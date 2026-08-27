@@ -26,6 +26,7 @@ const RETRY_SPACING_MS = 30 * MIN;
 const MAX_ATTEMPTS = 3;
 const GRACE_PAST_MS = 2 * 60 * MIN; // absolute time this recently past = already reset
 const TAIL_LINES = 15;
+const READ_BUDGET_MS = 3 * MIN;    // stop reading terminals before the 4-min tick deadline
 
 // --- pure logic (unit-tested) ---
 
@@ -33,6 +34,21 @@ const LIMIT_RE = /((usage|rate|session|weekly|daily|\d+[- ]hour)\s+limit|quota)/
 const REACHED_RE = /(reached|hit|exceeded)/i;
 const RESET_RE = /(resets?\b|try again|available|come back)/i;
 const VETO_RE = /approaching[^\n]*limit/i;
+
+export function shouldLog(level, env = process.env) {
+  return level !== 'debug' || Boolean(env.WATCHDOG_DEBUG);
+}
+
+// runtime_unavailable is Orca's structured "not running"; a bare "Command failed"
+// is the CLI erroring without JSON (daemon socket churn after an Orca update).
+// Both mean "nothing to observe this tick", not a watchdog fault.
+export function isUnavailableError(e) {
+  return e?.code === 'runtime_unavailable' || /^Command failed:/.test(e?.message ?? '');
+}
+
+export function readBudgetExceeded(startedAt, now) {
+  return now - startedAt > READ_BUDGET_MS;
+}
 
 export function detectBanner(lines) {
   const window = lines.slice(-TAIL_LINES);
@@ -116,6 +132,7 @@ export function reconcile(state, observations, now) {
 const pExecFile = promisify(execFile);
 
 function log(level, msg) {
+  if (!shouldLog(level)) return;
   fs.mkdirSync(STATE_DIR, { recursive: true });
   fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${level} ${msg}\n`);
   try {
@@ -182,12 +199,17 @@ async function tick({ dryRun }) {
   try {
     terminals = (await orca(['terminal', 'list'])).terminals ?? [];
   } catch (e) {
-    if (e.code === 'runtime_unavailable') { log('debug', 'orca not running'); return; }
+    if (isUnavailableError(e)) { log('debug', `orca unavailable: ${e.message.split('\n')[0]}`); return; }
     throw e;
   }
 
   const observations = [];
+  const startedAt = Date.now();
   for (const t of terminals.filter((t) => t.connected && t.writable)) {
+    if (readBudgetExceeded(startedAt, Date.now())) {
+      log('warn', `read budget (${READ_BUDGET_MS / MIN} min) spent; skipping remaining terminals this tick`);
+      break;
+    }
     try {
       observations.push({ handle: t.handle, banner: detectBanner(await readTail(t.handle)) });
     } catch (e) {

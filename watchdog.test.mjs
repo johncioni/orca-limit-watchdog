@@ -202,3 +202,24 @@ test('countdown digit changes do not spawn new events', () => {
   assert.equal(Object.keys(b.events).length, 1);
   assert.equal(Object.values(b.events)[0].detectedAt, NOW.toISOString());
 });
+
+// --- log hygiene + tick robustness ---
+import { shouldLog, isUnavailableError, readBudgetExceeded } from './watchdog.mjs';
+
+test('debug lines are suppressed unless WATCHDOG_DEBUG is set', () => {
+  assert.equal(shouldLog('debug', {}), false);
+  assert.equal(shouldLog('debug', { WATCHDOG_DEBUG: '1' }), true);
+  for (const lvl of ['info', 'warn', 'error']) assert.equal(shouldLog(lvl, {}), true);
+});
+
+test('runtime_unavailable and CLI command failure both count as orca unavailable', () => {
+  assert.equal(isUnavailableError(Object.assign(new Error('x'), { code: 'runtime_unavailable' })), true);
+  assert.equal(isUnavailableError(new Error('Command failed: /usr/local/bin/orca terminal list --json')), true);
+  assert.equal(isUnavailableError(new Error('unexpected JSON shape')), false);
+});
+
+test('read loop stops once the tick budget is spent', () => {
+  const t0 = new Date('2026-08-27T00:00:00Z');
+  assert.equal(readBudgetExceeded(t0, new Date(t0.getTime() + min(2))), false);
+  assert.equal(readBudgetExceeded(t0, new Date(t0.getTime() + min(3) + 1)), true);
+});
