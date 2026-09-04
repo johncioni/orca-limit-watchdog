@@ -52,10 +52,14 @@ export function readBudgetExceeded(startedAt, now) {
 
 export function detectBanner(lines) {
   const window = lines.slice(-TAIL_LINES);
-  const text = window.join('\n');
-  if (VETO_RE.test(text)) return null;
+  // Drop soft "approaching … limit" warning lines first, so such a warning can
+  // neither be mistaken for a reached-banner nor veto a genuine reached-banner
+  // that happens to share the same 15-line window (a per-line veto, not a
+  // whole-window one — the latter dropped real banners).
+  const kept = window.filter((l) => !VETO_RE.test(l));
+  const text = kept.join('\n');
   if (!(LIMIT_RE.test(text) && REACHED_RE.test(text) && RESET_RE.test(text))) return null;
-  const relevant = window.filter((l) => LIMIT_RE.test(l) || RESET_RE.test(l));
+  const relevant = kept.filter((l) => LIMIT_RE.test(l) || RESET_RE.test(l));
   return { bannerText: relevant.map((l) => l.trim()).join(' | ') };
 }
 
@@ -92,10 +96,16 @@ export function parseResetTime(text, now) {
 export const eventKey = (handle) => handle;
 
 // observations: [{ handle, banner: { bannerText } | null }]
-export function reconcile(state, observations, now) {
+export function reconcile(state, observations, now, liveHandles = null) {
   const events = structuredClone(state);
   const sendCandidates = [];
   const obsHandles = new Set(observations.map((o) => o.handle));
+  // Terminals that still EXIST this tick (from `terminal list`) — a superset of
+  // the ones we managed to READ (obsHandles): a read can fail on transient orca
+  // socket churn or be skipped by the read budget. When the caller doesn't
+  // supply it (old callers/tests), fall back to obsHandles, preserving the
+  // original delete-if-not-observed behavior.
+  const live = liveHandles ? new Set(liveHandles) : obsHandles;
   const currentKeys = new Set();
 
   for (const o of observations) {
@@ -113,7 +123,9 @@ export function reconcile(state, observations, now) {
   }
 
   for (const [key, ev] of Object.entries(events)) {
-    if (!obsHandles.has(ev.handle) || !currentKeys.has(key)) { delete events[key]; continue; }
+    if (!live.has(ev.handle)) { delete events[key]; continue; }   // terminal genuinely gone
+    if (!obsHandles.has(ev.handle)) continue;                     // live but unread this tick: freeze state, don't reset attempts
+    if (!currentKeys.has(key)) { delete events[key]; continue; }  // read OK, banner cleared: resume worked
     if (ev.status === 'resumed' && now - new Date(ev.lastAttemptAt) >= REARM_MS) {
       ev.status = ev.attempts >= MAX_ATTEMPTS ? 'gave_up' : 'waiting';
     }
@@ -181,7 +193,7 @@ function acquireLock() {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   try {
     const age = Date.now() - fs.statSync(LOCK_FILE).mtimeMs;
-    if (age > 10 * MIN) fs.rmSync(LOCK_FILE, { force: true });
+    if (age >= 10 * MIN) fs.rmSync(LOCK_FILE, { force: true });
   } catch { /* no lock */ }
   try {
     fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
@@ -219,7 +231,12 @@ async function tick({ dryRun }) {
 
   const now = new Date();
   const state = loadState();
-  const { events, sendCandidates } = reconcile(state, observations, now);
+  // Pass the full set of terminals that still exist so reconcile can tell a
+  // vanished terminal (delete its event) from one merely unread this tick
+  // (keep its event) — a transient read failure or budget skip must not reset
+  // attempt/backoff accounting and defeat RETRY_SPACING/MAX_ATTEMPTS.
+  const liveHandles = terminals.map((t) => t.handle);
+  const { events, sendCandidates } = reconcile(state, observations, now, liveHandles);
 
   for (const key of Object.keys(events)) {
     if (!state[key]) log('info', `detected limit on ${events[key].handle}, resetAt ${events[key].resetAt}`);
@@ -269,6 +286,11 @@ async function main() {
   if (fs.existsSync(DISABLED_FILE)) return;
   const dryRun = args.has('--dry-run');
   if (!dryRun && !acquireLock()) { log('debug', 'another tick holds the lock'); return; }
+  // Release the lock on ANY exit, including the deadline's process.exit(1),
+  // which bypasses the finally below. Without this, a hard-killed tick leaves a
+  // stale lock that makes the next 1-2 scheduled ticks skip (age < 10-min TTL),
+  // blinding the watchdog for ~5-15 min exactly when ticks are running slow.
+  if (!dryRun) process.once('exit', () => { try { fs.rmSync(LOCK_FILE, { force: true }); } catch { /* best effort */ } });
   const deadline = setTimeout(() => { log('error', 'tick deadline (4 min) exceeded'); process.exit(1); }, 4 * MIN);
   try {
     await tick({ dryRun });
