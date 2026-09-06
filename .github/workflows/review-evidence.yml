@@ -1,0 +1,154 @@
+name: review-evidence
+
+# Deterministic gate — no AI, no external service, nothing to rate-limit.
+# Every PR body must carry review evidence:
+#   Reviewed by <reviewer>, N round(s)      -> pass
+#   Review skipped: opus-implementer        -> pass (implementer was the code-reviewer model)
+#   Review skipped: <rule>                  -> pass only if the diff is skip-eligible:
+#                                              no invariant path touched (see .github/review-invariants.txt)
+#                                              and (docs/test-only OR <= MAX_SKIP_LINES changed)
+# Renovate/Dependabot PRs are exempt. Fails CLOSED on any API error.
+#
+# Uses pull_request_target on purpose: the job never checks out or executes PR
+# code (API reads only), and the base-branch copy of this workflow + the
+# invariants list is what runs — so a PR cannot neuter the gate by editing
+# either file. Token is read-only.
+
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: review-evidence-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review-evidence:
+    name: review-evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MAX_SKIP_LINES: "40"
+      PR_BODY: ${{ github.event.pull_request.body }}
+      PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check review evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$PR_AUTHOR" in
+            'renovate[bot]'|'dependabot[bot]')
+              echo "::notice::dependency bot '$PR_AUTHOR' — exempt from review evidence"
+              exit 0 ;;
+          esac
+
+          # Normalise: drop CR, strip HTML comments and fenced code blocks so
+          # commented-out or quoted evidence does not count.
+          body="$(printf '%s\n' "$PR_BODY" | tr -d '\r' \
+            | perl -0pe 's/<!--.*?-->//gs; s/^[ \t]*(`{3,}|~{3,}).*?^[ \t]*\1[^\n]*\n?//gms; s/^[ \t]*(`{3,}|~{3,}).*\z//ms')"
+
+          prefix='^[[:space:]]*(>[[:space:]]*)?(#{1,6}[[:space:]]+)?([-*+][[:space:]]+)?(\*\*)?'
+          if grep -Eiq "${prefix}reviewed by[[:space:]]+[^,[:space:]<][^,]*,[[:space:]]*[1-9][0-9]*[[:space:]]+rounds?([^[:alnum:]]|$)" <<<"$body"; then
+            echo "::notice::review evidence present: $(grep -Ei "${prefix}reviewed by" <<<"$body" | head -1)"
+            exit 0
+          fi
+
+          if ! grep -Eiq "${prefix}review skipped:[[:space:]]*[^[:space:]]" <<<"$body" \
+             || grep -Eiq "${prefix}review skipped:[[:space:]]*<rule>" <<<"$body"; then
+            echo "::error::PR body must contain one of:"
+            echo "::error::  Reviewed by <reviewer>, N rounds"
+            echo "::error::  Review skipped: <rule>   (docs/test-only or <= ${MAX_SKIP_LINES} lines, no invariant path)"
+            echo "::error::  Review skipped: opus-implementer   (implementer was the code-reviewer model)"
+            exit 1
+          fi
+
+          echo "Skip claimed: $(grep -Ei "${prefix}review skipped:" <<<"$body" | head -1)"
+
+          # opus-implementer: the implementer was the code-reviewer model, so no
+          # code review is run (rule in ~/.agents/MODELS.md). Accepted as claimed.
+          if grep -Eiq "${prefix}review skipped:[[:space:]]*opus-implementer([^[:alnum:]_-]|$)" <<<"$body"; then
+            echo "::notice::skip accepted: opus-implementer rule"
+            exit 0
+          fi
+
+          # --- PR metadata (fail closed on any API problem) ---
+          pr_json="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")"
+          additions="$(jq -r '.additions' <<<"$pr_json")"
+          deletions="$(jq -r '.deletions' <<<"$pr_json")"
+          changed_files="$(jq -r '.changed_files' <<<"$pr_json")"
+          for v in "$additions" "$deletions" "$changed_files"; do
+            [[ "$v" =~ ^[0-9]+$ ]] || { echo "::error::unexpected PR metadata from API: '$v'"; exit 1; }
+          done
+          total=$((additions + deletions))
+
+          # Current and previous (renamed-from) paths.
+          files_raw="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/files" \
+            -q '.[] | .filename, (.previous_filename // empty)')"
+          files=()
+          while IFS= read -r line; do [[ -n "$line" ]] && files+=("$line"); done <<<"$files_raw"
+          if ((${#files[@]} == 0)); then
+            echo "::error::no changed files returned by the API — refusing to accept a skip"; exit 1
+          fi
+          if ((changed_files > 3000)); then
+            echo "::error::PR has ${changed_files} files (> API listing limit) — run a review round"; exit 1
+          fi
+          echo "Changed files: ${changed_files}, lines: ${total}"
+
+          # --- 1. Invariant paths (read from the BASE ref, never the PR head) ---
+          inv_txt="$(gh api "repos/${GITHUB_REPOSITORY}/contents/.github/review-invariants.txt?ref=${BASE_SHA}" -q '.content | @base64d' 2>/dev/null || true)"
+          if [[ -z "$inv_txt" ]]; then
+            echo "::error::.github/review-invariants.txt missing on base ref — invariant check cannot run; refusing skip"; exit 1
+          fi
+          patterns=()
+          while IFS= read -r line; do
+            line="$(printf '%s' "$line" | tr -d '\r' | sed 's/[[:space:]]*$//; s/^[[:space:]]*//')"
+            [[ -z "$line" || "$line" == \#* ]] && continue
+            patterns+=("$line")
+          done <<<"$inv_txt"
+          if ((${#patterns[@]} == 0)); then
+            echo "::error::.github/review-invariants.txt has no patterns — refusing skip"; exit 1
+          fi
+
+          hits=()
+          for f in "${files[@]}"; do
+            for p in "${patterns[@]}"; do
+              # shellcheck disable=SC2053  # intentional glob match; '*' spans '/'
+              if [[ "$f" == $p ]]; then hits+=("$f (matches '$p')"); break; fi
+            done
+          done
+          if ((${#hits[@]})); then
+            echo "::error::Review skipped, but the diff touches invariant paths that always require a review round:"
+            printf '::error::  %s\n' "${hits[@]}"
+            exit 1
+          fi
+
+          # --- 2. Docs/test-only diffs may skip at any size; everything else must be small ---
+          docs_or_tests_only=true
+          for f in "${files[@]}"; do
+            case "$f" in
+              requirements*.txt|*.lock|*/robots.txt|robots.txt|CMakeLists.txt) docs_or_tests_only=false; break ;;
+              *.md|*.mdx|docs/*|LICENSE*|CHANGELOG*) ;;
+              *.test.*|*.spec.ts|*.spec.tsx|*.spec.js|*.spec.jsx|*.spec.mjs|*Tests.swift|tests/*|*/tests/*|test/*|*/test/*|*/__tests__/*|*/__fixtures__/*|*/fixtures/*|e2e/*|*/e2e/*) ;;
+              *) docs_or_tests_only=false; break ;;
+            esac
+          done
+
+          if $docs_or_tests_only; then
+            echo "::notice::docs/test-only diff — skip accepted"
+            exit 0
+          fi
+          if ((total <= MAX_SKIP_LINES)); then
+            echo "::notice::${total} lines changed (<= ${MAX_SKIP_LINES}) — skip accepted"
+            exit 0
+          fi
+
+          echo "::error::Review skipped, but the diff is ${total} lines of non-docs/test code (limit ${MAX_SKIP_LINES}). Run a review round and record 'Reviewed by <reviewer>, N rounds'."
+          exit 1
