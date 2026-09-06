@@ -1,0 +1,132 @@
+name: gitleaks
+
+# Secret scanning. GitHub's native secret scanning + push protection are ON for
+# the public repos, but they require GitHub Advanced Security on private ones
+# (GitHub Pro does not include it), so this workflow is the only secret gate
+# that works uniformly across all of them.
+#
+# Scans FULL history, not just the diff: a secret introduced in an earlier
+# commit on the branch is still a secret once merged. Known fixtures are
+# allowlisted in .gitleaks.toml by exact value rather than by weakening the
+# scan -- and that config is read from the base commit, never from the pull
+# request, so a PR cannot widen its own gate (see the trusted-config step).
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: gitleaks-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only: this gate never writes back.
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # SHA-pinned: a retargeted tag could run different action code before the
+      # secret scan. fetch-depth: 0 because the scan walks history and the
+      # default shallow clone would silently scan only the tip commit. It also
+      # means the base commit is already local, so the trusted-inputs step below
+      # needs no extra fetch. persist-credentials: false so no usable git token
+      # is left on disk.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Pinned binary rather than gitleaks-action: no marketplace action to
+      # trust and no licence key (the action requires one for organisations).
+      # The digest is verified BEFORE extraction -- piping curl straight into
+      # tar would execute unverified bytes, which is not acceptable in the
+      # workflow whose whole job is supply-chain hygiene.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          curl -sSfL -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks version
+
+      # A secret gate that silently stops detecting is worse than no gate: the
+      # scan would pass every PR and nobody would notice. Prove the binary
+      # actually fires on this runner before trusting its verdict.
+      #
+      # The verdict comes from the JSON report, not from the exit code. gitleaks
+      # exits non-zero both when it finds a secret and when it fails, so an
+      # exit-code test cannot tell "detected" from "crashed" -- it would read a
+      # broken scanner as a healthy one, which is the exact failure this step
+      # exists to catch. A crash writes no report at all; a live scanner writes
+      # one containing a github-pat finding.
+      #
+      # The canary is generated at runtime into a temp dir outside the repo, so
+      # it is never committed and never matched by the scan config.
+      - name: Smoke-test the scanner (canary must be detected)
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          trap 'rm -rf "$tmp"' EXIT
+          printf 'ghp_%s\n' \
+            "$(head -c 40 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 36)" \
+            > "$tmp/canary.txt"
+          # --exit-code 0 so a *detection* is not itself a failure; a genuine
+          # scanner error still exits non-zero and is reported as such.
+          if ! ./gitleaks dir "$tmp" --no-banner --redact --exit-code 0 \
+               --report-format json --report-path "$tmp/report.json"; then
+            echo "::error::gitleaks failed while scanning the canary - the scanner is broken, not clean"
+            exit 1
+          fi
+          if [ ! -s "$tmp/report.json" ] || \
+             [ "$(jq '[.[] | select(.RuleID == "github-pat")] | length' "$tmp/report.json")" -eq 0 ]; then
+            echo "::error::gitleaks did not detect the canary secret - the gate is INERT"
+            exit 1
+          fi
+          echo "canary detected: scanner is live"
+
+      # On `pull_request` the checked-out tree is the merge commit, so it
+      # contains the PR's own changes. Any config the scan reads from that tree
+      # is therefore controlled by the PR: it could add or widen a
+      # .gitleaks.toml allowlist and pass its own gate. Verified -- a PR adding
+      # an allowlist with paths = '.*' muted a planted secret entirely. Take the
+      # config from the BASE commit instead, which is already reviewed code.
+      #
+      # This raises the bar rather than closing the door: a PR can still edit
+      # this workflow itself. The difference is that the bypass stops being a
+      # quiet one-line data edit and becomes a visible change to the gate.
+      - name: Materialise the trusted scan config
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          # `push` to main carries no base sha; there the checked-out tree IS
+          # the trusted state, so read from it directly.
+          if [ -n "${BASE_SHA:-}" ]; then
+            got_config=$(git show "${BASE_SHA}:.gitleaks.toml" 2>/dev/null > "${RUNNER_TEMP}/gitleaks.toml" && echo yes || echo no)
+          else
+            got_config=$(cat .gitleaks.toml 2>/dev/null > "${RUNNER_TEMP}/gitleaks.toml" && echo yes || echo no)
+          fi
+          if [ "$got_config" = no ]; then
+            # No config at the trusted revision: pin the default ruleset
+            # explicitly, so a .gitleaks.toml added by the PR is never picked
+            # up implicitly.
+            printf '[extend]\nuseDefault = true\n' > "${RUNNER_TEMP}/gitleaks.toml"
+            echo "no .gitleaks.toml at the trusted revision; using the default ruleset"
+          else
+            echo "using the .gitleaks.toml from the trusted revision"
+          fi
+
+      # `git` is the current subcommand; `detect` is retained for compatibility
+      # but hidden from help in 8.x. --redact so a real finding never echoes the
+      # secret into CI logs.
+      - name: Scan for secrets
+        run: |
+          ./gitleaks git --no-banner --redact --exit-code 1 \
+            --config "${RUNNER_TEMP}/gitleaks.toml"
