@@ -34,7 +34,6 @@ export const SCHEDULE = Object.freeze({
 const KINDS = Object.keys(SCHEDULE);
 const PLATFORMS = ['claude', 'codex', 'unknown'];
 const STATUSES = ['waiting', 'resumed', 'gave_up'];
-const { bufferMs: BUFFER_MS, rearmMs: REARM_MS, retrySpacingMs: RETRY_SPACING_MS, maxSends: MAX_ATTEMPTS } = SCHEDULE.limit; // removed in Task 5
 const GRACE_PAST_MS = 2 * 60 * MIN; // absolute time this recently past = already reset
 const TAIL_LINES = 15;
 const READ_BUDGET_MS = 3 * MIN;    // stop reading terminals before the 4-min tick deadline
@@ -229,46 +228,41 @@ export function parseResetTime(text, now) {
 // echoed resume text, countdown digits) can never spawn duplicate events.
 export const eventKey = (handle) => handle;
 
-// observations: [{ handle, banner: { bannerText } | null }]
+// observations: [{ handle, banner: { kind, bannerText, … } | null, platform }]
+// Applies spec §5's transition order per stored event; first matching rule wins.
 export function reconcile(state, observations, now, liveHandles = null) {
   const events = structuredClone(state);
   const sendCandidates = [];
-  const obsHandles = new Set(observations.map((o) => o.handle));
+  const byHandle = new Map(observations.map((o) => [o.handle, { ...o, platform: o.platform ?? 'unknown' }]));
   // Terminals that still EXIST this tick (from `terminal list`) — a superset of
-  // the ones we managed to READ (obsHandles): a read can fail on transient orca
-  // socket churn or be skipped by the read budget. When the caller doesn't
-  // supply it (old callers/tests), fall back to obsHandles, preserving the
-  // original delete-if-not-observed behavior.
-  const live = liveHandles ? new Set(liveHandles) : obsHandles;
-  const currentKeys = new Set();
-
-  for (const o of observations) {
-    if (!o.banner) continue;
-    const key = eventKey(o.handle);
-    currentKeys.add(key);
-    if (!events[key]) {
-      const resetAt = parseResetTime(o.banner.bannerText, now) ?? new Date(now.getTime() + 60 * MIN);
-      events[key] = {
-        handle: o.handle, bannerText: o.banner.bannerText,
-        detectedAt: now.toISOString(), resetAt: resetAt.toISOString(),
-        attempts: 0, lastAttemptAt: null, status: 'waiting',
-      };
-    }
-  }
+  // the ones we managed to READ: a read can fail on transient orca socket churn
+  // or be skipped by the read budget. Old callers/tests omit it.
+  const live = liveHandles ? new Set(liveHandles) : new Set(byHandle.keys());
 
   for (const [key, ev] of Object.entries(events)) {
-    if (!live.has(ev.handle)) { delete events[key]; continue; }   // terminal genuinely gone
-    if (!obsHandles.has(ev.handle)) continue;                     // live but unread this tick: freeze state, don't reset attempts
-    if (!currentKeys.has(key)) { delete events[key]; continue; }  // read OK, banner cleared: resume worked
-    if (ev.status === 'resumed' && now - new Date(ev.lastAttemptAt) >= REARM_MS) {
-      ev.status = ev.attempts >= MAX_ATTEMPTS ? 'gave_up' : 'waiting';
+    if (!live.has(ev.handle)) { delete events[key]; continue; }             // 1. vanished
+    const o = byHandle.get(ev.handle);
+    if (!o) continue;                                                        // 2. live but unread: freeze
+    if (!o.banner) { delete events[key]; continue; }                         // 3. banner cleared
+    if (o.banner.kind !== ev.kind || (o.platform !== 'unknown' && o.platform !== ev.platform)) {
+      events[key] = newEvent(o, now); continue;                              // 4. replace (never a candidate this tick)
+    }
+    const sch = SCHEDULE[ev.kind];                                           // 5. same kind & platform
+    if (sch.deadlineMs !== null && now - new Date(ev.detectedAt) >= sch.deadlineMs) {
+      ev.status = 'gave_up'; continue;                                       // 5a
+    }
+    if (ev.status === 'resumed' && now - new Date(ev.lastAttemptAt) >= sch.rearmMs) {
+      ev.status = ev.attempts >= sch.maxSends ? 'gave_up' : 'waiting';       // 5b
     }
     if (ev.status === 'waiting'
-      && now - new Date(ev.resetAt) >= BUFFER_MS
-      && ev.attempts < MAX_ATTEMPTS
-      && (!ev.lastAttemptAt || now - new Date(ev.lastAttemptAt) >= RETRY_SPACING_MS)) {
-      sendCandidates.push(key);
+      && now - new Date(ev.resetAt) >= sch.bufferMs
+      && ev.attempts < sch.maxSends
+      && (!ev.lastAttemptAt || now - new Date(ev.lastAttemptAt) >= sch.retrySpacingMs)) {
+      sendCandidates.push(key);                                              // 5c
     }
+  }
+  for (const o of byHandle.values()) {
+    if (o.banner && !events[eventKey(o.handle)]) events[eventKey(o.handle)] = newEvent(o, now);
   }
   return { events, sendCandidates };
 }

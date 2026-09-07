@@ -204,7 +204,9 @@ test('unparsable returns null', () => {
 
 const H = 'term_abc';
 const min = (n) => n * 60_000;
-const obs = (banner) => [{ handle: H, banner: banner ? { bannerText: banner } : null }];
+const obs = (banner, extra = {}) => [{ handle: H, platform: 'unknown', ...extra,
+  banner: banner ? (typeof banner === 'string' ? { kind: 'limit', bannerText: banner } : banner) : null }];
+const LIMIT_EV = { handle: H, kind: 'limit', platform: 'unknown' };
 const BANNER = 'Claude usage limit reached. | Your limit will reset at 3am.';
 
 // --- schema v2 ---
@@ -272,7 +274,7 @@ test('event key is the terminal handle alone', () => {
 });
 
 test('echoed resume text changing the banner does not create a new event or resend', () => {
-  const state = { [H]: { handle: H, bannerText: BANNER, detectedAt: NOW.toISOString(),
+  const state = { [H]: { ...LIMIT_EV, bannerText: BANNER, detectedAt: NOW.toISOString(),
     resetAt: NOW.toISOString(), attempts: 1, lastAttemptAt: NOW.toISOString(), status: 'resumed' } };
   const mutated = BANNER + ' | Session rate limit has reset. Resume where you left off.';
   const r = reconcile(state, obs(mutated), new Date(NOW.getTime() + min(2)));
@@ -305,7 +307,7 @@ test('becomes a send candidate after resetAt + 2min buffer', () => {
 
 test('resumed event does not resend within 10 minutes', () => {
   const key = eventKey(H);
-  const state = { [key]: { handle: H, bannerText: BANNER, detectedAt: NOW.toISOString(),
+  const state = { [key]: { ...LIMIT_EV, bannerText: BANNER, detectedAt: NOW.toISOString(),
     resetAt: NOW.toISOString(), attempts: 1, lastAttemptAt: NOW.toISOString(), status: 'resumed' } };
   const r = reconcile(state, obs(BANNER), new Date(NOW.getTime() + min(5)));
   assert.deepEqual(r.sendCandidates, []);
@@ -314,7 +316,7 @@ test('resumed event does not resend within 10 minutes', () => {
 
 test('banner persisting ≥10min after send re-arms, retry gated to ≥30min spacing', () => {
   const key = eventKey(H);
-  const state = { [key]: { handle: H, bannerText: BANNER, detectedAt: NOW.toISOString(),
+  const state = { [key]: { ...LIMIT_EV, bannerText: BANNER, detectedAt: NOW.toISOString(),
     resetAt: NOW.toISOString(), attempts: 1, lastAttemptAt: NOW.toISOString(), status: 'resumed' } };
   const at15 = reconcile(state, obs(BANNER), new Date(NOW.getTime() + min(15)));
   assert.equal(at15.events[key].status, 'waiting');
@@ -325,7 +327,7 @@ test('banner persisting ≥10min after send re-arms, retry gated to ≥30min spa
 
 test('gives up after 3 attempts', () => {
   const key = eventKey(H);
-  const state = { [key]: { handle: H, bannerText: BANNER, detectedAt: NOW.toISOString(),
+  const state = { [key]: { ...LIMIT_EV, bannerText: BANNER, detectedAt: NOW.toISOString(),
     resetAt: NOW.toISOString(), attempts: 3, lastAttemptAt: NOW.toISOString(), status: 'resumed' } };
   const r = reconcile(state, obs(BANNER), new Date(NOW.getTime() + min(15)));
   assert.equal(r.events[key].status, 'gave_up');
@@ -335,7 +337,7 @@ test('gives up after 3 attempts', () => {
 
 test('banner gone deletes the event (success)', () => {
   const key = eventKey(H);
-  const state = { [key]: { handle: H, bannerText: BANNER, detectedAt: NOW.toISOString(),
+  const state = { [key]: { ...LIMIT_EV, bannerText: BANNER, detectedAt: NOW.toISOString(),
     resetAt: NOW.toISOString(), attempts: 1, lastAttemptAt: NOW.toISOString(), status: 'resumed' } };
   const r = reconcile(state, obs(null), new Date(NOW.getTime() + min(5)));
   assert.deepEqual(r.events, {});
@@ -343,7 +345,7 @@ test('banner gone deletes the event (success)', () => {
 
 test('terminal gone deletes the event', () => {
   const key = eventKey(H);
-  const state = { [key]: { handle: H, bannerText: BANNER, detectedAt: NOW.toISOString(),
+  const state = { [key]: { ...LIMIT_EV, bannerText: BANNER, detectedAt: NOW.toISOString(),
     resetAt: NOW.toISOString(), attempts: 0, lastAttemptAt: null, status: 'waiting' } };
   const r = reconcile(state, [], NOW);
   assert.deepEqual(r.events, {});
@@ -351,7 +353,7 @@ test('terminal gone deletes the event', () => {
 
 test('same banner reappearing after absence is a fresh event', () => {
   const key = eventKey(H);
-  const state = { [key]: { handle: H, bannerText: BANNER, detectedAt: NOW.toISOString(),
+  const state = { [key]: { ...LIMIT_EV, bannerText: BANNER, detectedAt: NOW.toISOString(),
     resetAt: NOW.toISOString(), attempts: 3, lastAttemptAt: NOW.toISOString(), status: 'gave_up' } };
   const gone = reconcile(state, obs(null), new Date(NOW.getTime() + min(5)));
   const back = reconcile(gone.events, obs(BANNER), new Date(NOW.getTime() + min(10)));
@@ -363,6 +365,101 @@ test('countdown digit changes do not spawn new events', () => {
   const b = reconcile(a.events, obs('usage limit reached, resets in 1 hours'), new Date(NOW.getTime() + min(60)));
   assert.equal(Object.keys(b.events).length, 1);
   assert.equal(Object.values(b.events)[0].detectedAt, NOW.toISOString());
+});
+
+// --- outage lifecycle ---
+
+const OUTAGE_BANNER = { kind: 'outage', bannerText: 'API Error: 529 overloaded_error', patternId: 'claude-api-error' };
+const oobs = (banner = OUTAGE_BANNER, platform = 'claude') => obs(banner, { platform });
+const at = (m) => new Date(NOW.getTime() + min(m));
+const seed = (over = {}) => ({ [H]: { handle: H, kind: 'outage', platform: 'claude', bannerText: OUTAGE_BANNER.bannerText,
+  detectedAt: NOW.toISOString(), resetAt: at(10).toISOString(), attempts: 0, lastAttemptAt: null, status: 'waiting', ...over } });
+
+test('outage: waiting event, candidate at exactly +10 min and not before', () => {
+  const { events } = reconcile({}, oobs(), NOW);
+  assert.equal(events[H].kind, 'outage');
+  assert.equal(events[H].platform, 'claude');
+  assert.equal(events[H].resetAt, at(10).toISOString());
+  assert.deepEqual(reconcile(events, oobs(), at(9)).sendCandidates, []);
+  assert.deepEqual(reconcile(events, oobs(), at(10)).sendCandidates, [H]);
+});
+
+test('outage: retry only after the 10-min verify and ≥30 min spacing', () => {
+  const sent = seed({ attempts: 1, lastAttemptAt: at(10).toISOString(), status: 'resumed' });
+  assert.equal(reconcile(sent, oobs(), at(19)).events[H].status, 'resumed');
+  const r = reconcile(sent, oobs(), at(20));
+  assert.equal(r.events[H].status, 'waiting');
+  assert.deepEqual(r.sendCandidates, []);                       // 30-min spacing not yet met
+  assert.deepEqual(reconcile(sent, oobs(), at(40)).sendCandidates, [H]);
+});
+
+test('outage: sixth send stays resumed through verify, then gave_up', () => {
+  const sixth = seed({ attempts: 6, lastAttemptAt: at(200).toISOString(), status: 'resumed' });
+  assert.equal(reconcile(sixth, oobs(), at(205)).events[H].status, 'resumed');
+  const r = reconcile(sixth, oobs(), at(210));
+  assert.equal(r.events[H].status, 'gave_up');
+  assert.deepEqual(r.sendCandidates, []);
+});
+
+test('outage: deadline at exactly +24h gives up even with attempts left', () => {
+  const r = reconcile(seed({ attempts: 2, lastAttemptAt: at(60).toISOString() }), oobs(), at(24 * 60));
+  assert.equal(r.events[H].status, 'gave_up');
+  assert.deepEqual(r.sendCandidates, []);
+  assert.equal(reconcile(seed(), oobs(), at(24 * 60 - 1)).events[H].status, 'waiting');
+});
+
+test('outage: limit events have no deadline', () => {
+  const st = { [H]: { ...LIMIT_EV, bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: at(48 * 60).toISOString(),
+    attempts: 0, lastAttemptAt: null, status: 'waiting' } };
+  assert.equal(reconcile(st, obs(BANNER), at(30 * 60)).events[H].status, 'waiting');
+});
+
+test('gave_up event whose banner clears is deleted', () => {
+  const r = reconcile(seed({ attempts: 6, lastAttemptAt: at(1).toISOString(), status: 'gave_up' }), obs(null), at(300));
+  assert.deepEqual(r.events, {});
+});
+
+test('unread live event is frozen: no candidate, no deadline, no re-arm', () => {
+  const st = seed({ attempts: 1, lastAttemptAt: at(10).toISOString(), status: 'resumed' });
+  const r = reconcile(st, [], at(48 * 60), [H]);
+  assert.deepEqual(r.events, st);
+  assert.deepEqual(r.sendCandidates, []);
+});
+
+test('replace: kind change from every status yields a fresh event with attempts 0', () => {
+  for (const status of ['waiting', 'resumed', 'gave_up']) {
+    const st = seed({ attempts: 3, lastAttemptAt: at(5).toISOString(), status });
+    const r = reconcile(st, obs(BANNER, { platform: 'claude' }), at(100));
+    assert.equal(r.events[H].kind, 'limit', status);
+    assert.equal(r.events[H].attempts, 0);
+    assert.equal(r.events[H].status, 'waiting');
+    assert.equal(r.events[H].detectedAt, at(100).toISOString());
+    assert.deepEqual(r.sendCandidates, []);                     // never a candidate on the replacing tick
+    const lim = { [H]: { ...LIMIT_EV, platform: 'claude', bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
+      attempts: 2, lastAttemptAt: at(5).toISOString(), status } };
+    const r2 = reconcile(lim, oobs(), at(100));
+    assert.equal(r2.events[H].kind, 'outage', status);
+    assert.equal(r2.events[H].attempts, 0);
+  }
+});
+
+test('replace: a known, different platform replaces; unknown keeps the event', () => {
+  const st = seed({ attempts: 2, lastAttemptAt: at(5).toISOString(), status: 'waiting' });
+  const changed = reconcile(st, oobs(OUTAGE_BANNER, 'codex'), at(100)).events[H];
+  assert.equal(changed.platform, 'codex');
+  assert.equal(changed.attempts, 0);
+  const kept = reconcile(st, oobs(OUTAGE_BANNER, 'unknown'), at(100)).events[H];
+  assert.equal(kept.platform, 'claude');
+  assert.equal(kept.attempts, 2);
+});
+
+test('limit lifecycle still uses the 2-min buffer and 3-send cap', () => {
+  const st = { [H]: { ...LIMIT_EV, bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
+    attempts: 0, lastAttemptAt: null, status: 'waiting' } };
+  assert.deepEqual(reconcile(st, obs(BANNER), at(1)).sendCandidates, []);
+  assert.deepEqual(reconcile(st, obs(BANNER), at(2)).sendCandidates, [H]);
+  const third = { [H]: { ...st[H], attempts: 3, lastAttemptAt: at(2).toISOString(), status: 'resumed' } };
+  assert.equal(reconcile(third, obs(BANNER), at(12)).events[H].status, 'gave_up');
 });
 
 // --- log hygiene + tick robustness ---
