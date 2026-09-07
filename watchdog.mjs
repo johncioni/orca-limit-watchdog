@@ -267,6 +267,17 @@ export function reconcile(state, observations, now, liveHandles = null) {
   return { events, sendCandidates };
 }
 
+const SHELL_PROMPT_RE = /[$%#❯➜λ❱>]$/;
+// True when the last non-empty line of a tail is a shell prompt, i.e. the agent
+// has exited and a send would land in the shell (spec §6.4). A bare ">" is
+// Claude Code's empty input box only with independent evidence (agentIdentity).
+export function isShellPrompt(tail, agentIdentity) {
+  const last = tail.map((l) => stripAnsi(l).trim()).filter(Boolean).at(-1);
+  if (last === undefined) return false;
+  if (last === '>') return agentIdentity !== 'claude';
+  return SHELL_PROMPT_RE.test(last);
+}
+
 // --- imperative shell ---
 
 const pExecFile = promisify(execFile);

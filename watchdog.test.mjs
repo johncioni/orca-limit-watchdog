@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
+import { isShellPrompt } from './watchdog.mjs';
 
 const CLAUDE_BANNER = [
   '─'.repeat(40),
@@ -460,6 +461,20 @@ test('limit lifecycle still uses the 2-min buffer and 3-send cap', () => {
   assert.deepEqual(reconcile(st, obs(BANNER), at(2)).sendCandidates, [H]);
   const third = { [H]: { ...st[H], attempts: 3, lastAttemptAt: at(2).toISOString(), status: 'resumed' } };
   assert.equal(reconcile(third, obs(BANNER), at(12)).events[H].status, 'gave_up');
+});
+
+// --- prompt guard ---
+
+test('isShellPrompt recognises shell prompt endings and fails closed on a bare ">"', () => {
+  for (const p of ['john@mac ~ $', '~ %', 'root#', '❯', 'repo ➜', 'λ', '❱', 'foo>', 'cmd>  ']) {
+    assert.equal(isShellPrompt(['API Error: 529', p, '', '  '], 'claude'), true, p);
+  }
+  assert.equal(isShellPrompt(['API Error: 529', '\x1b[32m~ %\x1b[0m']), true);
+  assert.equal(isShellPrompt(['API Error: 529', '> ']), true);           // no identity ⇒ shell continuation
+  assert.equal(isShellPrompt(['API Error: 529', '> '], 'codex'), true);
+  assert.equal(isShellPrompt(['API Error: 529', '> '], 'claude'), false);
+  assert.equal(isShellPrompt(['API Error: 529', '? for shortcuts']), false);
+  assert.equal(isShellPrompt([]), false);
 });
 
 // --- log hygiene + tick robustness ---
