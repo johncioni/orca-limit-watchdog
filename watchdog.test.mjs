@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize } from './watchdog.mjs';
+import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine } from './watchdog.mjs';
 
 const CLAUDE_BANNER = [
   '─'.repeat(40),
@@ -48,6 +48,94 @@ test('no match on ordinary code/log output mentioning limits', () => {
 test('only scans the last 15 lines', () => {
   const lines = [...CLAUDE_BANNER, ...Array(20).fill('normal output')];
   assert.equal(detectBanner(lines), null);
+});
+
+// --- outage detection ---
+
+const CHROME_TAIL = ['', '─'.repeat(40), '> ', '? for shortcuts'];
+const CLAUDE_529 = 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CTx"}';
+const outageTail = (line) => ['some earlier output', line, ...CHROME_TAIL];
+
+test('existing limit banners now carry kind "limit"', () => {
+  assert.equal(detectBanner(CLAUDE_BANNER).kind, 'limit');
+  assert.equal(detectBanner(CODEX_BANNER).kind, 'limit');
+});
+
+test('detects Claude API outage banners (529, 503, Connection error, ⎿ prefix) on claude and unknown', () => {
+  for (const platform of ['claude', 'unknown']) {
+    for (const line of [CLAUDE_529, '⎿  ' + CLAUDE_529, 'API Error: 503 Service Unavailable', 'API Error: Connection error']) {
+      const b = detectBanner(outageTail(line), platform);
+      assert.ok(b, `${platform}: ${line}`);
+      assert.equal(b.kind, 'outage');
+      assert.equal(b.patternId, 'claude-api-error');
+      assert.match(b.bannerText, /^(?:⎿\s*)?API Error/);
+    }
+  }
+});
+
+test('outage bannerText is sanitized and capped at 200 chars', () => {
+  const b = detectBanner(outageTail('API Error: 529 ' + 'x '.repeat(300)), 'claude');
+  assert.ok(b.bannerText.length <= 201);
+  assert.match(b.bannerText, /…$/);
+});
+
+test('non-outage API errors do not match', () => {
+  for (const code of [400, 401, 403, 429]) {
+    assert.equal(detectBanner(outageTail(`API Error: ${code} {"type":"error"}`), 'claude'), null, String(code));
+  }
+});
+
+test('the Claude pattern is not applied to codex terminals', () => {
+  assert.equal(detectBanner(outageTail(CLAUDE_529), 'codex'), null);
+});
+
+test('prose, code and logs mentioning errors do not match', () => {
+  const lines = [
+    'I saw "API Error: 529" in the logs yesterday.',
+    'const status = 500; // or 529',
+    'connection reset by peer; stream error; ECONNRESET; fetch failed; overloaded',
+    '> ',
+  ];
+  assert.equal(detectBanner(lines, 'claude'), null);
+});
+
+test('ordinary agent output ending at the input box does not match', () => {
+  assert.equal(detectBanner(['Done. All tests pass.', '', '> ', '? for shortcuts'], 'claude'), null);
+});
+
+test('a stale error the agent worked past fails the final-block requirement', () => {
+  assert.equal(detectBanner([CLAUDE_529, 'Retrying succeeded, continuing with the task.', 'Edited foo.js', '> '], 'claude'), null);
+  assert.equal(detectBanner([CLAUDE_529, 'john@mac ~ %'], 'claude'), null);
+});
+
+test('retry markers at or after the error veto; before the error do not', () => {
+  assert.equal(detectBanner([CLAUDE_529, 'Retrying in 5s… (attempt 2/10)', '> '], 'claude'), null);
+  assert.equal(detectBanner(['API Error: 529 overloaded_error · Retrying in 4s', '> '], 'claude'), null);
+  assert.ok(detectBanner(['Retrying in 5s…', CLAUDE_529, '> '], 'claude'));
+  assert.ok(detectBanner([CLAUDE_529, 'Retrying in 5s…', CLAUDE_529, '> '], 'claude'));
+});
+
+test('"reconnecting…" alone is neither a match nor a veto', () => {
+  assert.equal(detectBanner(['reconnecting…', '> '], 'claude'), null);
+});
+
+test('ANSI-wrapped banner and chrome still match; ANSI-wrapped prose still does not', () => {
+  assert.ok(detectBanner(['\x1b[31m' + CLAUDE_529 + '\x1b[0m', '\x1b[2m> \x1b[0m'], 'claude'));
+  assert.equal(detectBanner(['\x1b[31mI saw "API Error: 529" once\x1b[0m', '> '], 'claude'), null);
+});
+
+test('class precedence is chronological by last contributing line', () => {
+  const limitLine = 'Claude usage limit reached.';
+  const resetLine = 'Your limit will reset at 3am.';
+  assert.equal(detectBanner([limitLine, resetLine, CLAUDE_529, '> '], 'claude').kind, 'outage');
+  assert.equal(detectBanner([CLAUDE_529, limitLine, resetLine, '> '], 'claude').kind, 'limit');
+  assert.equal(detectBanner([limitLine, CLAUDE_529, resetLine, '> '], 'claude').kind, 'limit');
+  assert.equal(detectBanner(['Session limit reached: API Error: 529 overloaded_error, try again later', '> '], 'claude').kind, 'limit');
+});
+
+test('hasOutageLine reports a pattern line regardless of platform or trailing prose', () => {
+  assert.equal(hasOutageLine([CLAUDE_529, 'moved on', 'john@mac ~ %']), true);
+  assert.equal(hasOutageLine(['all good', '> ']), false);
 });
 
 // --- parseResetTime ---

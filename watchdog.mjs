@@ -56,6 +56,25 @@ export function sanitize(text, limit = 200) {
   return s.length > limit ? `${s.slice(0, limit)}…` : s;
 }
 
+// Outage banners are platform-owned TUI shapes; there is deliberately no
+// generic rule. `platforms` gates which terminal identities a row applies to.
+// Codex has no row yet (spec §Non-goals): nothing it prints is unambiguous.
+const OUTAGE_PATTERNS = [
+  { id: 'claude-api-error', platforms: ['claude', 'unknown'],
+    re: /^(⎿\s*)?API Error: (5\d\d\b|Connection error\b|.*\boverloaded_error\b)/i },
+];
+const RETRY_RE = /retrying in \d|attempt \d+\s*(\/|of)\s*\d+/i;
+// Lines allowed AFTER the error for it to count as the final, stalled banner.
+const CHROME_RES = [
+  /^$/,
+  /^[─│╭╮╰╯┃━┌┐└┘├┤⎿\s]+$/,
+  /^>(\s.*)?$/,
+  /^⎿/,
+  /^(\? for shortcuts|Press |Esc |esc |Retry|⏵|⏸|✗|✓)/,
+];
+const isChrome = (l) => CHROME_RES.some((re) => re.test(l));
+const lastIndex = (arr, pred) => { let i = -1; arr.forEach((x, j) => { if (pred(x)) i = j; }); return i; };
+
 export function shouldLog(level, env = process.env) {
   return level !== 'debug' || Boolean(env.WATCHDOG_DEBUG);
 }
@@ -71,17 +90,45 @@ export function readBudgetExceeded(startedAt, now) {
   return now - startedAt > READ_BUDGET_MS;
 }
 
-export function detectBanner(lines) {
-  const window = lines.slice(-TAIL_LINES);
+export function hasOutageLine(lines) {
+  const window = lines.slice(-TAIL_LINES).map((l) => stripAnsi(l).trim());
+  return OUTAGE_PATTERNS.some((p) => window.some((l) => p.re.test(l)));
+}
+
+export function detectBanner(lines, platform = 'unknown') {
+  const window = lines.slice(-TAIL_LINES).map((l) => stripAnsi(l).trim());
+
+  // --- limit rule (unchanged semantics; now on stripped lines) ---
   // Drop soft "approaching … limit" warning lines first, so such a warning can
   // neither be mistaken for a reached-banner nor veto a genuine reached-banner
-  // that happens to share the same 15-line window (a per-line veto, not a
-  // whole-window one — the latter dropped real banners).
+  // that happens to share the same 15-line window (per-line veto, not whole-window).
   const kept = window.filter((l) => !VETO_RE.test(l));
   const text = kept.join('\n');
-  if (!(LIMIT_RE.test(text) && REACHED_RE.test(text) && RESET_RE.test(text))) return null;
-  const relevant = kept.filter((l) => LIMIT_RE.test(l) || RESET_RE.test(l));
-  return { bannerText: relevant.map((l) => l.trim()).join(' | ') };
+  let limit = null;
+  if (LIMIT_RE.test(text) && REACHED_RE.test(text) && RESET_RE.test(text)) {
+    const isRelevant = (l) => !VETO_RE.test(l) && (LIMIT_RE.test(l) || RESET_RE.test(l));
+    const l = lastIndex(window, isRelevant);
+    limit = { kind: 'limit', bannerText: window.filter(isRelevant).join(' | '),
+      matchedLine: window[l], patternId: 'limit', index: l };
+  }
+
+  // --- outage rule ---
+  let outage = null;
+  for (const p of OUTAGE_PATTERNS) {
+    if (!p.platforms.includes(platform)) continue;
+    const e = lastIndex(window, (l) => p.re.test(l));
+    if (e < 0) continue;
+    if (lastIndex(window, (l) => RETRY_RE.test(l)) >= e) continue;   // still retrying
+    if (!window.slice(e + 1).every(isChrome)) continue;               // stale: agent moved on
+    outage = { kind: 'outage', bannerText: sanitize(window[e], 200),
+      matchedLine: window[e], patternId: p.id, index: e };
+    break;
+  }
+
+  const pick = (limit && outage) ? (limit.index >= outage.index ? limit : outage) : (limit ?? outage);
+  if (!pick) return null;
+  const { index, ...banner } = pick;
+  return banner;
 }
 
 export function parseResetTime(text, now) {
