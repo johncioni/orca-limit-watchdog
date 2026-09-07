@@ -35,6 +35,27 @@ const REACHED_RE = /(reached|hit|exceeded)/i;
 const RESET_RE = /(resets?\b|try again|available|come back)/i;
 const VETO_RE = /approaching[^\n]*limit/i;
 
+// CSI (ESC [ … final), OSC (ESC ] … BEL|ST), and stray C0/DEL control bytes.
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\x00-\x08\x0b-\x1f\x7f]/g;
+export function stripAnsi(s) { return String(s).replace(ANSI_RE, ''); }
+
+// Credential shapes redacted from every logged terminal fragment. The last
+// pattern (32+ opaque chars) also catches raw JWT/API-key material we have no
+// prefix for; ordinary words and short git hashes are far below that length.
+const SECRET_RES = [
+  /\bsk-[A-Za-z0-9_-]{8,}/g,
+  /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{8,}/g,
+  /\bgithub_pat_[A-Za-z0-9_]{8,}/g,
+  /\bBearer\s+\S+/gi,
+  /\bAKIA[0-9A-Z]{16}\b/g,
+  /[A-Za-z0-9+/=_-]{32,}/g,
+];
+export function sanitize(text, limit = 200) {
+  let s = stripAnsi(text).replace(/\s+/g, ' ').trim();
+  for (const re of SECRET_RES) s = s.replace(re, '[redacted]');
+  return s.length > limit ? `${s.slice(0, limit)}…` : s;
+}
+
 export function shouldLog(level, env = process.env) {
   return level !== 'debug' || Boolean(env.WATCHDOG_DEBUG);
 }

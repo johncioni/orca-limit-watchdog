@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { detectBanner, parseResetTime, reconcile, eventKey } from './watchdog.mjs';
+import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize } from './watchdog.mjs';
 
 const CLAUDE_BANNER = [
   '─'.repeat(40),
@@ -222,4 +222,28 @@ test('read loop stops once the tick budget is spent', () => {
   const t0 = new Date('2026-08-27T00:00:00Z');
   assert.equal(readBudgetExceeded(t0, new Date(t0.getTime() + min(2))), false);
   assert.equal(readBudgetExceeded(t0, new Date(t0.getTime() + min(3) + 1)), true);
+});
+
+// --- sanitize ---
+
+test('stripAnsi removes CSI, OSC and control bytes', () => {
+  assert.equal(stripAnsi('\x1b[1;31mred\x1b[0m \x1b]0;title\x07x\x07'), 'red x');
+});
+
+test('sanitize redacts credentials and long opaque runs', () => {
+  assert.equal(sanitize('key sk-abcdefghijklmnop end'), 'key [redacted] end');
+  assert.equal(sanitize('ghp_ABCDEFGHIJKLMNOP'), '[redacted]');
+  assert.equal(sanitize('github_pat_11ABCDEFG_xyz'), '[redacted]');
+  assert.equal(sanitize('Authorization: Bearer eyJhbGciOi'), 'Authorization: [redacted]');
+  assert.equal(sanitize('AKIA' + 'ABCDEFGHIJKLMNOP'), '[redacted]'); // built at runtime so secret scanners don't flag the fixture
+  assert.equal(sanitize('a'.repeat(40)), '[redacted]');
+});
+
+test('sanitize leaves ordinary text and short hashes alone', () => {
+  assert.equal(sanitize('API Error: 529 overloaded_error at b7ea497'), 'API Error: 529 overloaded_error at b7ea497');
+});
+
+test('sanitize strips ANSI, collapses whitespace and truncates', () => {
+  assert.equal(sanitize('\x1b[2m  a \n\t b  \x1b[0m'), 'a b');
+  assert.equal(sanitize('x'.repeat(10), 4), 'xxxx…');
 });
