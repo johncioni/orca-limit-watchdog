@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine } from './watchdog.mjs';
+import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform } from './watchdog.mjs';
 
 const CLAUDE_BANNER = [
   '─'.repeat(40),
@@ -136,6 +136,19 @@ test('class precedence is chronological by last contributing line', () => {
 test('hasOutageLine reports a pattern line regardless of platform or trailing prose', () => {
   assert.equal(hasOutageLine([CLAUDE_529, 'moved on', 'john@mac ~ %']), true);
   assert.equal(hasOutageLine(['all good', '> ']), false);
+});
+
+// --- inferPlatform ---
+
+test('agentIdentity is authoritative; banner is the fallback; else unknown', () => {
+  const claudeBanner = { patternId: 'claude-api-error' };
+  assert.equal(inferPlatform({ agentIdentity: 'codex' }, claudeBanner), 'codex');
+  assert.equal(inferPlatform({ agentIdentity: 'claude' }, null), 'claude');
+  assert.equal(inferPlatform({}, claudeBanner), 'claude');
+  assert.equal(inferPlatform(undefined, claudeBanner), 'claude');
+  assert.equal(inferPlatform({ agentIdentity: 'gpt' }, null), 'unknown');
+  assert.equal(inferPlatform({}, { patternId: 'limit' }), 'unknown');
+  assert.equal(inferPlatform({ agentIdentity: 'gpt' }), 'unknown');
 });
 
 // --- parseResetTime ---

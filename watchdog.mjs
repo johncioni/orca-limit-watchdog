@@ -131,6 +131,13 @@ export function detectBanner(lines, platform = 'unknown') {
   return banner;
 }
 
+export function inferPlatform(terminal, banner = null) {
+  const id = terminal?.agentIdentity;
+  if (id === 'claude' || id === 'codex') return id;
+  if (banner?.patternId === 'claude-api-error') return 'claude';
+  return 'unknown';
+}
+
 export function parseResetTime(text, now) {
   const relHM = text.match(/\bin\s+(\d+)\s*h(?:ou)?rs?\b(?:\s*(?:and\s+)?(\d+)\s*m(?:in(?:ute)?s?)?)?/i);
   if (relHM) {
