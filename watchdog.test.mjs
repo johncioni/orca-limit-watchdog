@@ -685,3 +685,16 @@ test('sanitize strips ANSI, collapses whitespace and truncates', () => {
   assert.equal(sanitize('\x1b[2m  a \n\t b  \x1b[0m'), 'a b');
   assert.equal(sanitize('x'.repeat(10), 4), 'xxxx…');
 });
+
+// --- e2e status stub ---
+
+test('status-stub serves the scripted indicator sequence and repeats the last', async () => {
+  const { startStub } = await import('./e2e/status-stub.mjs');
+  const stub = await startStub(0, ['major', 'none']);
+  try {
+    const get = async () => (await (await fetch(`http://127.0.0.1:${stub.port}/api/v2/status.json`)).json()).status.indicator;
+    assert.equal(await get(), 'major');
+    assert.equal(await get(), 'none');
+    assert.equal(await get(), 'none');
+  } finally { await stub.close(); }
+});
