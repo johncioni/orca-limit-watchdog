@@ -8,14 +8,29 @@ precisely when every agent subscription is exhausted.
 ## How it works
 
 launchd runs `watchdog.mjs` every 5 minutes. Each tick reads every connected
-Orca terminal's tail, looks for a limit banner (limit phrase + reset phrase in
-the last 15 lines), parses the stated reset time, and — once it has passed and
-the terminal is idle with the banner still showing — sends:
+Orca terminal's tail and looks for one of two banners in the last 15 lines:
 
-> Session rate limit has reset. Resume where you left off.
+- **Rate limit** (limit phrase + reset phrase): parses the stated reset time
+  and, once it has passed and the terminal is idle with the banner still
+  showing, sends
+  > Session rate limit has reset. Resume where you left off.
 
-Normally exactly one send per limit event; if the banner survives a send, up
-to two retries 30 min apart, then it gives up loudly in the log.
+  Normally one send per event; up to two retries 30 min apart, then it gives
+  up loudly in the log.
+- **API outage** (Claude Code's own `API Error: 5xx / Connection error /
+  overloaded_error` line as the final stalled banner, on a terminal Orca
+  identifies as `claude`): waits 10 min, then sends
+  > The API outage appears to be over. Resume where you left off.
+
+  Up to 6 sends 30 min apart, hard stop 24 h after detection. Before each
+  send it checks `status.claude.com`; a `major`/`critical` incident holds the
+  send (without using an attempt). Any status-page problem fails open.
+  Codex outage detection is not enabled yet (no captured transcript).
+
+Both kinds refuse to send when the terminal's last line is a shell prompt
+(the agent exited). Network access is limited to the two status pages and
+happens only when an outage send is due; `WATCHDOG_STATUS_URL_CLAUDE` /
+`_CODEX` override them for tests and are honoured only for loopback URLs.
 
 ## Install
 
@@ -38,6 +53,17 @@ tail -f ~/.local/state/orca-limit-watchdog/watchdog.log
 
 ```bash
 node --test       # unit tests (patterns, time parsing, lifecycle)
+```
+
+E2E (scratch Orca terminal, never a live agent):
+
+```bash
+node e2e/status-stub.mjs 8123 major,none &                 # tick 1 held, tick 2 sends
+orca terminal create --command 'node e2e/fake-tui.mjs /tmp/recv.txt --outage'   # note the handle
+# preseed a due outage event for that handle (resetAt in the past), then:
+WATCHDOG_STATUS_URL_CLAUDE=http://127.0.0.1:8123/api/v2/status.json node watchdog.mjs --once
+WATCHDOG_STATUS_URL_CLAUDE=http://127.0.0.1:8123/api/v2/status.json node watchdog.mjs --once
+cat /tmp/recv.txt   # exactly one outage resume line
 ```
 
 Design: `docs/superpowers/specs/2026-07-23-orca-limit-watchdog-design.md`.
