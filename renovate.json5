@@ -21,11 +21,11 @@
   osvVulnerabilityAlerts: true,
 
   // No Dependency Dashboard issue; majors open as ordinary standalone PRs
-  // after the soak (close the PR to decline).
+  // after a 14-day soak, same as the other repos (close the PR to decline).
   dependencyDashboard: false,
 
   packageRules: [
     { matchManagers: ["github-actions"], groupName: "github actions" },
-    { matchUpdateTypes: ["major"], groupName: null, labels: ["dependencies", "major"] },
+    { matchUpdateTypes: ["major"], groupName: null, labels: ["dependencies", "major"], minimumReleaseAge: "14 days" },
   ],
 }
