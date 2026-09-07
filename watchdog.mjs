@@ -278,6 +278,38 @@ export function isShellPrompt(tail, agentIdentity) {
   return SHELL_PROMPT_RE.test(last);
 }
 
+const STATUS_URLS = Object.freeze({
+  claude: 'https://status.claude.com/api/v2/status.json',
+  codex: 'https://status.openai.com/api/v2/status.json',
+});
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '[::1]', 'localhost']);
+
+// Resolve the status page for a platform. The env override exists for the E2E
+// stub only and is honoured solely for http(s) loopback URLs (spec safety §5).
+export function statusUrlFor(platform, env = process.env) {
+  const url = STATUS_URLS[platform];
+  const override = env[`WATCHDOG_STATUS_URL_${platform.toUpperCase()}`];
+  if (!override) return { url, warn: null };
+  try {
+    const u = new URL(override);
+    if ((u.protocol === 'http:' || u.protocol === 'https:') && LOOPBACK_HOSTS.has(u.hostname)) return { url: override, warn: null };
+  } catch { /* fall through */ }
+  return { url, warn: `ignoring non-loopback status URL override for ${platform}` };
+}
+
+// Fetch a Statuspage indicator. Never throws: any failure is null (fail open).
+export async function fetchIndicator(url, fetchImpl = globalThis.fetch) {
+  try {
+    const r = await fetchImpl(url, { redirect: 'error', signal: AbortSignal.timeout(10_000) });
+    if (!r.ok) return null;
+    const j = await r.json();
+    const ind = j?.status?.indicator;
+    return typeof ind === 'string' ? ind : null;
+  } catch { return null; }
+}
+
+export const suppressedByStatus = (indicator) => indicator === 'major' || indicator === 'critical';
+
 // --- imperative shell ---
 
 const pExecFile = promisify(execFile);

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
 import { isShellPrompt } from './watchdog.mjs';
+import { statusUrlFor, fetchIndicator, suppressedByStatus } from './watchdog.mjs';
 
 const CLAUDE_BANNER = [
   '─'.repeat(40),
@@ -475,6 +476,53 @@ test('isShellPrompt recognises shell prompt endings and fails closed on a bare "
   assert.equal(isShellPrompt(['API Error: 529', '> '], 'claude'), false);
   assert.equal(isShellPrompt(['API Error: 529', '? for shortcuts']), false);
   assert.equal(isShellPrompt([]), false);
+});
+
+// --- status gate ---
+
+const CLAUDE_URL = 'https://status.claude.com/api/v2/status.json';
+const CODEX_URL = 'https://status.openai.com/api/v2/status.json';
+
+test('statusUrlFor: defaults, loopback overrides honoured, everything else ignored with a warning', () => {
+  assert.deepEqual(statusUrlFor('claude', {}), { url: CLAUDE_URL, warn: null });
+  assert.deepEqual(statusUrlFor('codex', {}), { url: CODEX_URL, warn: null });
+  for (const ok of ['http://127.0.0.1:8123/s.json', 'http://localhost:8123/s.json', 'https://[::1]:8123/s.json']) {
+    assert.deepEqual(statusUrlFor('claude', { WATCHDOG_STATUS_URL_CLAUDE: ok }), { url: ok, warn: null }, ok);
+  }
+  for (const bad of ['https://evil.example/s.json', 'file:///etc/passwd', 'ftp://127.0.0.1/x', 'http://127.0.0.1.evil.example/', 'not a url']) {
+    const r = statusUrlFor('claude', { WATCHDOG_STATUS_URL_CLAUDE: bad });
+    assert.equal(r.url, CLAUDE_URL, bad);
+    assert.match(r.warn, /ignoring/);
+  }
+  assert.equal(statusUrlFor('codex', { WATCHDOG_STATUS_URL_CLAUDE: 'http://127.0.0.1:1/' }).url, CODEX_URL);
+});
+
+const fakeFetch = (impl) => {
+  const calls = [];
+  const f = async (url, opts) => { calls.push({ url, opts }); return impl(url, opts); };
+  f.calls = calls;
+  return f;
+};
+const okJson = (body) => ({ ok: true, status: 200, json: async () => body });
+
+test('fetchIndicator reads status.indicator, passes redirect:error and a timeout signal', async () => {
+  const f = fakeFetch(() => okJson({ status: { indicator: 'major' } }));
+  assert.equal(await fetchIndicator(CLAUDE_URL, f), 'major');
+  assert.equal(f.calls[0].opts.redirect, 'error');
+  assert.ok(f.calls[0].opts.signal instanceof AbortSignal);
+});
+
+test('fetchIndicator returns null on non-200, bad JSON, missing field, or throw', async () => {
+  assert.equal(await fetchIndicator(CLAUDE_URL, fakeFetch(() => ({ ok: false, status: 503, json: async () => ({}) }))), null);
+  assert.equal(await fetchIndicator(CLAUDE_URL, fakeFetch(() => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('x'); } }))), null);
+  assert.equal(await fetchIndicator(CLAUDE_URL, fakeFetch(() => okJson({ page: {} }))), null);
+  assert.equal(await fetchIndicator(CLAUDE_URL, fakeFetch(() => { throw new TypeError('redirect'); })), null);
+});
+
+test('suppressedByStatus only for major/critical', () => {
+  assert.equal(suppressedByStatus('major'), true);
+  assert.equal(suppressedByStatus('critical'), true);
+  for (const v of ['none', 'minor', 'weird', null, undefined]) assert.equal(suppressedByStatus(v), false, String(v));
 });
 
 // --- log hygiene + tick robustness ---
