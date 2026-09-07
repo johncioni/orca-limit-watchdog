@@ -206,7 +206,7 @@ Unit (`node --test`), all pure functions with injected `now` and injected
 
 - Detection: Claude `API Error: 529 … overloaded_error` ⇒ outage; Codex
   `stream error` / `stream disconnected` ⇒ outage; `Retrying in 5s…` in the
-  window ⇒ no outage (veto); `reconnecting…` ⇒ no outage; a window with both a
+  window ⇒ no outage (veto); `reconnecting…` alone ⇒ no outage (no match, no veto); a window with both a
   limit banner and an API-error line ⇒ `limit`; code output discussing
   "connection reset" with a shell prompt on the last line ⇒ detected at
   reconcile time but rejected by the prompt guard (guard tested separately
