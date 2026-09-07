@@ -20,10 +20,21 @@ const ORCA = process.env.ORCA_CLI
   || (fs.existsSync('/usr/local/bin/orca') ? '/usr/local/bin/orca' : 'orca');
 
 const MIN = 60_000;
-const BUFFER_MS = 2 * MIN;        // wait past stated reset before sending
-const REARM_MS = 10 * MIN;        // banner still present this long after a send = failed attempt
-const RETRY_SPACING_MS = 30 * MIN;
-const MAX_ATTEMPTS = 3;
+export const OUTAGE_RESUME_TEXT = 'The API outage appears to be over. Resume where you left off.';
+
+// Per-kind schedule (spec §4). bufferMs: wait past resetAt before sending;
+// rearmMs: banner still present this long after a send = failed attempt;
+// deadlineMs: give up this long after detection regardless of attempts.
+export const SCHEDULE = Object.freeze({
+  limit: Object.freeze({ bufferMs: 2 * MIN, retrySpacingMs: 30 * MIN, rearmMs: 10 * MIN, maxSends: 3, deadlineMs: null,
+    resumeText: RESUME_TEXT }),
+  outage: Object.freeze({ bufferMs: 0, retrySpacingMs: 30 * MIN, rearmMs: 10 * MIN, maxSends: 6, deadlineMs: 24 * 60 * MIN,
+    initialDelayMs: 10 * MIN, resumeText: OUTAGE_RESUME_TEXT }),
+});
+const KINDS = Object.keys(SCHEDULE);
+const PLATFORMS = ['claude', 'codex', 'unknown'];
+const STATUSES = ['waiting', 'resumed', 'gave_up'];
+const { bufferMs: BUFFER_MS, rearmMs: REARM_MS, retrySpacingMs: RETRY_SPACING_MS, maxSends: MAX_ATTEMPTS } = SCHEDULE.limit; // removed in Task 5
 const GRACE_PAST_MS = 2 * 60 * MIN; // absolute time this recently past = already reset
 const TAIL_LINES = 15;
 const READ_BUDGET_MS = 3 * MIN;    // stop reading terminals before the 4-min tick deadline
@@ -138,6 +149,54 @@ export function inferPlatform(terminal, banner = null) {
   return 'unknown';
 }
 
+export function newEvent(o, now) {
+  const kind = o.banner.kind;
+  const resetAt = kind === 'outage'
+    ? new Date(now.getTime() + SCHEDULE.outage.initialDelayMs)
+    : (parseResetTime(o.banner.bannerText, now) ?? new Date(now.getTime() + 60 * MIN));
+  return {
+    handle: o.handle, kind, platform: o.platform ?? 'unknown', bannerText: o.banner.bannerText,
+    detectedAt: now.toISOString(), resetAt: resetAt.toISOString(),
+    attempts: 0, lastAttemptAt: null, status: 'waiting',
+  };
+}
+
+const isIso = (v) => typeof v === 'string' && !Number.isNaN(Date.parse(v));
+
+// Returns the first violation as a string, or null when the event is valid (spec §3).
+export function validateEvent(key, ev) {
+  if (!ev || typeof ev !== 'object') return 'event: not an object';
+  if (typeof ev.handle !== 'string' || ev.handle === '' || ev.handle !== key) return 'handle: must equal its key';
+  if (!KINDS.includes(ev.kind)) return `kind: ${ev.kind}`;
+  if (!PLATFORMS.includes(ev.platform)) return `platform: ${ev.platform}`;
+  if (ev.kind === 'outage' && ev.platform === 'unknown') return 'platform: outage requires a known platform';
+  if (!STATUSES.includes(ev.status)) return `status: ${ev.status}`;
+  if (typeof ev.bannerText !== 'string') return 'bannerText: not a string';
+  if (!isIso(ev.detectedAt)) return 'detectedAt: not a timestamp';
+  if (!isIso(ev.resetAt)) return 'resetAt: not a timestamp';
+  const max = SCHEDULE[ev.kind].maxSends;
+  if (!Number.isInteger(ev.attempts) || ev.attempts < 0 || ev.attempts > max) return `attempts: ${ev.attempts} (0..${max})`;
+  if (ev.lastAttemptAt !== null && !isIso(ev.lastAttemptAt)) return 'lastAttemptAt: not null or a timestamp';
+  if (ev.lastAttemptAt === null && (ev.status !== 'waiting' || ev.attempts > 0)) return 'lastAttemptAt: required once an attempt was made';
+  return null;
+}
+
+// Parses state.json text. v1 is upgraded in memory (kind limit, platform
+// unknown) then validated as v2. Returns null for anything invalid.
+export function parseStateFile(text) {
+  let s;
+  try { s = JSON.parse(text); } catch { return null; }
+  if (!s || typeof s !== 'object' || !s.events || typeof s.events !== 'object') return null;
+  if (s.version !== 1 && s.version !== 2) return null;
+  const events = {};
+  for (const [key, raw] of Object.entries(s.events)) {
+    const ev = s.version === 1 ? { ...raw, kind: 'limit', platform: 'unknown' } : raw;
+    if (validateEvent(key, ev) !== null) return null;
+    events[key] = ev;
+  }
+  return events;
+}
+
 export function parseResetTime(text, now) {
   const relHM = text.match(/\bin\s+(\d+)\s*h(?:ou)?rs?\b(?:\s*(?:and\s+)?(\d+)\s*m(?:in(?:ute)?s?)?)?/i);
   if (relHM) {
@@ -245,22 +304,33 @@ async function orca(args) {
 }
 
 function loadState() {
-  try {
-    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    if (s.version === 1 && s.events && typeof s.events === 'object') return s.events;
-    throw new Error('unexpected schema');
-  } catch (e) {
+  let text;
+  try { text = fs.readFileSync(STATE_FILE, 'utf8'); } catch (e) {
     if (e.code === 'ENOENT') return {};
-    try { fs.renameSync(STATE_FILE, `${STATE_FILE}.bad-${Date.now()}`); } catch { /* gone */ }
     log('warn', `state file unreadable (${e.message}); reset`);
     return {};
   }
+  const events = parseStateFile(text);
+  if (events) return events;
+  // Name the first violation so a bad file is diagnosable from the log.
+  let why = 'invalid state file';
+  try {
+    const s = JSON.parse(text);
+    if (s?.version !== 1 && s?.version !== 2) why = `unsupported version ${s?.version}`;
+    else for (const [k, raw] of Object.entries(s.events ?? {})) {
+      const v = validateEvent(k, s.version === 1 ? { ...raw, kind: 'limit', platform: 'unknown' } : raw);
+      if (v) { why = `${k}: ${v}`; break; }
+    }
+  } catch (e) { why = e.message; }
+  try { fs.renameSync(STATE_FILE, `${STATE_FILE}.bad-${Date.now()}`); } catch { /* gone */ }
+  log('warn', `state file rejected (${why}); backed up and reset`);
+  return {};
 }
 
 function saveState(events) {
   fs.mkdirSync(STATE_DIR, { recursive: true });
   const tmp = `${STATE_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ version: 1, events }, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify({ version: 2, events }, null, 2));
   fs.renameSync(tmp, STATE_FILE);
 }
 
@@ -355,7 +425,7 @@ async function main() {
   if (args.has('--status')) {
     const events = loadState();
     console.log(Object.keys(events).length === 0 ? 'no active events'
-      : JSON.stringify({ version: 1, events }, null, 2));
+      : JSON.stringify({ version: 2, events }, null, 2));
     return;
   }
   if (fs.existsSync(DISABLED_FILE)) return;

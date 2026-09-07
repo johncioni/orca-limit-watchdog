@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform } from './watchdog.mjs';
+import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
+  SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
 
 const CLAUDE_BANNER = [
   '─'.repeat(40),
@@ -205,6 +206,66 @@ const H = 'term_abc';
 const min = (n) => n * 60_000;
 const obs = (banner) => [{ handle: H, banner: banner ? { bannerText: banner } : null }];
 const BANNER = 'Claude usage limit reached. | Your limit will reset at 3am.';
+
+// --- schema v2 ---
+
+const V1 = { handle: H, bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
+  attempts: 1, lastAttemptAt: NOW.toISOString(), status: 'resumed' };
+const V2 = { ...V1, kind: 'limit', platform: 'unknown' };
+
+test('schedule table matches the spec', () => {
+  assert.deepEqual(SCHEDULE.limit, { bufferMs: min(2), retrySpacingMs: min(30), rearmMs: min(10), maxSends: 3, deadlineMs: null,
+    resumeText: 'Session rate limit has reset. Resume where you left off.' });
+  assert.deepEqual(SCHEDULE.outage, { bufferMs: 0, retrySpacingMs: min(30), rearmMs: min(10), maxSends: 6, deadlineMs: min(24 * 60),
+    initialDelayMs: min(10), resumeText: OUTAGE_RESUME_TEXT });
+  assert.equal(OUTAGE_RESUME_TEXT, 'The API outage appears to be over. Resume where you left off.');
+});
+
+test('newEvent: outage resetAt is detectedAt + 10 min; limit parses the banner', () => {
+  const o = newEvent({ handle: H, platform: 'claude', banner: { kind: 'outage', bannerText: 'API Error: 529', patternId: 'claude-api-error' } }, NOW);
+  assert.deepEqual(o, { handle: H, kind: 'outage', platform: 'claude', bannerText: 'API Error: 529', detectedAt: NOW.toISOString(),
+    resetAt: new Date(NOW.getTime() + min(10)).toISOString(), attempts: 0, lastAttemptAt: null, status: 'waiting' });
+  const l = newEvent({ handle: H, platform: 'unknown', banner: { kind: 'limit', bannerText: 'session limit reached, resets in 2 hours' } }, NOW);
+  assert.equal(l.kind, 'limit');
+  assert.equal(new Date(l.resetAt).getTime(), NOW.getTime() + min(120));
+});
+
+test('validateEvent accepts a valid v2 event and names the first violation otherwise', () => {
+  assert.equal(validateEvent(H, V2), null);
+  assert.equal(validateEvent(H, { ...V2, attempts: 0, lastAttemptAt: null, status: 'waiting' }), null);
+  const bad = [
+    ['handle', { ...V2, handle: 'other' }],
+    ['kind', { ...V2, kind: 'oops' }],
+    ['kind', (() => { const { kind, ...rest } = V2; return rest; })()],
+    ['platform', { ...V2, platform: 'gpt' }],
+    ['platform', { ...V2, kind: 'outage', platform: 'unknown' }],
+    ['status', { ...V2, status: 'done' }],
+    ['bannerText', { ...V2, bannerText: 5 }],
+    ['detectedAt', { ...V2, detectedAt: 'yesterday' }],
+    ['resetAt', { ...V2, resetAt: 12 }],
+    ['attempts', { ...V2, attempts: -1 }],
+    ['attempts', { ...V2, attempts: 7 }],
+    ['attempts', { ...V2, kind: 'outage', platform: 'claude', attempts: 7 }],
+    ['attempts', { ...V2, attempts: 1.5 }],
+    ['lastAttemptAt', { ...V2, lastAttemptAt: null }],            // resumed needs a timestamp
+    ['lastAttemptAt', { ...V2, status: 'waiting', lastAttemptAt: null }], // attempts > 0 needs one
+    ['lastAttemptAt', { ...V2, lastAttemptAt: 'nope' }],
+  ];
+  for (const [field, ev] of bad) assert.match(validateEvent(H, ev) ?? 'VALID', new RegExp(field), JSON.stringify(ev));
+  assert.equal(validateEvent(H, { ...V2, kind: 'outage', platform: 'claude', attempts: 6 }), null);
+});
+
+test('parseStateFile upgrades v1 in memory, round-trips v2, rejects everything else', () => {
+  const v1 = parseStateFile(JSON.stringify({ version: 1, events: { [H]: V1 } }));
+  assert.deepEqual(v1[H], V2);
+  const v2 = parseStateFile(JSON.stringify({ version: 2, events: { [H]: V2 } }));
+  assert.deepEqual(v2[H], V2);
+  assert.equal(parseStateFile(JSON.stringify({ version: 3, events: {} })), null);
+  assert.equal(parseStateFile(JSON.stringify({ version: 2, events: { [H]: V1 } })), null); // missing kind
+  assert.equal(parseStateFile(JSON.stringify({ version: 2, events: { [H]: { ...V2, attempts: -1 } } })), null);
+  assert.equal(parseStateFile('not json'), null);
+  assert.deepEqual(parseStateFile(JSON.stringify({ version: 2, events: {} })), {});
+});
 
 test('event key is the terminal handle alone', () => {
   assert.equal(eventKey(H), H);
