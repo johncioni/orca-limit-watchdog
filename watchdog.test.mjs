@@ -4,6 +4,7 @@ import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
 import { isShellPrompt } from './watchdog.mjs';
 import { statusUrlFor, fetchIndicator, suppressedByStatus } from './watchdog.mjs';
+import { tick, RESUME_TEXT } from './watchdog.mjs';
 
 const CLAUDE_BANNER = [
   '─'.repeat(40),
@@ -523,6 +524,121 @@ test('suppressedByStatus only for major/critical', () => {
   assert.equal(suppressedByStatus('major'), true);
   assert.equal(suppressedByStatus('critical'), true);
   for (const v of ['none', 'minor', 'weird', null, undefined]) assert.equal(suppressedByStatus(v), false, String(v));
+});
+
+// --- tick send gate (fake orca, fake fetch, in-memory state) ---
+
+function harness({ tail, terminals, indicator = 'none', state = {}, now = at(10), readThrows = false }) {
+  const sent = [];
+  const orcaCalls = [];
+  let saved = null;
+  const orca = async (args) => {
+    orcaCalls.push(args);
+    const [scope, verb] = args;
+    if (scope === 'terminal' && verb === 'list') return { terminals };
+    if (scope === 'terminal' && verb === 'read') { if (readThrows) throw new Error('Command failed: read'); return { terminal: { tail } }; }
+    if (scope === 'terminal' && verb === 'wait') return {};
+    if (scope === 'terminal' && verb === 'send') { sent.push(args[args.indexOf('--text') + 1]); return {}; }
+    throw new Error(`unexpected orca call ${args.join(' ')}`);
+  };
+  const fetchImpl = fakeFetch(() => okJson({ status: { indicator } }));
+  const deps = { orca, fetchImpl, env: {}, now: () => now, loadState: () => structuredClone(state), saveState: (e) => { saved = structuredClone(e); }, log: () => {} };
+  return { deps, sent, orcaCalls, fetchImpl, saved: () => saved };
+}
+const T = { handle: H, connected: true, writable: true, agentIdentity: 'claude' };
+const OUTAGE_TAIL = [CLAUDE_529, '', '> ', '? for shortcuts'];
+
+test('tick: due outage event, status none ⇒ one outage resume, attempt persisted before send', async () => {
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, [OUTAGE_RESUME_TEXT]);
+  assert.equal(h.saved()[H].attempts, 1);
+  assert.equal(h.saved()[H].status, 'resumed');
+  assert.equal(h.fetchImpl.calls.length, 1);
+  assert.equal(h.fetchImpl.calls[0].url, CLAUDE_URL);
+});
+
+test('tick: status major suppresses without consuming an attempt', async () => {
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed(), indicator: 'major' });
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.saved()[H].attempts, 0);
+  assert.equal(h.saved()[H].lastAttemptAt, null);
+  assert.equal(h.saved()[H].status, 'waiting');
+});
+
+test('tick: limit events use the limit text and never touch the network', async () => {
+  const st = { [H]: { ...LIMIT_EV, platform: 'claude', bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
+    attempts: 0, lastAttemptAt: null, status: 'waiting' } };
+  const h = harness({ tail: [...CLAUDE_BANNER, '? for shortcuts'], terminals: [T], state: st, indicator: 'major' });
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, [RESUME_TEXT]);
+  assert.equal(h.fetchImpl.calls.length, 0);
+});
+
+test('tick: dry-run makes no sends and no network calls', async () => {
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });
+  await tick({ dryRun: true }, h.deps);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.fetchImpl.calls.length, 0);
+  assert.equal(h.saved(), null);
+});
+
+test('tick: fresh re-read failure leaves the event untouched and sends nothing', async () => {
+  const state = seed();
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state });
+  let reads = 0;
+  const inner = h.deps.orca;
+  h.deps.orca = async (args) => { if (args[1] === 'read' && ++reads === 2) throw new Error('Command failed'); return inner(args); };
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, []);
+  assert.deepEqual(h.saved()[H], state[H]);
+});
+
+test('tick: banner cleared on fresh re-read deletes the event; kind change replaces it; neither sends', async () => {
+  const flip = (second) => {
+    const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });
+    let reads = 0; const inner = h.deps.orca;
+    h.deps.orca = async (args) => (args[1] === 'read' && ++reads === 2) ? { terminal: { tail: second } } : inner(args);
+    return h;
+  };
+  const gone = flip(['all done', '> ', '? for shortcuts']);
+  await tick({ dryRun: false }, gone.deps);
+  assert.deepEqual(gone.sent, []); assert.deepEqual(gone.saved(), {});
+  const changed = flip([...CLAUDE_BANNER, '? for shortcuts']);
+  await tick({ dryRun: false }, changed.deps);
+  assert.deepEqual(changed.sent, []);
+  assert.equal(changed.saved()[H].kind, 'limit'); assert.equal(changed.saved()[H].attempts, 0);
+});
+
+test('tick: shell prompt on the fresh tail deletes the event and sends nothing', async () => {
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });
+  let reads = 0; const inner = h.deps.orca;
+  h.deps.orca = async (args) => (args[1] === 'read' && ++reads === 2) ? { terminal: { tail: [CLAUDE_529, 'john@mac ~ %'] } } : inner(args);
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, []); assert.deepEqual(h.saved(), {});
+});
+
+test('tick: one status fetch per platform per tick; claude major does not suppress codex', async () => {
+  const H2 = 'term_two';
+  const T2 = { ...T, handle: H2, agentIdentity: 'codex' };
+  const state = { ...seed(), [H2]: { ...seed()[H], handle: H2, platform: 'codex' } };
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T, T2], state });
+  h.deps.fetchImpl = fakeFetch((url) => okJson({ status: { indicator: url === CLAUDE_URL ? 'major' : 'none' } }));
+  // codex has no detection row, so give its terminal a claude-shaped tail via a per-handle read
+  const inner = h.deps.orca;
+  h.deps.orca = async (args) => inner(args);
+  await tick({ dryRun: false }, h.deps);
+  assert.equal(h.deps.fetchImpl.calls.filter((c) => c.url === CLAUDE_URL).length, 1);
+  assert.deepEqual(h.sent, []);            // claude suppressed; codex terminal's tail cannot match (no codex row) ⇒ event deleted, no send
+  assert.equal(h.saved()[H2], undefined);
+});
+
+test('tick: v1 state file on disk is saved back as v2', async () => {
+  const h = harness({ tail: ['nothing here', '> ', '? for shortcuts'], terminals: [T] });
+  h.deps.loadState = () => parseStateFile(JSON.stringify({ version: 1, events: {} }));
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.saved(), {});
 });
 
 // --- log hygiene + tick robustness ---

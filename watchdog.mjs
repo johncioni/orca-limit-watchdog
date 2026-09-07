@@ -383,19 +383,24 @@ function acquireLock() {
   } catch { return false; }
 }
 
-async function readTail(handle) {
-  const r = await orca(['terminal', 'read', '--terminal', handle]);
+async function readTail(handle, orcaFn = orca) {
+  const r = await orcaFn(['terminal', 'read', '--terminal', handle]);
   return r.terminal?.tail ?? [];
 }
 
-async function tick({ dryRun }) {
+const DEFAULT_DEPS = () => ({ orca, fetchImpl: globalThis.fetch, env: process.env, now: () => new Date(), loadState, saveState, log });
+
+export async function tick({ dryRun }, depsIn = {}) {
+  const deps = { ...DEFAULT_DEPS(), ...depsIn };
+  const log = deps.log;   // shadows the module logger so tests can silence it
   let terminals;
   try {
-    terminals = (await orca(['terminal', 'list'])).terminals ?? [];
+    terminals = (await deps.orca(['terminal', 'list'])).terminals ?? [];
   } catch (e) {
     if (isUnavailableError(e)) { log('debug', `orca unavailable: ${e.message.split('\n')[0]}`); return; }
     throw e;
   }
+  const byHandle = new Map(terminals.map((t) => [t.handle, t]));
 
   const observations = [];
   const startedAt = Date.now();
@@ -405,55 +410,87 @@ async function tick({ dryRun }) {
       break;
     }
     try {
-      observations.push({ handle: t.handle, banner: detectBanner(await readTail(t.handle)) });
+      const tail = await readTail(t.handle, deps.orca);
+      const banner = detectBanner(tail, inferPlatform(t));
+      if (!banner && shouldLog('debug') && hasOutageLine(tail)) {
+        log('debug', `outage line without stalled final block on ${t.handle}: ${sanitize(tail.slice(-TAIL_LINES).join(' | '), 600)}`);
+      }
+      observations.push({ handle: t.handle, banner, platform: inferPlatform(t, banner), window: tail.slice(-TAIL_LINES).join(' | ') });
     } catch (e) {
       log('warn', `read failed for ${t.handle}: ${e.message}`);
     }
   }
 
-  const now = new Date();
-  const state = loadState();
-  // Pass the full set of terminals that still exist so reconcile can tell a
-  // vanished terminal (delete its event) from one merely unread this tick
-  // (keep its event) — a transient read failure or budget skip must not reset
-  // attempt/backoff accounting and defeat RETRY_SPACING/MAX_ATTEMPTS.
+  const now = deps.now();
+  const state = deps.loadState();
+  // Pass every terminal that still exists so reconcile can tell a vanished
+  // terminal (delete) from one merely unread this tick (freeze).
   const liveHandles = terminals.map((t) => t.handle);
   const { events, sendCandidates } = reconcile(state, observations, now, liveHandles);
 
   for (const key of Object.keys(events)) {
-    if (!state[key]) log('info', `detected limit on ${events[key].handle}, resetAt ${events[key].resetAt}`);
+    const ev = events[key];
+    if (state[key]?.detectedAt === ev.detectedAt) continue;   // not new (also skips untouched events)
+    const o = observations.find((x) => x.handle === ev.handle);
+    log('info', `detected ${ev.kind} on ${ev.handle} (${ev.platform}, ${o?.banner?.patternId ?? 'limit'}: ${sanitize(o?.banner?.matchedLine ?? ev.bannerText)}), resetAt ${ev.resetAt}`);
+    if (ev.kind === 'outage' && shouldLog('debug')) log('debug', `outage window on ${ev.handle}: ${sanitize(o?.window ?? '', 600)}`);
   }
 
+  const indicators = new Map();   // platform → indicator, fetched at most once per tick
   for (const key of sendCandidates) {
     const ev = events[key];
-    if (dryRun) { log('info', `[dry-run] would resume ${ev.handle} (attempt ${ev.attempts + 1})`); console.log(`would resume ${ev.handle} (attempt ${ev.attempts + 1})`); continue; }
-    try {
-      await orca(['terminal', 'wait', '--terminal', ev.handle, '--for', 'tui-idle', '--timeout-ms', '5000']);
+    const sch = SCHEDULE[ev.kind];
+    if (dryRun) {
+      log('info', `[dry-run] would resume ${ev.handle} (${ev.kind}/${ev.platform}, attempt ${ev.attempts + 1})`);
+      console.log(`would resume ${ev.handle} (${ev.kind}/${ev.platform}, attempt ${ev.attempts + 1})`);
+      continue;
+    }
+    if (ev.kind === 'outage' && ev.platform !== 'unknown') {                       // 1. status gate
+      if (!indicators.has(ev.platform)) {
+        const { url, warn } = statusUrlFor(ev.platform, deps.env);
+        if (warn) log('warn', warn);
+        indicators.set(ev.platform, await fetchIndicator(url, deps.fetchImpl));
+      }
+      if (suppressedByStatus(indicators.get(ev.platform))) {
+        log('debug', `skip ${ev.handle}: ${ev.platform} status is ${indicators.get(ev.platform)}`); continue;
+      }
+    }
+    try {                                                                            // 2. idle check
+      await deps.orca(['terminal', 'wait', '--terminal', ev.handle, '--for', 'tui-idle', '--timeout-ms', '5000']);
     } catch (e) {
       log('info', `skip ${ev.handle}: not idle (${e.message})`); continue;
     }
-    // re-read immediately before sending: a limit banner must still be present
-    let stillThere = false;
-    try {
-      stillThere = detectBanner(await readTail(ev.handle)) !== null;
-    } catch { /* treated as gone */ }
-    if (!stillThere) { log('info', `skip ${ev.handle}: banner cleared before send`); continue; }
-    // persist the attempt BEFORE sending (at-most-once per attempt)
-    ev.attempts += 1;
+    let tail;                                                                        // 3. fresh re-read
+    try { tail = await readTail(ev.handle, deps.orca); } catch (e) {
+      log('warn', `skip ${ev.handle}: re-read failed (${e.message}); event untouched`); continue;
+    }
+    const term = byHandle.get(ev.handle);
+    const fresh = detectBanner(tail, inferPlatform(term));
+    if (!fresh) { log('info', `skip ${ev.handle}: banner cleared before send`); delete events[key]; deps.saveState(events); continue; }
+    const platform = inferPlatform(term, fresh);
+    if (fresh.kind !== ev.kind || (platform !== 'unknown' && platform !== ev.platform)) {
+      log('info', `skip ${ev.handle}: banner changed to ${fresh.kind}/${platform} before send; fresh event`);
+      events[key] = newEvent({ handle: ev.handle, banner: fresh, platform }, now); deps.saveState(events); continue;
+    }
+    if (isShellPrompt(tail, term?.agentIdentity)) {                                  // 4. prompt guard
+      log('warn', `skip ${ev.handle}: shell prompt on last line, agent has exited; event dropped`);
+      delete events[key]; deps.saveState(events); continue;
+    }
+    ev.attempts += 1;                                                                // 5. persist, then send
     ev.lastAttemptAt = now.toISOString();
     ev.status = 'resumed';
-    saveState(events);
-    await orca(['terminal', 'send', '--terminal', ev.handle, '--text', RESUME_TEXT, '--enter']);
-    log('info', `resumed ${ev.handle} (attempt ${ev.attempts})`);
+    deps.saveState(events);
+    await deps.orca(['terminal', 'send', '--terminal', ev.handle, '--text', sch.resumeText, '--enter']);
+    log('info', `resumed ${ev.handle} (${ev.kind}, attempt ${ev.attempts})`);
   }
 
   for (const [key, ev] of Object.entries(events)) {
     if (ev.status === 'gave_up' && state[key]?.status !== 'gave_up') {
-      log('error', `GAVE UP on ${ev.handle} after ${ev.attempts} attempts — banner never cleared`);
+      log('error', `GAVE UP on ${ev.handle} (${ev.kind}) after ${ev.attempts} attempts — banner never cleared`);
     }
   }
 
-  if (!dryRun) saveState(events);
+  if (!dryRun) deps.saveState(events);
   if (dryRun) console.log(`${Object.keys(events).length} active event(s), ${sendCandidates.length} send candidate(s)`);
 }
 
