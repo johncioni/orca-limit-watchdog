@@ -512,11 +512,11 @@ export async function tick({ dryRun }, depsIn = {}) {
     try {                                                                            // 2. idle check
       await deps.orca(['terminal', 'wait', '--terminal', ev.handle, '--for', 'tui-idle', '--timeout-ms', '5000']);
     } catch (e) {
-      log('info', `skip ${ev.handle}: not idle (${e.message})`); continue;
+      log('info', `skip ${ev.handle}: not idle (${sanitize(e.message)})`); continue;
     }
     let tail;                                                                        // 3. fresh re-read
     try { tail = await readTail(ev.handle, deps.orca); } catch (e) {
-      log('warn', `skip ${ev.handle}: re-read failed (${e.message}); event untouched`); continue;
+      log('warn', `skip ${ev.handle}: re-read failed (${sanitize(e.message)}); event untouched`); continue;
     }
     const term = byHandle.get(ev.handle);
     const fresh = detectBanner(tail, inferPlatform(term));
@@ -582,7 +582,7 @@ async function main() {
   try {
     await tick({ dryRun });
   } catch (e) {
-    log('error', `tick failed: ${e.message}`);
+    log('error', `tick failed: ${sanitize(e.message)}`);
   } finally {
     clearTimeout(deadline);
     if (!dryRun) fs.rmSync(LOCK_FILE, { force: true });

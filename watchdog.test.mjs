@@ -719,6 +719,24 @@ test('tick: a throwing send is logged and the remaining candidates still send (D
   assert.ok(logged.some((l) => l.startsWith('warn send failed for term_') && l.includes('agent_prompt_stalled')), logged.join('\n'));
 });
 
+test('tick: multi-line orca errors are logged on one line (DOG-13)', async () => {
+  const logged = [];
+  const orca = async (args) => {
+    const [scope, verb] = args;
+    if (scope === 'terminal' && verb === 'list') return { terminals: [T] };
+    if (scope === 'terminal' && verb === 'read') return { terminal: { tail: OUTAGE_TAIL } };
+    if (scope === 'terminal' && verb === 'wait') throw new Error('agent_prompt_stalled\n2026-09-07T00:00:00Z error INJECTED');
+    throw new Error(`unexpected orca call ${args.join(' ')}`);
+  };
+  const deps = { orca, fetchImpl: fakeFetch(() => okJson({ status: { indicator: 'none' } })), env: {}, now: () => at(10),
+    loadState: () => seed(), saveState: () => {}, log: (lvl, msg) => logged.push(msg) };
+  await tick({ dryRun: false }, deps);
+  const line = logged.find((m) => m.includes('not idle'));
+  assert.ok(line, logged.join('\n'));
+  assert.doesNotMatch(line, /\n/);
+  assert.match(line, /INJECTED/);
+});
+
 test('tick: terminal reads run with bounded concurrency, not one at a time (DOG-9)', async () => {
   const terminals = Array.from({ length: 8 }, (_, i) => ({ ...T, handle: `term_${i}` }));
   let inFlight = 0, peak = 0;
