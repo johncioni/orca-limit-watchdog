@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-// Build a curated, deterministic release archive (tar.gz) plus its SHA-256.
-// Pure Node, no dependencies: the same file set the installer expects, packed
-// so an identical tree always produces identical bytes (a stable Homebrew SHA).
+// Build a curated release archive (tar.gz) plus its SHA-256. Pure Node, no
+// dependencies. The tar payload is deterministic (fixed mtime, sorted entries,
+// fixed ownership), so a given build environment reproduces identical bytes;
+// the SHA the Homebrew formula pins is the uploaded asset's, set at release.
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';

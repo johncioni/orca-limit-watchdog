@@ -4,8 +4,8 @@
 #
 # On release: build the archive (`node scripts/build-release.mjs`), upload
 # dist/orca-limit-watchdog-<version>.tar.gz to the GitHub release for the tag,
-# then copy this file to the tap. The sha256 below is the deterministic archive
-# checksum; the build-release test keeps it in sync with the shipped tree.
+# then copy this file to the tap. Set the sha256 below to the uploaded asset's
+# checksum (`shasum -a 256 dist/orca-limit-watchdog-<version>.tar.gz`).
 class OrcaLimitWatchdog < Formula
   desc "Watchdog that auto-resumes rate-limited or stalled Orca terminals"
   homepage "https://github.com/johncioni/orca-limit-watchdog"
