@@ -20,6 +20,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with: { node-version: 22 }
       - run: node --test
-      - run: node --check watchdog.mjs && bash -n install.sh && bash -n uninstall.sh
+      - run: node --check watchdog.mjs && bash -n install.sh uninstall.sh scripts/orca-setup.sh
       # plutil is macOS-only; the runner is Linux, so validate the launchd plist with plistlib.
       - run: python3 -c "import plistlib; plistlib.load(open('com.john.orca-limit-watchdog.plist','rb'))"
