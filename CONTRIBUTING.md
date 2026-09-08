@@ -1,4 +1,4 @@
-# Contributing to orca-limit-watchdog
+# Contributing to Orca Watchdog
 
 Thanks for your interest! This is a small, dependency-free macOS daemon, and the
 goal is to keep it that way: easy to read, easy to audit, and safe by default.

@@ -1,10 +1,11 @@
-# orca-limit-watchdog
+# Orca Watchdog
 
-A local [launchd](https://www.launchd.info/) daemon for macOS that watches your
-connected [Orca](https://orca.dev) terminals for a stalled agent TUI and sends a
-one-line resume prompt when — and only when — it is safe to. Zero AI, zero
-tokens: it does its job precisely when the agent subscriptions it watches are
-exhausted.
+**Orca Watchdog** is a local [launchd](https://www.launchd.info/) daemon for
+macOS that watches your connected [Orca](https://orca.dev) terminals for a
+stalled agent TUI and sends a one-line resume prompt when — and only when — it
+is safe to. Zero AI, zero tokens: it does its job precisely when the agent
+subscriptions it watches are exhausted. (The installed command is
+`orca-limit-watchdog`.)
 
 It resumes on two conditions:
 

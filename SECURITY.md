@@ -2,8 +2,8 @@
 
 ## What this software does
 
-orca-limit-watchdog is a local macOS `launchd` daemon. Its only outward actions
-are:
+Orca Watchdog (the `orca-limit-watchdog` command) is a local macOS `launchd`
+daemon. Its only outward actions are:
 
 - reading the tail of your connected Orca terminals via the `orca` CLI, and
 - sending a fixed one-line resume prompt into a terminal when a rate limit or API

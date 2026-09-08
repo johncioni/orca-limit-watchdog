@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Orca Limit Watchdog are documented here.
+All notable changes to Orca Watchdog are documented here.
 
 ## 0.1.0 - 2026-09-08
 
