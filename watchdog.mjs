@@ -205,7 +205,8 @@ export function parseStateFile(text) {
 }
 
 export function parseResetTime(text, now) {
-  const relHM = text.match(/\bin\s+(\d+)\s*h(?:ou)?rs?\b(?:\s*(?:and\s+)?(\d+)\s*m(?:in(?:ute)?s?)?)?/i);
+  // "in 2 hours 15 minutes", "in 2h 30m", "in 3h", "in 1hr 5m"
+  const relHM = text.match(/\bin\s+(\d+)\s*h(?:(?:ou)?rs?)?\b(?:\s*(?:and\s+)?(\d+)\s*m(?:in(?:ute)?s?)?)?/i);
   if (relHM) {
     const mins = Number(relHM[1]) * 60 + Number(relHM[2] || 0);
     return new Date(now.getTime() + mins * MIN);

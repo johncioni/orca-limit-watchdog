@@ -217,6 +217,14 @@ test('parses bare relative minutes', () => {
   assert.equal(t.getTime(), NOW.getTime() + 45 * 60_000);
 });
 
+test('parses compact relative resets "in 3h 8m", "in 2h", "in 1hr 5m" (DOG-4)', () => {
+  const now = new Date('2026-09-07T10:00:00');
+  assert.equal(parseResetTime('Usage 41% (resets in 3h 8m)', now).getTime(), now.getTime() + 188 * 60_000);
+  assert.equal(parseResetTime('resets in 2h', now).getTime(), now.getTime() + 120 * 60_000);
+  assert.equal(parseResetTime('try again in 1hr 5m', now).getTime(), now.getTime() + 65 * 60_000);
+  assert.equal(parseResetTime('resets in 45m', now).getTime(), now.getTime() + 45 * 60_000);
+});
+
 test('recent past time (≤2h grace) means already reset — acts now, not tomorrow', () => {
   const t = parseResetTime('resets at 10pm', NOW); // 1h ago
   assert.equal(t.getDate(), 23);
