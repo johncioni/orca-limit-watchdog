@@ -204,7 +204,24 @@ export function parseStateFile(text) {
   return events;
 }
 
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+const MONTH_DAY_RE = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b/i;
+
+// Reads a clock time ("3pm", "3:30 p.m.", "14:00") out of text. Returns
+// { h, m } or null.
+function parseClock(text) {
+  const t12 = text.match(/\b(\d{1,2})(?::([0-5]\d))?\s*([ap])\.?m\.?\b/i);
+  if (t12) return { h: Number(t12[1]) % 12 + (t12[3].toLowerCase() === 'p' ? 12 : 0), m: Number(t12[2] || 0) };
+  const t24 = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+  if (t24) return { h: Number(t24[1]), m: Number(t24[2]) };
+  return null;
+}
+
 export function parseResetTime(text, now) {
+  // "in 3 days" (weekly limits) — a day count, never a clock time.
+  const relD = text.match(/\bin\s+(\d+)\s+days?\b/i);
+  if (relD) return new Date(now.getTime() + Number(relD[1]) * 24 * 60 * MIN);
+
   // "in 2 hours 15 minutes", "in 2h 30m", "in 3h", "in 1hr 5m"
   const relHM = text.match(/\bin\s+(\d+)\s*h(?:(?:ou)?rs?)?\b(?:\s*(?:and\s+)?(\d+)\s*m(?:in(?:ute)?s?)?)?/i);
   if (relHM) {
@@ -214,18 +231,22 @@ export function parseResetTime(text, now) {
   const relM = text.match(/\bin\s+(\d+)\s*m(?:in(?:ute)?s?)?\b/i);
   if (relM) return new Date(now.getTime() + Number(relM[1]) * MIN);
 
-  let h = null, m = 0;
-  const t12 = text.match(/\b(\d{1,2})(?::([0-5]\d))?\s*([ap])\.?m\.?\b/i);
-  if (t12) {
-    h = Number(t12[1]) % 12 + (t12[3].toLowerCase() === 'p' ? 12 : 0);
-    m = Number(t12[2] || 0);
-  } else {
-    const t24 = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
-    if (t24) { h = Number(t24[1]); m = Number(t24[2]); }
+  const clock = parseClock(text);
+
+  // "Sep 12 at 3pm", "September 12, 09:30", "on Sep 12" (midnight when no time)
+  const md = text.match(MONTH_DAY_RE);
+  if (md) {
+    const month = MONTHS.indexOf(md[1].slice(0, 3).toLowerCase());
+    const candidate = new Date(now);
+    candidate.setMonth(month, Number(md[2]));
+    candidate.setHours(clock?.h ?? 0, clock?.m ?? 0, 0, 0);
+    if (candidate <= now && now - candidate > GRACE_PAST_MS) candidate.setFullYear(candidate.getFullYear() + 1);
+    return candidate;
   }
-  if (h === null) return null;
+
+  if (!clock) return null;
   const candidate = new Date(now);
-  candidate.setHours(h, m, 0, 0);
+  candidate.setHours(clock.h, clock.m, 0, 0);
   if (candidate <= now && now - candidate > GRACE_PAST_MS) {
     candidate.setDate(candidate.getDate() + 1);
   }

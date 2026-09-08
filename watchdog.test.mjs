@@ -225,6 +225,17 @@ test('parses compact relative resets "in 3h 8m", "in 2h", "in 1hr 5m" (DOG-4)', 
   assert.equal(parseResetTime('resets in 45m', now).getTime(), now.getTime() + 45 * 60_000);
 });
 
+test('parses multi-day and month-day resets instead of defaulting to today (DOG-5)', () => {
+  const now = new Date('2026-09-07T10:00:00');
+  assert.equal(parseResetTime('Weekly limit reached. Resets in 3 days.', now).getTime(), now.getTime() + 3 * 24 * 60 * 60_000);
+  assert.equal(parseResetTime('resets Sep 12 at 3pm', now).getTime(), new Date('2026-09-12T15:00:00').getTime());
+  assert.equal(parseResetTime('resets September 12, 09:30', now).getTime(), new Date('2026-09-12T09:30:00').getTime());
+  // no time given: start of that day is the earliest safe assumption
+  assert.equal(parseResetTime('resets on Sep 12', now).getTime(), new Date('2026-09-12T00:00:00').getTime());
+  // a month-day already more than 2 minutes in the past means next year
+  assert.equal(parseResetTime('resets Jan 3 at 3pm', now).getTime(), new Date('2027-01-03T15:00:00').getTime());
+});
+
 test('recent past time (≤2h grace) means already reset — acts now, not tomorrow', () => {
   const t = parseResetTime('resets at 10pm', NOW); // 1h ago
   assert.equal(t.getDate(), 23);
