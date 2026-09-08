@@ -12,7 +12,7 @@ const CLAUDE_BANNER = [
   '> ',
 ];
 const CODEX_BANNER = [
-  "You've hit your usage limit. Try again at 14:00.",
+  "You've hit your usage limit. Try again at Sep 8th, 2026 2:00 PM.",
 ];
 const GEMINI_BANNER = [
   'Quota exceeded: daily limit reached for gemini-3-pro. Resets in 2 hours 15 minutes.',
@@ -234,6 +234,14 @@ test('parses multi-day and month-day resets instead of defaulting to today (DOG-
   assert.equal(parseResetTime('resets on Sep 12', now).getTime(), new Date('2026-09-12T00:00:00').getTime());
   // a month-day already more than 2 minutes in the past means next year
   assert.equal(parseResetTime('resets Jan 3 at 3pm', now).getTime(), new Date('2027-01-03T15:00:00').getTime());
+});
+
+test('parses month-day resets with an ordinal suffix and a year, as Codex prints them (DOG-16)', () => {
+  const now = new Date('2026-09-07T10:00:00');
+  assert.equal(parseResetTime("You've hit your usage limit. Try again at Sep 12th, 2026 9:30 AM.", now).getTime(), new Date('2026-09-12T09:30:00').getTime());
+  assert.equal(parseResetTime('Try again at Sep 8th, 2026 2:00 PM.', now).getTime(), new Date('2026-09-08T14:00:00').getTime());
+  assert.equal(parseResetTime('resets Oct 1st at 3pm', now).getTime(), new Date('2026-10-01T15:00:00').getTime());
+  assert.equal(parseResetTime('resets Jan 2nd, 2027 8:00 AM', now).getTime(), new Date('2027-01-02T08:00:00').getTime());
 });
 
 test('recent past time (≤2h grace) means already reset — acts now, not tomorrow', () => {

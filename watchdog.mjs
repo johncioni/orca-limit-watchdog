@@ -210,7 +210,7 @@ export function parseStateFile(text) {
 }
 
 const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
-const MONTH_DAY_RE = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b/i;
+const MONTH_DAY_RE = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?\b(?:,?\s+(\d{4}))?/i;
 
 // Reads a clock time ("3pm", "3:30 p.m.", "14:00") out of text. Returns
 // { h, m } or null.
@@ -243,9 +243,10 @@ export function parseResetTime(text, now) {
   if (md) {
     const month = MONTHS.indexOf(md[1].slice(0, 3).toLowerCase());
     const candidate = new Date(now);
-    candidate.setMonth(month, Number(md[2]));
+    if (md[3]) candidate.setFullYear(Number(md[3]), month, Number(md[2]));
+    else candidate.setMonth(month, Number(md[2]));
     candidate.setHours(clock?.h ?? 0, clock?.m ?? 0, 0, 0);
-    if (candidate <= now && now - candidate > GRACE_PAST_MS) candidate.setFullYear(candidate.getFullYear() + 1);
+    if (!md[3] && candidate <= now && now - candidate > GRACE_PAST_MS) candidate.setFullYear(candidate.getFullYear() + 1);
     return candidate;
   }
 
