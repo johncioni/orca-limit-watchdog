@@ -654,6 +654,33 @@ test('tick: an occupied input box skips the send and leaves the event untouched 
   assert.equal(h.saved()[H].status, 'waiting');
 });
 
+test('tick: a throwing send is logged and the remaining candidates still send (DOG-10)', async () => {
+  const H2 = 'term_second';
+  const T2 = { ...T, handle: H2 };
+  const sent = [];
+  const logged = [];
+  const orca = async (args) => {
+    const [scope, verb] = args;
+    if (scope === 'terminal' && verb === 'list') return { terminals: [T, T2] };
+    if (scope === 'terminal' && verb === 'read') return { terminal: { tail: OUTAGE_TAIL } };
+    if (scope === 'terminal' && verb === 'wait') return {};
+    if (scope === 'terminal' && verb === 'send') {
+      const handle = args[args.indexOf('--terminal') + 1];
+      if (handle === H) throw new Error('Command failed: agent_prompt_stalled');
+      sent.push(handle); return {};
+    }
+    throw new Error(`unexpected orca call ${args.join(' ')}`);
+  };
+  const state = { ...seed(), [H2]: { ...seed()[H], handle: H2 } };
+  let saved = null;
+  const deps = { orca, fetchImpl: fakeFetch(() => okJson({ status: { indicator: 'none' } })), env: {}, now: () => at(10),
+    loadState: () => structuredClone(state), saveState: (e) => { saved = structuredClone(e); }, log: (lvl, msg) => logged.push(`${lvl} ${msg}`) };
+  await tick({ dryRun: false }, deps);
+  assert.deepEqual(sent, [H2]);
+  assert.equal(saved[H].attempts, 1, 'attempt was persisted before the failed send');
+  assert.ok(logged.some((l) => l.startsWith('warn send failed for term_') && l.includes('agent_prompt_stalled')), logged.join('\n'));
+});
+
 test('tick: fresh re-read failure leaves the event untouched and sends nothing', async () => {
   const state = seed();
   const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state });

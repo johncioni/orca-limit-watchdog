@@ -522,8 +522,14 @@ export async function tick({ dryRun }, depsIn = {}) {
     ev.lastAttemptAt = now.toISOString();
     ev.status = 'resumed';
     deps.saveState(events);
-    await deps.orca(['terminal', 'send', '--terminal', ev.handle, '--text', sch.resumeText, '--enter']);
-    log('info', `resumed ${ev.handle} (${ev.kind}, attempt ${ev.attempts})`);
+    try {
+      await deps.orca(['terminal', 'send', '--terminal', ev.handle, '--text', sch.resumeText, '--enter']);
+      log('info', `resumed ${ev.handle} (${ev.kind}, attempt ${ev.attempts})`);
+    } catch (e) {
+      // The attempt is already persisted (no double-send on retry); the other
+      // candidates and the GAVE UP pass must still run this tick.
+      log('warn', `send failed for ${ev.handle} (attempt ${ev.attempts}): ${sanitize(e.message)}`);
+    }
   }
 
   for (const [key, ev] of Object.entries(events)) {
