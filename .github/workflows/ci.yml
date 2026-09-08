@@ -11,15 +11,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+  test:
+    name: test (${{ matrix.os }}, node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15 is Apple Silicon (arm64); macos-15-intel is Intel (x86_64).
+        # Full Node coverage on arm64; the Node floor also proven on Intel.
+        include:
+          - { os: macos-15, node: 22 }
+          - { os: macos-15, node: 24 }
+          - { os: macos-15, node: 26 }
+          - { os: macos-15-intel, node: 22 }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with: { persist-credentials: false }
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with: { node-version: 22 }
-      - run: node --test
-      - run: node --check watchdog.mjs && bash -n install.sh && bash -n uninstall.sh && bash -n scripts/orca-setup.sh
-      # plutil is macOS-only; the runner is Linux, so validate the launchd plist with plistlib.
-      - run: python3 -c "import plistlib; plistlib.load(open('com.john.orca-limit-watchdog.plist','rb'))"
+        with: { node-version: ${{ matrix.node }} }
+      - name: Report architecture
+        run: node -e "console.log(process.platform, process.arch, process.version)"
+      - name: Unit tests
+        run: node --test
+      - name: Syntax checks
+        run: |
+          node --check watchdog.mjs
+          node --check version.mjs
+          node --check lib/management.mjs
+          node --check bin/orca-limit-watchdog.mjs
+          node --check scripts/install-archive.mjs
+          node --check scripts/uninstall-archive.mjs
+          node --check scripts/build-release.mjs
+          bash -n bin/orca-limit-watchdog
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n scripts/orca-setup.sh
+      - name: Validate launchd plist
+        run: plutil -lint com.john.orca-limit-watchdog.plist
+      - name: Build release archive (smoke)
+        run: |
+          node scripts/build-release.mjs
+          cd dist && shasum -a 256 -c orca-limit-watchdog-*.tar.gz.sha256
+
+  # Required status check. Stays green only when every matrix leg passes, so the
+  # `ci` context that branch protection requires keeps reporting under one name.
+  ci:
+    name: ci
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Gate on the test matrix
+        run: |
+          echo "test matrix result: ${{ needs.test.result }}"
+          test "${{ needs.test.result }}" = "success"

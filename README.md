@@ -1,91 +1,165 @@
 # orca-limit-watchdog
 
-Local, deterministic watchdog that detects rate-limited agent TUIs (Claude
-Code, Codex, Gemini, …) in [Orca](https://orca.dev) terminals and sends a
-resume prompt after the limit resets. Zero AI, zero tokens — it keeps working
-precisely when every agent subscription is exhausted.
+A local [launchd](https://www.launchd.info/) daemon for macOS that watches your
+connected [Orca](https://orca.dev) terminals for a stalled agent TUI and sends a
+one-line resume prompt when — and only when — it is safe to. Zero AI, zero
+tokens: it does its job precisely when the agent subscriptions it watches are
+exhausted.
 
-## How it works
+It resumes on two conditions:
 
-launchd runs `watchdog.mjs` every 5 minutes. Each tick reads every connected
-Orca terminal's tail and looks for one of two banners in the last 15 lines:
+- **Rate limit** — a terminal shows a limit banner with a stated reset time. The
+  watchdog waits until that time has passed and the terminal is still idle on the
+  banner, then sends one resume prompt.
+- **API outage** — a terminal shows an outage banner (Claude Code's own
+  `API Error: 5xx / Connection error / overloaded_error`, or Codex's error line).
+  The watchdog waits out a hold, re-checks the relevant status page
+  (`status.claude.com` / `status.openai.com`), and resumes once the incident
+  clears.
 
-- **Rate limit** (limit phrase + reset phrase): parses the stated reset time
-  and, once it has passed and the terminal is idle with the banner still
-  showing, sends
-  > Session rate limit has reset. Resume where you left off.
+It is plain Node with no dependencies, no GUI, and no network access beyond the
+two status pages (contacted only when an outage resume is actually due).
 
-  Normally one send per event; up to two retries 30 min apart, then it gives
-  up loudly in the log.
-- **API outage** (Claude Code's own `API Error: 5xx / Connection error /
-  overloaded_error` line as the final stalled banner, on a terminal running
-  Claude Code—identified by Orca as `claude`, or by Claude Code's own
-  `API Error:` banner; a bare `>` last line is trusted only with the Orca
-  identity): waits 10 min, then sends
-  > The API outage appears to be over. Resume where you left off.
+## Requirements
 
-  Up to 6 sends 30 min apart, hard stop 24 h after detection. Before each
-  send it checks `status.claude.com`; a `major`/`critical` incident holds the
-  send (without using an attempt). Any status-page problem fails open.
-  Codex terminals are covered too: the TUI's own `■ …` error line (wording
-  taken from the Codex source; only on terminals Orca identifies as Codex),
-  gated on `status.openai.com`, and held while `Reconnecting... N/5` or
-  `esc to interrupt` is on screen.
-
-Both kinds refuse to send when the terminal's last line is a shell prompt
-(the agent exited). Network access is limited to the two status pages and
-happens only when an outage send is due; `WATCHDOG_STATUS_URL_CLAUDE` /
-`_CODEX` override them for tests and are honoured only for loopback URLs.
+- **macOS** (uses `launchd` and `plutil`).
+- **Node.js 22 or newer.** Homebrew installs this for you; the archive install
+  expects `node` on your `PATH` (or set `ORCA_WATCHDOG_NODE`).
+- **[Orca](https://orca.dev)** with its `orca` CLI available (or set `ORCA_CLI`
+  to its absolute path). The watchdog needs `orca terminal list/read/wait/send`.
 
 ## Install
 
+The watchdog installs **stopped**. Nothing is registered with `launchd` and no
+terminal is ever touched until you explicitly `start` it.
+
+### Homebrew (recommended)
+
 ```bash
-./install.sh      # validates node ≥ 20, writes plist, launchctl bootstrap
-./uninstall.sh
+brew install johncioni/tap/orca-limit-watchdog
 ```
+
+### Archive
+
+Download the release archive and its checksum from the
+[releases page](https://github.com/johncioni/orca-limit-watchdog/releases),
+verify it, then run the bundled installer:
+
+```bash
+# from the download directory, with the .tar.gz and .sha256 side by side:
+shasum -a 256 -c orca-limit-watchdog-0.1.0.tar.gz.sha256   # verify the download
+tar xzf orca-limit-watchdog-0.1.0.tar.gz
+cd orca-limit-watchdog-0.1.0
+./install.sh
+```
+
+The archive installs a versioned copy under
+`~/.local/share/orca-limit-watchdog/<version>/` and links the command into
+`~/.local/bin/orca-limit-watchdog` (make sure `~/.local/bin` is on your `PATH`).
+
+## First run
+
+```bash
+orca-limit-watchdog doctor   # confirm macOS, Node, Orca, and launchd state
+orca-limit-watchdog start    # validate, then register the LaunchAgent
+orca-limit-watchdog status   # service health, pause state, active events
+```
+
+Once started, `launchd` runs the watchdog every 5 minutes.
 
 ## Operate
 
 ```bash
-node watchdog.mjs --dry-run          # what would it do right now
-node watchdog.mjs --once             # readability alias for one normal tick
-node watchdog.mjs --status           # active events
-touch  ~/.local/state/orca-limit-watchdog/disabled   # pause everything
-rm     ~/.local/state/orca-limit-watchdog/disabled   # re-enable
-tail -f ~/.local/state/orca-limit-watchdog/watchdog.log
+orca-limit-watchdog status     # service / pause / events, reported separately
+orca-limit-watchdog pause      # stop acting without unregistering or losing state
+orca-limit-watchdog resume     # re-enable
+orca-limit-watchdog --dry-run  # run one observation-only tick; never sends input
+orca-limit-watchdog stop       # unregister the LaunchAgent (state is retained)
 ```
 
-## Test
+Logs and state live under `~/.local/state/orca-limit-watchdog/`:
+`watchdog.log` (activity), `launchd.out.log` / `launchd.err.log` (service
+output), `state.json` (tracked events), and `disabled` (present while paused).
+
+## Update
+
+**Homebrew:**
 
 ```bash
-node --test       # unit tests (patterns, time parsing, lifecycle)
+orca-limit-watchdog stop
+brew upgrade johncioni/tap/orca-limit-watchdog
+orca-limit-watchdog doctor && orca-limit-watchdog start
 ```
 
-`--once` is a readability alias for a single normal tick; it does not change
-the daemon's one-tick-per-invocation behavior.
-
-E2E (scratch Orca terminal, never a live agent):
+**Archive:** stop, install the new archive (it keeps the previous version for
+rollback), then start again:
 
 ```bash
-node e2e/status-stub.mjs 8123 major,none &                 # tick 1 held, tick 2 sends
-orca terminal create --command 'node e2e/fake-tui.mjs /tmp/recv.txt --outage'   # note the handle
-# preseed a due outage event for that handle (resetAt in the past), then:
-WATCHDOG_STATUS_URL_CLAUDE=http://127.0.0.1:8123/api/v2/status.json node watchdog.mjs --once
-WATCHDOG_STATUS_URL_CLAUDE=http://127.0.0.1:8123/api/v2/status.json node watchdog.mjs --once
-cat /tmp/recv.txt   # exactly one outage resume line
+orca-limit-watchdog stop
+cd orca-limit-watchdog-<new-version> && ./install.sh
+orca-limit-watchdog doctor && orca-limit-watchdog start
 ```
 
-## Develop
+If a new version misbehaves, roll back to the previous one and start:
 
 ```bash
-bash scripts/orca-setup.sh   # full local gate: node >= 20, syntax checks, node --test
+orca-limit-watchdog stop
+./install.sh --rollback
+orca-limit-watchdog start
 ```
 
-`orca.yaml` runs that script when Orca creates a worktree for this repo, so a
-spawned agent lands in a checkout that has already passed the gate. The agent
-workflow (roles, review loop, Orca and Linear conventions) is in `CLAUDE.md`.
+Your pause state and tracked events are preserved across updates.
 
-Design specs:
+## Remove
 
-- `docs/superpowers/specs/2026-07-23-orca-limit-watchdog-design.md` (rate-limit resume)
-- `docs/superpowers/specs/2026-09-07-outage-resume-design.md` (API-outage resume)
+```bash
+orca-limit-watchdog stop
+brew uninstall johncioni/tap/orca-limit-watchdog   # Homebrew
+./uninstall.sh                                      # archive
+```
+
+Removal unregisters the service and deletes the installed copy but **retains
+your state** at `~/.local/state/orca-limit-watchdog/`. Delete that directory by
+hand if you want a clean slate.
+
+## Troubleshooting
+
+- **`orca-limit-watchdog doctor`** is the first stop: it reports macOS, Node,
+  Orca CLI, launchd registration, pause, and event state, and exits non-zero if
+  anything required is missing.
+- **`orca` not found under launchd?** launchd runs with a minimal `PATH`. The
+  watchdog resolves absolute paths to Node and Orca when you `start`, so start it
+  from a shell where `orca` resolves, or set `ORCA_CLI` to an absolute path.
+- **Nothing happens on a stalled terminal?** Run `orca-limit-watchdog --dry-run`
+  to see what the current tick observes, and check `watchdog.log`.
+
+## How it works
+
+`launchd` runs `watchdog.mjs` every 5 minutes. Each tick reads every connected
+Orca terminal's tail and looks for a rate-limit or outage banner in the last few
+lines:
+
+- **Rate limit:** parses the stated reset time; once it has passed and the
+  terminal is still idle on the banner, sends one resume prompt. Normally one
+  send per event, with up to two retries 30 minutes apart before it gives up
+  loudly in the log.
+- **API outage:** waits 10 minutes, then before each send checks the relevant
+  status page. A `major`/`critical` incident holds the send without consuming an
+  attempt; any other status-page trouble fails open. Up to 6 sends 30 minutes
+  apart, with a hard stop 24 hours after detection. Codex terminals are held
+  additionally while `Reconnecting... N/5` or `esc to interrupt` is on screen.
+
+Both kinds **refuse to send when the terminal's last line is a shell prompt**
+(the agent has exited). Outage detection is scoped to terminals Orca identifies
+as Claude Code or Codex; rate-limit detection is generic. Network access is
+limited to the two status pages and happens only when an outage send is due.
+
+## Contributing & security
+
+- Contributor setup and workflow: [`CONTRIBUTING.md`](CONTRIBUTING.md).
+- Reporting a vulnerability: [`SECURITY.md`](SECURITY.md).
+
+## License
+
+[MIT](LICENSE) © John Cioni. An independent community utility; not affiliated
+with Orca, Anthropic, or OpenAI.

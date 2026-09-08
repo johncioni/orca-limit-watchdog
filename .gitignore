@@ -1,2 +1,9 @@
 # Orca per-repo hook state
 .orca/
+
+# Coordinator-only, ephemeral audit/review notes (never publish)
+.superpowers/
+HANDOFF.md
+
+# Release build output
+dist/

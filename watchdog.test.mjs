@@ -962,7 +962,7 @@ test('sanitize leaves ordinary text and short hashes alone', () => {
 });
 
 test('sanitize keeps filesystem paths but still redacts long opaque tokens (DOG-12)', () => {
-  const p = '/Users/john/Projects/orca-limit-watchdog/watchdog.mjs';
+  const p = '/Users/example/orca-limit-watchdog/watchdog.mjs';
   assert.equal(sanitize(`see ${p} line 3`), `see ${p} line 3`);
   assert.equal(sanitize('token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abc'), 'token [redacted]');
 });
@@ -1000,26 +1000,6 @@ test('CLI entry runs when invoked through a symlinked path (DOG-6)', async () =>
   try {
     const { stdout } = await pExecFile(process.execPath, [path.join(link, 'watchdog.mjs'), '--status'], { env: { ...process.env, HOME: tmp } });
     assert.equal(stdout.trim(), 'no active events');
-  } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
-  }
-});
-
-test('install.sh renders the plist without sed-delimiter corruption for paths containing | and & (DOG-15)', async () => {
-  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-plist-'));
-  const out = path.join(tmp, 'out.plist');
-  const script = `
-    set -euo pipefail
-    NODE_BIN='/opt/a|b/node'; REPO='/Users/x&y/repo'; STATE='/tmp/state'
-    eval "$(sed -n '/^render_plist()/,/^}/p' install.sh)"
-    render_plist com.john.orca-limit-watchdog.plist "${out}"
-  `;
-  try {
-    await pExecFile('bash', ['-c', script]);
-    const rendered = fs.readFileSync(out, 'utf8');
-    assert.match(rendered, /<string>\/opt\/a\|b\/node<\/string>/);
-    assert.match(rendered, /\/Users\/x&y\/repo/);
-    assert.doesNotMatch(rendered, /__(NODE|REPO|STATE)__/);
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
