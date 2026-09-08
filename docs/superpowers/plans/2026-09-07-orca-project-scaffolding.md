@@ -123,7 +123,7 @@ New layout:
 GlamBook's header comment (the AND/OR gotcha) + `[extend] useDefault =
 true`. No allowlists: CI is green on defaults today.
 
-### 5. `.github/workflows/ci.yml` (invariant, one-line change)
+### 5. `.github/workflows/ci.yml` + invariant lists (invariant files)
 
 Add `&& bash -n scripts/orca-setup.sh` to the syntax-check step (one
 invocation per file). Also add `orca.yaml` and `scripts/orca-setup.sh` to
