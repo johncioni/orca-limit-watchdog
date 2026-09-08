@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
-import { isShellPrompt } from './watchdog.mjs';
+import { isShellPrompt, isInputOccupied } from './watchdog.mjs';
 import { statusUrlFor, fetchIndicator, suppressedByStatus } from './watchdog.mjs';
 import { tick, RESUME_TEXT } from './watchdog.mjs';
 
@@ -637,6 +637,21 @@ test('tick: dry-run makes no sends and no network calls', async () => {
   assert.deepEqual(h.sent, []);
   assert.equal(h.fetchImpl.calls.length, 0);
   assert.equal(h.saved(), null);
+});
+
+test('isInputOccupied: a ">" line with text after it is a user draft', () => {
+  assert.equal(isInputOccupied(['API Error: 529', '> my half typed draft', '? for shortcuts']), true);
+  assert.equal(isInputOccupied(['API Error: 529', '> ', '? for shortcuts']), false);
+  assert.equal(isInputOccupied(['API Error: 529', '>', '? for shortcuts']), false);
+  assert.equal(isInputOccupied([]), false);
+});
+
+test('tick: an occupied input box skips the send and leaves the event untouched (DOG-7)', async () => {
+  const h = harness({ tail: [CLAUDE_529, '', '> my half typed draft', '? for shortcuts'], terminals: [T], state: seed() });
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.saved()[H].attempts, 0);
+  assert.equal(h.saved()[H].status, 'waiting');
 });
 
 test('tick: fresh re-read failure leaves the event untouched and sends nothing', async () => {

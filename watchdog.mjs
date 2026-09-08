@@ -309,6 +309,14 @@ export function isShellPrompt(tail, agentIdentity) {
   return SHELL_PROMPT_RE.test(last);
 }
 
+// True when Claude Code's input box (a line starting with ">") already holds
+// text. A send would be appended to that draft and --enter would submit both,
+// so the tick skips and the event stays as it is (spec §6.4 spirit).
+const INPUT_DRAFT_RE = /^>\s+\S/;
+export function isInputOccupied(tail) {
+  return tail.map((l) => stripAnsi(l).trimEnd()).some((l) => INPUT_DRAFT_RE.test(l));
+}
+
 const STATUS_URLS = Object.freeze({
   claude: 'https://status.claude.com/api/v2/status.json',
   codex: 'https://status.openai.com/api/v2/status.json',
@@ -506,6 +514,9 @@ export async function tick({ dryRun }, depsIn = {}) {
     if (isShellPrompt(tail, term?.agentIdentity)) {                                  // 4. prompt guard
       log('warn', `skip ${ev.handle}: shell prompt on last line, agent has exited; event dropped`);
       delete events[key]; deps.saveState(events); continue;
+    }
+    if (isInputOccupied(tail)) {                                                     // 4b. draft guard
+      log('info', `skip ${ev.handle}: input box holds a draft; event untouched`); continue;
     }
     ev.attempts += 1;                                                                // 5. persist, then send
     ev.lastAttemptAt = now.toISOString();
