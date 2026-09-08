@@ -248,7 +248,7 @@ export function reconcile(state, observations, now, liveHandles = null) {
       events[key] = newEvent(o, now); continue;                              // 4. replace (never a candidate this tick)
     }
     const sch = SCHEDULE[ev.kind];                                           // 5. same kind & platform
-    if (sch.deadlineMs !== null && now - new Date(ev.detectedAt) >= sch.deadlineMs) {
+    if (ev.status !== 'gave_up' && sch.deadlineMs !== null && now - new Date(ev.detectedAt) >= sch.deadlineMs) {
       ev.status = 'gave_up'; continue;                                       // 5a
     }
     if (ev.status === 'resumed' && now - new Date(ev.lastAttemptAt) >= sch.rearmMs) {
@@ -413,7 +413,7 @@ export async function tick({ dryRun }, depsIn = {}) {
       const tail = await readTail(t.handle, deps.orca);
       const banner = detectBanner(tail, inferPlatform(t));
       if (!banner && shouldLog('debug') && hasOutageLine(tail)) {
-        log('debug', `outage line without stalled final block on ${t.handle}: ${sanitize(tail.slice(-TAIL_LINES).join(' | '), 600)}`);
+        log('debug', `outage-pattern line present but not detected (platform gate, retry veto, or final block) on ${t.handle}: ${sanitize(tail.slice(-TAIL_LINES).join(' | '), 600)}`);
       }
       observations.push({ handle: t.handle, banner, platform: inferPlatform(t, banner), window: tail.slice(-TAIL_LINES).join(' | ') });
     } catch (e) {
@@ -496,6 +496,8 @@ export async function tick({ dryRun }, depsIn = {}) {
 
 async function main() {
   const args = new Set(process.argv.slice(2));
+  // `--once` is a readability alias for the normal one-tick invocation.
+  args.delete('--once');
   if (args.has('--status')) {
     const events = loadState();
     console.log(Object.keys(events).length === 0 ? 'no active events'

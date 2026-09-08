@@ -419,6 +419,13 @@ test('outage: deadline at exactly +24h gives up even with attempts left', () => 
   assert.equal(r.events[H].status, 'gave_up');
   assert.deepEqual(r.sendCandidates, []);
   assert.equal(reconcile(seed(), oobs(), at(24 * 60 - 1)).events[H].status, 'waiting');
+  const alreadyGaveUp = reconcile(
+    seed({ attempts: 2, lastAttemptAt: at(60).toISOString(), status: 'gave_up' }),
+    oobs(),
+    at(24 * 60 + 1),
+  );
+  assert.equal(alreadyGaveUp.events[H].status, 'gave_up');
+  assert.deepEqual(alreadyGaveUp.sendCandidates, []);
 });
 
 test('outage: limit events have no deadline', () => {

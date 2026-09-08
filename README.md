@@ -18,8 +18,10 @@ Orca terminal's tail and looks for one of two banners in the last 15 lines:
   Normally one send per event; up to two retries 30 min apart, then it gives
   up loudly in the log.
 - **API outage** (Claude Code's own `API Error: 5xx / Connection error /
-  overloaded_error` line as the final stalled banner, on a terminal Orca
-  identifies as `claude`): waits 10 min, then sends
+  overloaded_error` line as the final stalled banner, on a terminal running
+  Claude Code—identified by Orca as `claude`, or by Claude Code's own
+  `API Error:` banner; a bare `>` last line is trusted only with the Orca
+  identity): waits 10 min, then sends
   > The API outage appears to be over. Resume where you left off.
 
   Up to 6 sends 30 min apart, hard stop 24 h after detection. Before each
@@ -43,6 +45,7 @@ happens only when an outage send is due; `WATCHDOG_STATUS_URL_CLAUDE` /
 
 ```bash
 node watchdog.mjs --dry-run          # what would it do right now
+node watchdog.mjs --once             # readability alias for one normal tick
 node watchdog.mjs --status           # active events
 touch  ~/.local/state/orca-limit-watchdog/disabled   # pause everything
 rm     ~/.local/state/orca-limit-watchdog/disabled   # re-enable
@@ -54,6 +57,9 @@ tail -f ~/.local/state/orca-limit-watchdog/watchdog.log
 ```bash
 node --test       # unit tests (patterns, time parsing, lifecycle)
 ```
+
+`--once` is a readability alias for a single normal tick; it does not change
+the daemon's one-tick-per-invocation behavior.
 
 E2E (scratch Orca terminal, never a live agent):
 
