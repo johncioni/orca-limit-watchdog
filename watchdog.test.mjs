@@ -629,15 +629,38 @@ test('tick: shell prompt on the fresh tail deletes the event and sends nothing',
   assert.deepEqual(h.sent, []); assert.deepEqual(h.saved(), {});
 });
 
-test('tick: one status fetch per platform per tick; claude major does not suppress codex', async () => {
+test('tick: two due Claude outages share one status fetch and both send when status is none', async () => {
+  const H2 = 'term_two';
+  const T2 = { ...T, handle: H2 };
+  const state = { ...seed(), [H2]: { ...seed()[H], handle: H2 } };
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T, T2], state });
+  await tick({ dryRun: false }, h.deps);
+  assert.equal(h.fetchImpl.calls.filter((c) => c.url === CLAUDE_URL).length, 1);
+  assert.deepEqual(h.sent, [OUTAGE_RESUME_TEXT, OUTAGE_RESUME_TEXT]);
+});
+
+test('tick: two due Claude outages share one major status fetch and consume no attempts', async () => {
+  const H2 = 'term_two';
+  const T2 = { ...T, handle: H2 };
+  const state = { ...seed(), [H2]: { ...seed()[H], handle: H2 } };
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T, T2], state, indicator: 'major' });
+  await tick({ dryRun: false }, h.deps);
+  assert.equal(h.fetchImpl.calls.filter((c) => c.url === CLAUDE_URL).length, 1);
+  assert.deepEqual(h.sent, []);
+  for (const handle of [H, H2]) {
+    assert.equal(h.saved()[handle].attempts, 0);
+    assert.equal(h.saved()[handle].lastAttemptAt, null);
+    assert.equal(h.saved()[handle].status, 'waiting');
+  }
+});
+
+test('tick: codex terminal with a Claude-shaped tail cannot become a candidate; only Claude is fetched', async () => {
   const H2 = 'term_two';
   const T2 = { ...T, handle: H2, agentIdentity: 'codex' };
   const state = { ...seed(), [H2]: { ...seed()[H], handle: H2, platform: 'codex' } };
   const h = harness({ tail: OUTAGE_TAIL, terminals: [T, T2], state });
   h.deps.fetchImpl = fakeFetch((url) => okJson({ status: { indicator: url === CLAUDE_URL ? 'major' : 'none' } }));
-  // codex has no detection row, so give its terminal a claude-shaped tail via a per-handle read
-  const inner = h.deps.orca;
-  h.deps.orca = async (args) => inner(args);
+  // True cross-platform isolation is unreachable through the public path while Codex detection is disabled.
   await tick({ dryRun: false }, h.deps);
   assert.equal(h.deps.fetchImpl.calls.filter((c) => c.url === CLAUDE_URL).length, 1);
   assert.deepEqual(h.sent, []);            // claude suppressed; codex terminal's tail cannot match (no codex row) ⇒ event deleted, no send
