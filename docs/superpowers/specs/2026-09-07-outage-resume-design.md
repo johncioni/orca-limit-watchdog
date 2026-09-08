@@ -403,3 +403,11 @@ sends after tick one and exactly one outage resume line after tick two.
 
 Live: `node watchdog.mjs --dry-run` against the real Orca with no outage in
 progress ⇒ "no action" and no network calls (verified by the debug log).
+
+## Amendment 2026-09-07 (DOG-11): banner-cleared hold
+
+Rule 3 ("banner cleared → delete") now requires the banner to be absent on
+two consecutive ticks. The first miss stamps `clearedAt` on the event and
+freezes it; a second miss deletes it; the banner reappearing removes
+`clearedAt` and keeps `attempts`. This closes the loophole where a
+flickering read reset the retry cap every 30 minutes.

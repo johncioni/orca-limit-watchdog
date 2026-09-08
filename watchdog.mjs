@@ -187,6 +187,7 @@ export function validateEvent(key, ev) {
   if (!Number.isInteger(ev.attempts) || ev.attempts < 0 || ev.attempts > max) return `attempts: ${ev.attempts} (0..${max})`;
   if (ev.lastAttemptAt !== null && !isIso(ev.lastAttemptAt)) return 'lastAttemptAt: not null or a timestamp';
   if (ev.lastAttemptAt === null && (ev.status !== 'waiting' || ev.attempts > 0)) return 'lastAttemptAt: required once an attempt was made';
+  if (ev.clearedAt !== undefined && !isIso(ev.clearedAt)) return 'clearedAt: not a timestamp';
   return null;
 }
 
@@ -275,7 +276,14 @@ export function reconcile(state, observations, now, liveHandles = null) {
     if (!live.has(ev.handle)) { delete events[key]; continue; }             // 1. vanished
     const o = byHandle.get(ev.handle);
     if (!o) continue;                                                        // 2. live but unread: freeze
-    if (!o.banner) { delete events[key]; continue; }                         // 3. banner cleared
+    if (!o.banner) {                                                         // 3. banner cleared
+      // One absent read is not proof: the agent scrolls, orca returns a short
+      // tail, a redraw lands mid-read. Deleting on the first miss resets
+      // attempts to 0 and lets a flickering banner be sent to without bound.
+      if (ev.clearedAt) { delete events[key]; continue; }                    //    3a. second consecutive miss
+      ev.clearedAt = now.toISOString(); continue;                            //    3b. first miss: hold
+    }
+    delete ev.clearedAt;                                                     //    banner present again
     if (o.banner.kind !== ev.kind || (o.platform !== 'unknown' && o.platform !== ev.platform)) {
       events[key] = newEvent(o, now); continue;                              // 4. replace (never a candidate this tick)
     }
@@ -510,7 +518,10 @@ export async function tick({ dryRun }, depsIn = {}) {
     }
     const term = byHandle.get(ev.handle);
     const fresh = detectBanner(tail, inferPlatform(term));
-    if (!fresh) { log('info', `skip ${ev.handle}: banner cleared before send`); delete events[key]; deps.saveState(events); continue; }
+    if (!fresh) {   // same hold as reconcile rule 3b: one miss is not proof
+      log('info', `skip ${ev.handle}: banner cleared before send; holding`);
+      ev.clearedAt = now.toISOString(); deps.saveState(events); continue;
+    }
     const platform = inferPlatform(term, fresh);
     if (fresh.kind !== ev.kind || (platform !== 'unknown' && platform !== ev.platform)) {
       log('info', `skip ${ev.handle}: banner changed to ${fresh.kind}/${platform} before send; fresh event`);
