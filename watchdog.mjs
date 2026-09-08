@@ -58,15 +58,16 @@ const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1
 export function stripAnsi(s) { return String(s).replace(ANSI_RE, ''); }
 
 // Credential shapes redacted from every logged terminal fragment. The last
-// pattern (32+ opaque chars) also catches raw JWT/API-key material we have no
-// prefix for; ordinary words and short git hashes are far below that length.
+// pattern (32+ opaque chars, no "/") also catches raw JWT/API-key material we
+// have no prefix for; ordinary words and short git hashes are far below that
+// length, and "/" is excluded so a long path is not swallowed as one run.
 const SECRET_RES = [
   /\bsk-[A-Za-z0-9_-]{8,}/g,
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{8,}/g,
   /\bgithub_pat_[A-Za-z0-9_]{8,}/g,
   /\bBearer\s+\S+/gi,
   /\bAKIA[0-9A-Z]{16}\b/g,
-  /[A-Za-z0-9+/=_-]{32,}/g,
+  /(?<![/\w])[A-Za-z0-9+=_-]{32,}(?![/\w])/g,
 ];
 export function sanitize(text, limit = 200) {
   let s = stripAnsi(text).replace(/\s+/g, ' ').trim();

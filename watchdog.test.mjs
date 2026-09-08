@@ -882,6 +882,12 @@ test('sanitize leaves ordinary text and short hashes alone', () => {
   assert.equal(sanitize('API Error: 529 overloaded_error at b7ea497'), 'API Error: 529 overloaded_error at b7ea497');
 });
 
+test('sanitize keeps filesystem paths but still redacts long opaque tokens (DOG-12)', () => {
+  const p = '/Users/john/Projects/orca-limit-watchdog/watchdog.mjs';
+  assert.equal(sanitize(`see ${p} line 3`), `see ${p} line 3`);
+  assert.equal(sanitize('token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abc'), 'token [redacted]');
+});
+
 test('sanitize strips ANSI, collapses whitespace and truncates', () => {
   assert.equal(sanitize('\x1b[2m  a \n\t b  \x1b[0m'), 'a b');
   assert.equal(sanitize('x'.repeat(10), 4), 'xxxx…');
