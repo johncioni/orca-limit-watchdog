@@ -719,6 +719,24 @@ test('tick: a throwing send is logged and the remaining candidates still send (D
   assert.ok(logged.some((l) => l.startsWith('warn send failed for term_') && l.includes('agent_prompt_stalled')), logged.join('\n'));
 });
 
+test('tick: multi-line orca errors are logged on one line (DOG-13)', async () => {
+  const logged = [];
+  const orca = async (args) => {
+    const [scope, verb] = args;
+    if (scope === 'terminal' && verb === 'list') return { terminals: [T] };
+    if (scope === 'terminal' && verb === 'read') return { terminal: { tail: OUTAGE_TAIL } };
+    if (scope === 'terminal' && verb === 'wait') throw new Error('agent_prompt_stalled\n2026-09-07T00:00:00Z error INJECTED');
+    throw new Error(`unexpected orca call ${args.join(' ')}`);
+  };
+  const deps = { orca, fetchImpl: fakeFetch(() => okJson({ status: { indicator: 'none' } })), env: {}, now: () => at(10),
+    loadState: () => seed(), saveState: () => {}, log: (lvl, msg) => logged.push(msg) };
+  await tick({ dryRun: false }, deps);
+  const line = logged.find((m) => m.includes('not idle'));
+  assert.ok(line, logged.join('\n'));
+  assert.doesNotMatch(line, /\n/);
+  assert.match(line, /INJECTED/);
+});
+
 test('tick: terminal reads run with bounded concurrency, not one at a time (DOG-9)', async () => {
   const terminals = Array.from({ length: 8 }, (_, i) => ({ ...T, handle: `term_${i}` }));
   let inFlight = 0, peak = 0;
@@ -882,6 +900,12 @@ test('sanitize leaves ordinary text and short hashes alone', () => {
   assert.equal(sanitize('API Error: 529 overloaded_error at b7ea497'), 'API Error: 529 overloaded_error at b7ea497');
 });
 
+test('sanitize keeps filesystem paths but still redacts long opaque tokens (DOG-12)', () => {
+  const p = '/Users/john/Projects/orca-limit-watchdog/watchdog.mjs';
+  assert.equal(sanitize(`see ${p} line 3`), `see ${p} line 3`);
+  assert.equal(sanitize('token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abc'), 'token [redacted]');
+});
+
 test('sanitize strips ANSI, collapses whitespace and truncates', () => {
   assert.equal(sanitize('\x1b[2m  a \n\t b  \x1b[0m'), 'a b');
   assert.equal(sanitize('x'.repeat(10), 4), 'xxxx…');
@@ -898,4 +922,44 @@ test('status-stub serves the scripted indicator sequence and repeats the last', 
     assert.equal(await get(), 'none');
     assert.equal(await get(), 'none');
   } finally { await stub.close(); }
+});
+
+// --- CLI entry + install.sh rendering (DOG-6, DOG-15) ---
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+const pExecFile = promisify(execFile);
+
+test('CLI entry runs when invoked through a symlinked path (DOG-6)', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-symlink-'));
+  const link = path.join(tmp, 'repo');
+  fs.symlinkSync(process.cwd(), link);
+  try {
+    const { stdout } = await pExecFile(process.execPath, [path.join(link, 'watchdog.mjs'), '--status'], { env: { ...process.env, HOME: tmp } });
+    assert.equal(stdout.trim(), 'no active events');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('install.sh renders the plist without sed-delimiter corruption for paths containing | and & (DOG-15)', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-plist-'));
+  const out = path.join(tmp, 'out.plist');
+  const script = `
+    set -euo pipefail
+    NODE_BIN='/opt/a|b/node'; REPO='/Users/x&y/repo'; STATE='/tmp/state'
+    eval "$(sed -n '/^render_plist()/,/^}/p' install.sh)"
+    render_plist com.john.orca-limit-watchdog.plist "${out}"
+  `;
+  try {
+    await pExecFile('bash', ['-c', script]);
+    const rendered = fs.readFileSync(out, 'utf8');
+    assert.match(rendered, /<string>\/opt\/a\|b\/node<\/string>/);
+    assert.match(rendered, /\/Users\/x&y\/repo/);
+    assert.doesNotMatch(rendered, /__(NODE|REPO|STATE)__/);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
 });

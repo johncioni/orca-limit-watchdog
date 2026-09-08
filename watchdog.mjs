@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { pathToFileURL } from 'node:url';
 
 export const RESUME_TEXT = 'Session rate limit has reset. Resume where you left off.';
 
@@ -57,15 +58,16 @@ const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1
 export function stripAnsi(s) { return String(s).replace(ANSI_RE, ''); }
 
 // Credential shapes redacted from every logged terminal fragment. The last
-// pattern (32+ opaque chars) also catches raw JWT/API-key material we have no
-// prefix for; ordinary words and short git hashes are far below that length.
+// pattern (32+ opaque chars, no "/") also catches raw JWT/API-key material we
+// have no prefix for; ordinary words and short git hashes are far below that
+// length, and "/" is excluded so a long path is not swallowed as one run.
 const SECRET_RES = [
   /\bsk-[A-Za-z0-9_-]{8,}/g,
   /\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{8,}/g,
   /\bgithub_pat_[A-Za-z0-9_]{8,}/g,
   /\bBearer\s+\S+/gi,
   /\bAKIA[0-9A-Z]{16}\b/g,
-  /[A-Za-z0-9+/=_-]{32,}/g,
+  /(?<![/\w])[A-Za-z0-9+=_-]{32,}(?![/\w])/g,
 ];
 export function sanitize(text, limit = 200) {
   let s = stripAnsi(text).replace(/\s+/g, ' ').trim();
@@ -497,7 +499,7 @@ export async function tick({ dryRun }, depsIn = {}) {
       console.log(`would resume ${ev.handle} (${ev.kind}/${ev.platform}, attempt ${ev.attempts + 1})`);
       continue;
     }
-    if (ev.kind === 'outage' && ev.platform !== 'unknown') {                       // 1. status gate
+    if (ev.kind === 'outage') {   // 1. status gate (validateEvent guarantees a known platform)
       if (!indicators.has(ev.platform)) {
         const { url, warn } = statusUrlFor(ev.platform, deps.env);
         if (warn) log('warn', warn);
@@ -510,11 +512,11 @@ export async function tick({ dryRun }, depsIn = {}) {
     try {                                                                            // 2. idle check
       await deps.orca(['terminal', 'wait', '--terminal', ev.handle, '--for', 'tui-idle', '--timeout-ms', '5000']);
     } catch (e) {
-      log('info', `skip ${ev.handle}: not idle (${e.message})`); continue;
+      log('info', `skip ${ev.handle}: not idle (${sanitize(e.message)})`); continue;
     }
     let tail;                                                                        // 3. fresh re-read
     try { tail = await readTail(ev.handle, deps.orca); } catch (e) {
-      log('warn', `skip ${ev.handle}: re-read failed (${e.message}); event untouched`); continue;
+      log('warn', `skip ${ev.handle}: re-read failed (${sanitize(e.message)}); event untouched`); continue;
     }
     const term = byHandle.get(ev.handle);
     const fresh = detectBanner(tail, inferPlatform(term));
@@ -580,13 +582,19 @@ async function main() {
   try {
     await tick({ dryRun });
   } catch (e) {
-    log('error', `tick failed: ${e.message}`);
+    log('error', `tick failed: ${sanitize(e.message)}`);
   } finally {
     clearTimeout(deadline);
     if (!dryRun) fs.rmSync(LOCK_FILE, { force: true });
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+// import.meta.url is the real path; argv[1] may be a symlink. Compare real to real,
+// through pathToFileURL so spaces and unicode are percent-encoded on both sides.
+const entryIsThisFile = (() => {
+  if (!process.argv[1]) return false;
+  try { return import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href; } catch { return false; }
+})();
+if (entryIsThisFile) {
   await main();
 }
