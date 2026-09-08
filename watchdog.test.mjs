@@ -34,6 +34,16 @@ test('detects Gemini quota banner', () => {
   assert.ok(detectBanner(GEMINI_BANNER));
 });
 
+test('limit bannerText is sanitized before storage', () => {
+  const b = detectBanner([
+    'Claude usage limit reached.',
+    'Your limit will reset at 3am. Authorization: Bearer abc123token',
+  ]);
+  assert.match(b.bannerText, /usage limit reached/i);
+  assert.match(b.bannerText, /\[redacted\]/);
+  assert.doesNotMatch(b.bannerText, /Bearer/i);
+});
+
 test('vetoes "approaching" warning banners', () => {
   assert.equal(
     detectBanner(['Approaching weekly limit · resets at 5pm', '> working...']),

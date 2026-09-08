@@ -118,7 +118,7 @@ export function detectBanner(lines, platform = 'unknown') {
   if (LIMIT_RE.test(text) && REACHED_RE.test(text) && RESET_RE.test(text)) {
     const isRelevant = (l) => !VETO_RE.test(l) && (LIMIT_RE.test(l) || RESET_RE.test(l));
     const l = lastIndex(window, isRelevant);
-    limit = { kind: 'limit', bannerText: window.filter(isRelevant).join(' | '),
+    limit = { kind: 'limit', bannerText: sanitize(window.filter(isRelevant).join(' | '), 600),
       matchedLine: window[l], patternId: 'limit', index: l };
   }
 
