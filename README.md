@@ -72,4 +72,17 @@ WATCHDOG_STATUS_URL_CLAUDE=http://127.0.0.1:8123/api/v2/status.json node watchdo
 cat /tmp/recv.txt   # exactly one outage resume line
 ```
 
-Design: `docs/superpowers/specs/2026-07-23-orca-limit-watchdog-design.md`.
+## Develop
+
+```bash
+bash scripts/orca-setup.sh   # full local gate: node >= 20, syntax checks, node --test
+```
+
+`orca.yaml` runs that script when Orca creates a worktree for this repo, so a
+spawned agent lands in a checkout that has already passed the gate. The agent
+workflow (roles, review loop, Orca and Linear conventions) is in `CLAUDE.md`.
+
+Design specs:
+
+- `docs/superpowers/specs/2026-07-23-orca-limit-watchdog-design.md` (rate-limit resume)
+- `docs/superpowers/specs/2026-09-07-outage-resume-design.md` (API-outage resume)
