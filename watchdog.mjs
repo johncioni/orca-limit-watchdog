@@ -50,8 +50,9 @@ const VETO_RE = /approaching[^\n]*limit/i;
 // chrome, never evidence: dropped before the limit rule runs.
 const FOOTER_RE = /│\s*Usage\s/;
 
-// CSI (ESC [ … final), OSC (ESC ] … BEL|ST), and stray C0/DEL control bytes.
-const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\x00-\x08\x0b-\x1f\x7f]/g;
+// CSI (ESC [ … final), OSC (ESC ] … BEL|ST), charset selects (ESC ( B),
+// two-byte escapes (ESC = > 7 8 c D E H M N O Z), and stray C0/DEL bytes.
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78cDEHMNOZ]|[\x00-\x08\x0b-\x1f\x7f]/g;
 export function stripAnsi(s) { return String(s).replace(ANSI_RE, ''); }
 
 // Credential shapes redacted from every logged terminal fragment. The last

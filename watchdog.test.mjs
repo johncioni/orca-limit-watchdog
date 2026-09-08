@@ -746,6 +746,12 @@ test('stripAnsi removes CSI, OSC and control bytes', () => {
   assert.equal(stripAnsi('\x1b[1;31mred\x1b[0m \x1b]0;title\x07x\x07'), 'red x');
 });
 
+test('stripAnsi removes two-byte escapes so a stray ">" cannot fake a shell prompt (DOG-8)', () => {
+  assert.equal(stripAnsi('? for shortcuts\x1b>'), '? for shortcuts');
+  assert.equal(stripAnsi('\x1b=\x1b(Bhello\x1b7\x1b8'), 'hello');
+  assert.equal(isShellPrompt(['API Error: 529', '? for shortcuts\x1b>'], 'claude'), false);
+});
+
 test('sanitize redacts credentials and long opaque runs', () => {
   assert.equal(sanitize('key sk-abcdefghijklmnop end'), 'key [redacted] end');
   assert.equal(sanitize('ghp_ABCDEFGHIJKLMNOP'), '[redacted]');
