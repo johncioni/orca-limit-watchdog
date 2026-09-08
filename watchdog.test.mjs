@@ -899,3 +899,23 @@ test('status-stub serves the scripted indicator sequence and repeats the last', 
     assert.equal(await get(), 'none');
   } finally { await stub.close(); }
 });
+
+// --- CLI entry + install.sh rendering (DOG-6, DOG-15) ---
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+const pExecFile = promisify(execFile);
+
+test('CLI entry runs when invoked through a symlinked path (DOG-6)', async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-symlink-'));
+  const link = path.join(tmp, 'repo');
+  fs.symlinkSync(process.cwd(), link);
+  try {
+    const { stdout } = await pExecFile(process.execPath, [path.join(link, 'watchdog.mjs'), '--status'], { env: { ...process.env, HOME: tmp } });
+    assert.equal(stdout.trim(), 'no active events');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});

@@ -2,7 +2,7 @@
 # Install the orca-limit-watchdog LaunchAgent.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "$0")" && pwd)"
+REPO="$(cd "$(dirname "$0")" && pwd -P)"
 STATE="$HOME/.local/state/orca-limit-watchdog"
 LABEL="com.john.orca-limit-watchdog"
 PLIST_DST="$HOME/Library/LaunchAgents/$LABEL.plist"

@@ -7,6 +7,7 @@ import { promisify } from 'node:util';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { pathToFileURL } from 'node:url';
 
 export const RESUME_TEXT = 'Session rate limit has reset. Resume where you left off.';
 
@@ -587,6 +588,12 @@ async function main() {
   }
 }
 
-if (process.argv[1] && import.meta.url === new URL(`file://${process.argv[1]}`).href) {
+// import.meta.url is the real path; argv[1] may be a symlink. Compare real to real,
+// through pathToFileURL so spaces and unicode are percent-encoded on both sides.
+const entryIsThisFile = (() => {
+  if (!process.argv[1]) return false;
+  try { return import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href; } catch { return false; }
+})();
+if (entryIsThisFile) {
   await main();
 }
