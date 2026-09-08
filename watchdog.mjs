@@ -499,7 +499,7 @@ export async function tick({ dryRun }, depsIn = {}) {
       console.log(`would resume ${ev.handle} (${ev.kind}/${ev.platform}, attempt ${ev.attempts + 1})`);
       continue;
     }
-    if (ev.kind === 'outage' && ev.platform !== 'unknown') {                       // 1. status gate
+    if (ev.kind === 'outage') {   // 1. status gate (validateEvent guarantees a known platform)
       if (!indicators.has(ev.platform)) {
         const { url, warn } = statusUrlFor(ev.platform, deps.env);
         if (warn) log('warn', warn);
