@@ -68,7 +68,8 @@ Do not add dependencies.
 opus-implementer exception still applies):** `watchdog.mjs` (the daemon
 itself: a bug here can spam `orca terminal send` into every session),
 `install.sh` / `uninstall.sh` (launchctl bootstrap/bootout), the launchd
-plist, `.github/*`, `CLAUDE.md`.
+plist, `orca.yaml` / `scripts/orca-setup.sh` (execute on every
+`orca worktree create`), `.github/*`, `CLAUDE.md`.
 
 **Branch protection is strict:** `main` requires the PR branch to be up to
 date. On `mergeStateStatus: BEHIND`, run `gh pr update-branch <n>`, wait for

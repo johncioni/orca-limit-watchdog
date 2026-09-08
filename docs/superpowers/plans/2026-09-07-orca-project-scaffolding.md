@@ -57,8 +57,8 @@ dependencies, so the script is a verification warm-up, not an install:
   `~/.local/state/orca-limit-watchdog`** (that is `install.sh`, post-merge,
   main checkout only).
 - Steps: assert `node` ≥ 20 (same check `install.sh` does; reuse its
-  version test verbatim), `node --check watchdog.mjs`,
-  `bash -n install.sh uninstall.sh scripts/orca-setup.sh`, `node --test`.
+  version test verbatim), `node --check watchdog.mjs`, one `bash -n` per
+  script (`bash -n a b` checks only `a`; `b` becomes `$1`), `node --test`.
 - Readiness summary: node version, test result, and a one-line reminder:
   "Do NOT run install.sh from this worktree; deploy from the main checkout
   after merge."
@@ -125,8 +125,10 @@ true`. No allowlists: CI is green on defaults today.
 
 ### 5. `.github/workflows/ci.yml` (invariant, one-line change)
 
-Extend the syntax-check step to `bash -n install.sh uninstall.sh
-scripts/orca-setup.sh`.
+Add `&& bash -n scripts/orca-setup.sh` to the syntax-check step (one
+invocation per file). Also add `orca.yaml` and `scripts/orca-setup.sh` to
+`.github/review-invariants.txt` and the CLAUDE.md invariant list: both
+execute on every `orca worktree create` (review round 1 finding).
 
 ### 6. `docs/superpowers/plans/2026-09-07-orca-project-scaffolding.md`
 

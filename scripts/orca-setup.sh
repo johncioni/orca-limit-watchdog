@@ -3,9 +3,9 @@
 #
 # Runs on `orca worktree create` (repo hookSettings: setupRunPolicy=run-by-default,
 # setupAgentStartupPolicy=wait-for-setup), so a spawned agent blocks until this
-# finishes. Point the repo's Orca setup script at this file (Orca app → repo
-# settings: `bash scripts/orca-setup.sh`) so the command is versioned here
-# instead of living only in local Orca config.
+# finishes. The committed orca.yaml (`scripts.setup`) wires it, so Orca picks it
+# up automatically; do NOT also add it as a local hook in the Orca app, which
+# would flip the repo's command source to local-only and bypass orca.yaml.
 #
 # The daemon has zero dependencies (plain system Node, no package.json), so
 # there is nothing to install. This is a verification warm-up: a fresh worktree
@@ -25,7 +25,7 @@ NODE_MAJOR="$("$NODE_BIN" -p 'process.versions.node.split(".")[0]')"
 
 echo "==> syntax: watchdog.mjs, install.sh, uninstall.sh, scripts/orca-setup.sh"
 node --check watchdog.mjs
-bash -n install.sh uninstall.sh scripts/orca-setup.sh
+for f in install.sh uninstall.sh scripts/orca-setup.sh; do bash -n "$f"; done
 
 echo "==> node --test"
 node --test
