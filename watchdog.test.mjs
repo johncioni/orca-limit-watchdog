@@ -59,6 +59,25 @@ test('no match on ordinary code/log output mentioning limits', () => {
   assert.equal(detectBanner(['const usageLimit = 5; // reached?']), null);
 });
 
+const FOOTER = 'Context ██░░░░░░░░ 19% │ Usage ████░░░░░░ 41% (resets in 3h 8m)';
+
+test('usage footer does not turn a prose rate-limit line into a limit event (DOG-3)', () => {
+  assert.equal(detectBanner(['error: rate limit exceeded (HTTP 429)', FOOTER, '> ', '? for shortcuts'], 'claude'), null);
+  assert.equal(detectBanner(['Working around the rate limit we hit yesterday.', FOOTER, '> ', '? for shortcuts'], 'claude'), null);
+});
+
+test('limit phrase and reached word must share a line', () => {
+  assert.equal(detectBanner(['usage limit', 'reached', 'resets at 3pm']), null);
+});
+
+test('a real banner is still detected next to the footer, and the footer never enters bannerText', () => {
+  const b = detectBanner([...CLAUDE_BANNER, FOOTER, '? for shortcuts'], 'claude');
+  assert.ok(b);
+  assert.equal(b.kind, 'limit');
+  assert.match(b.bannerText, /reset at 3am/i);
+  assert.doesNotMatch(b.bannerText, /3h 8m/);
+});
+
 test('only scans the last 15 lines', () => {
   const lines = [...CLAUDE_BANNER, ...Array(20).fill('normal output')];
   assert.equal(detectBanner(lines), null);
@@ -196,6 +215,25 @@ test('parses relative times', () => {
 test('parses bare relative minutes', () => {
   const t = parseResetTime('try again in 45 minutes', NOW);
   assert.equal(t.getTime(), NOW.getTime() + 45 * 60_000);
+});
+
+test('parses compact relative resets "in 3h 8m", "in 2h", "in 1hr 5m" (DOG-4)', () => {
+  const now = new Date('2026-09-07T10:00:00');
+  assert.equal(parseResetTime('Usage 41% (resets in 3h 8m)', now).getTime(), now.getTime() + 188 * 60_000);
+  assert.equal(parseResetTime('resets in 2h', now).getTime(), now.getTime() + 120 * 60_000);
+  assert.equal(parseResetTime('try again in 1hr 5m', now).getTime(), now.getTime() + 65 * 60_000);
+  assert.equal(parseResetTime('resets in 45m', now).getTime(), now.getTime() + 45 * 60_000);
+});
+
+test('parses multi-day and month-day resets instead of defaulting to today (DOG-5)', () => {
+  const now = new Date('2026-09-07T10:00:00');
+  assert.equal(parseResetTime('Weekly limit reached. Resets in 3 days.', now).getTime(), now.getTime() + 3 * 24 * 60 * 60_000);
+  assert.equal(parseResetTime('resets Sep 12 at 3pm', now).getTime(), new Date('2026-09-12T15:00:00').getTime());
+  assert.equal(parseResetTime('resets September 12, 09:30', now).getTime(), new Date('2026-09-12T09:30:00').getTime());
+  // no time given: start of that day is the earliest safe assumption
+  assert.equal(parseResetTime('resets on Sep 12', now).getTime(), new Date('2026-09-12T00:00:00').getTime());
+  // a month-day already more than 2 minutes in the past means next year
+  assert.equal(parseResetTime('resets Jan 3 at 3pm', now).getTime(), new Date('2027-01-03T15:00:00').getTime());
 });
 
 test('recent past time (≤2h grace) means already reset — acts now, not tomorrow', () => {
@@ -706,6 +744,12 @@ test('read loop stops once the tick budget is spent', () => {
 
 test('stripAnsi removes CSI, OSC and control bytes', () => {
   assert.equal(stripAnsi('\x1b[1;31mred\x1b[0m \x1b]0;title\x07x\x07'), 'red x');
+});
+
+test('stripAnsi removes two-byte escapes so a stray ">" cannot fake a shell prompt (DOG-8)', () => {
+  assert.equal(stripAnsi('? for shortcuts\x1b>'), '? for shortcuts');
+  assert.equal(stripAnsi('\x1b=\x1b(Bhello\x1b7\x1b8'), 'hello');
+  assert.equal(isShellPrompt(['API Error: 529', '? for shortcuts\x1b>'], 'claude'), false);
 });
 
 test('sanitize redacts credentials and long opaque runs', () => {

@@ -45,8 +45,14 @@ const REACHED_RE = /(reached|hit|exceeded)/i;
 const RESET_RE = /(resets?\b|try again|available|come back)/i;
 const VETO_RE = /approaching[^\n]*limit/i;
 
-// CSI (ESC [ … final), OSC (ESC ] … BEL|ST), and stray C0/DEL control bytes.
-const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\x00-\x08\x0b-\x1f\x7f]/g;
+// Claude Code's persistent status footer ("Context … │ Usage … (resets in 3h 8m)")
+// is on screen in every Claude terminal and always satisfies RESET_RE. It is
+// chrome, never evidence: dropped before the limit rule runs.
+const FOOTER_RE = /│\s*Usage\s/;
+
+// CSI (ESC [ … final), OSC (ESC ] … BEL|ST), charset selects (ESC ( B),
+// two-byte escapes (ESC = > 7 8 c D E H M N O Z), and stray C0/DEL bytes.
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][A-Za-z0-9]|\x1b[=>78cDEHMNOZ]|[\x00-\x08\x0b-\x1f\x7f]/g;
 export function stripAnsi(s) { return String(s).replace(ANSI_RE, ''); }
 
 // Credential shapes redacted from every logged terminal fragment. The last
@@ -112,11 +118,14 @@ export function detectBanner(lines, platform = 'unknown') {
   // Drop soft "approaching … limit" warning lines first, so such a warning can
   // neither be mistaken for a reached-banner nor veto a genuine reached-banner
   // that happens to share the same 15-line window (per-line veto, not whole-window).
-  const kept = window.filter((l) => !VETO_RE.test(l));
+  const kept = window.filter((l) => !VETO_RE.test(l) && !FOOTER_RE.test(l));
   const text = kept.join('\n');
   let limit = null;
-  if (LIMIT_RE.test(text) && REACHED_RE.test(text) && RESET_RE.test(text)) {
-    const isRelevant = (l) => !VETO_RE.test(l) && (LIMIT_RE.test(l) || RESET_RE.test(l));
+  // The limit phrase and the reached word must sit on ONE line: a banner says
+  // "usage limit reached"; prose and logs scatter the words across lines.
+  const reachedLine = (l) => LIMIT_RE.test(l) && REACHED_RE.test(l);
+  if (kept.some(reachedLine) && RESET_RE.test(text)) {
+    const isRelevant = (l) => !VETO_RE.test(l) && !FOOTER_RE.test(l) && (LIMIT_RE.test(l) || RESET_RE.test(l));
     const l = lastIndex(window, isRelevant);
     limit = { kind: 'limit', bannerText: sanitize(window.filter(isRelevant).join(' | '), 600),
       matchedLine: window[l], patternId: 'limit', index: l };
@@ -196,8 +205,26 @@ export function parseStateFile(text) {
   return events;
 }
 
+const MONTHS = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+const MONTH_DAY_RE = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})\b/i;
+
+// Reads a clock time ("3pm", "3:30 p.m.", "14:00") out of text. Returns
+// { h, m } or null.
+function parseClock(text) {
+  const t12 = text.match(/\b(\d{1,2})(?::([0-5]\d))?\s*([ap])\.?m\.?\b/i);
+  if (t12) return { h: Number(t12[1]) % 12 + (t12[3].toLowerCase() === 'p' ? 12 : 0), m: Number(t12[2] || 0) };
+  const t24 = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+  if (t24) return { h: Number(t24[1]), m: Number(t24[2]) };
+  return null;
+}
+
 export function parseResetTime(text, now) {
-  const relHM = text.match(/\bin\s+(\d+)\s*h(?:ou)?rs?\b(?:\s*(?:and\s+)?(\d+)\s*m(?:in(?:ute)?s?)?)?/i);
+  // "in 3 days" (weekly limits) — a day count, never a clock time.
+  const relD = text.match(/\bin\s+(\d+)\s+days?\b/i);
+  if (relD) return new Date(now.getTime() + Number(relD[1]) * 24 * 60 * MIN);
+
+  // "in 2 hours 15 minutes", "in 2h 30m", "in 3h", "in 1hr 5m"
+  const relHM = text.match(/\bin\s+(\d+)\s*h(?:(?:ou)?rs?)?\b(?:\s*(?:and\s+)?(\d+)\s*m(?:in(?:ute)?s?)?)?/i);
   if (relHM) {
     const mins = Number(relHM[1]) * 60 + Number(relHM[2] || 0);
     return new Date(now.getTime() + mins * MIN);
@@ -205,18 +232,22 @@ export function parseResetTime(text, now) {
   const relM = text.match(/\bin\s+(\d+)\s*m(?:in(?:ute)?s?)?\b/i);
   if (relM) return new Date(now.getTime() + Number(relM[1]) * MIN);
 
-  let h = null, m = 0;
-  const t12 = text.match(/\b(\d{1,2})(?::([0-5]\d))?\s*([ap])\.?m\.?\b/i);
-  if (t12) {
-    h = Number(t12[1]) % 12 + (t12[3].toLowerCase() === 'p' ? 12 : 0);
-    m = Number(t12[2] || 0);
-  } else {
-    const t24 = text.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
-    if (t24) { h = Number(t24[1]); m = Number(t24[2]); }
+  const clock = parseClock(text);
+
+  // "Sep 12 at 3pm", "September 12, 09:30", "on Sep 12" (midnight when no time)
+  const md = text.match(MONTH_DAY_RE);
+  if (md) {
+    const month = MONTHS.indexOf(md[1].slice(0, 3).toLowerCase());
+    const candidate = new Date(now);
+    candidate.setMonth(month, Number(md[2]));
+    candidate.setHours(clock?.h ?? 0, clock?.m ?? 0, 0, 0);
+    if (candidate <= now && now - candidate > GRACE_PAST_MS) candidate.setFullYear(candidate.getFullYear() + 1);
+    return candidate;
   }
-  if (h === null) return null;
+
+  if (!clock) return null;
   const candidate = new Date(now);
-  candidate.setHours(h, m, 0, 0);
+  candidate.setHours(clock.h, clock.m, 0, 0);
   if (candidate <= now && now - candidate > GRACE_PAST_MS) {
     candidate.setDate(candidate.getDate() + 1);
   }
