@@ -681,6 +681,28 @@ test('tick: a throwing send is logged and the remaining candidates still send (D
   assert.ok(logged.some((l) => l.startsWith('warn send failed for term_') && l.includes('agent_prompt_stalled')), logged.join('\n'));
 });
 
+test('tick: terminal reads run with bounded concurrency, not one at a time (DOG-9)', async () => {
+  const terminals = Array.from({ length: 8 }, (_, i) => ({ ...T, handle: `term_${i}` }));
+  let inFlight = 0, peak = 0;
+  const orca = async (args) => {
+    const [scope, verb] = args;
+    if (scope === 'terminal' && verb === 'list') return { terminals };
+    if (scope === 'terminal' && verb === 'read') {
+      inFlight += 1; peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 50));
+      inFlight -= 1;
+      return { terminal: { tail: ['> '] } };
+    }
+    throw new Error(`unexpected orca call ${args.join(' ')}`);
+  };
+  const deps = { orca, fetchImpl: fakeFetch(() => okJson({})), env: {}, now: () => at(10), loadState: () => ({}), saveState: () => {}, log: () => {} };
+  const started = Date.now();
+  await tick({ dryRun: false }, deps);
+  const elapsed = Date.now() - started;
+  assert.ok(peak >= 2 && peak <= 4, `peak in-flight reads ${peak}, expected 2..4`);
+  assert.ok(elapsed < 250, `8 reads at 50 ms took ${elapsed} ms; sequential would be >= 400`);
+});
+
 test('tick: fresh re-read failure leaves the event untouched and sends nothing', async () => {
   const state = seed();
   const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state });

@@ -37,6 +37,7 @@ const STATUSES = ['waiting', 'resumed', 'gave_up'];
 const GRACE_PAST_MS = 2 * 60 * MIN; // absolute time this recently past = already reset
 const TAIL_LINES = 15;
 const READ_BUDGET_MS = 3 * MIN;    // stop reading terminals before the 4-min tick deadline
+const READ_CONCURRENCY = 4;        // parallel `terminal read`s per tick; orca serialises beyond a few
 
 // --- pure logic (unit-tested) ---
 
@@ -443,22 +444,26 @@ export async function tick({ dryRun }, depsIn = {}) {
 
   const observations = [];
   const startedAt = Date.now();
-  for (const t of terminals.filter((t) => t.connected && t.writable)) {
-    if (readBudgetExceeded(startedAt, Date.now())) {
-      log('warn', `read budget (${READ_BUDGET_MS / MIN} min) spent; skipping remaining terminals this tick`);
-      break;
-    }
-    try {
-      const tail = await readTail(t.handle, deps.orca);
-      const banner = detectBanner(tail, inferPlatform(t));
-      if (!banner && shouldLog('debug') && hasOutageLine(tail)) {
-        log('debug', `outage-pattern line present but not detected (platform gate, retry veto, or final block) on ${t.handle}: ${sanitize(tail.slice(-TAIL_LINES).join(' | '), 600)}`);
+  const queue = terminals.filter((t) => t.connected && t.writable);
+  let budgetSpent = false;
+  const worker = async () => {
+    while (queue.length > 0) {
+      if (readBudgetExceeded(startedAt, Date.now())) { budgetSpent = true; return; }
+      const t = queue.shift();
+      try {
+        const tail = await readTail(t.handle, deps.orca);
+        const banner = detectBanner(tail, inferPlatform(t));
+        if (!banner && shouldLog('debug') && hasOutageLine(tail)) {
+          log('debug', `outage-pattern line present but not detected (platform gate, retry veto, or final block) on ${t.handle}: ${sanitize(tail.slice(-TAIL_LINES).join(' | '), 600)}`);
+        }
+        observations.push({ handle: t.handle, banner, platform: inferPlatform(t, banner), window: tail.slice(-TAIL_LINES).join(' | ') });
+      } catch (e) {
+        log('warn', `read failed for ${t.handle}: ${sanitize(e.message)}`);
       }
-      observations.push({ handle: t.handle, banner, platform: inferPlatform(t, banner), window: tail.slice(-TAIL_LINES).join(' | ') });
-    } catch (e) {
-      log('warn', `read failed for ${t.handle}: ${e.message}`);
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(READ_CONCURRENCY, queue.length) }, worker));
+  if (budgetSpent) log('warn', `read budget (${READ_BUDGET_MS / MIN} min) spent; skipped ${queue.length} terminal(s) this tick`);
 
   const now = deps.now();
   const state = deps.loadState();
