@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
-import { isShellPrompt } from './watchdog.mjs';
+import { isShellPrompt, isInputOccupied } from './watchdog.mjs';
 import { statusUrlFor, fetchIndicator, suppressedByStatus } from './watchdog.mjs';
 import { tick, RESUME_TEXT } from './watchdog.mjs';
 
@@ -390,7 +390,9 @@ test('banner gone deletes the event (success)', () => {
   const key = eventKey(H);
   const state = { [key]: { ...LIMIT_EV, bannerText: BANNER, detectedAt: NOW.toISOString(),
     resetAt: NOW.toISOString(), attempts: 1, lastAttemptAt: NOW.toISOString(), status: 'resumed' } };
-  const r = reconcile(state, obs(null), new Date(NOW.getTime() + min(5)));
+  const held = reconcile(state, obs(null), new Date(NOW.getTime() + min(5)));       // first miss: held (DOG-11)
+  assert.ok(held.events[key], 'kept after one absent tick');
+  const r = reconcile(held.events, obs(null), new Date(NOW.getTime() + min(10)));   // second miss: deleted
   assert.deepEqual(r.events, {});
 });
 
@@ -406,8 +408,10 @@ test('same banner reappearing after absence is a fresh event', () => {
   const key = eventKey(H);
   const state = { [key]: { ...LIMIT_EV, bannerText: BANNER, detectedAt: NOW.toISOString(),
     resetAt: NOW.toISOString(), attempts: 3, lastAttemptAt: NOW.toISOString(), status: 'gave_up' } };
-  const gone = reconcile(state, obs(null), new Date(NOW.getTime() + min(5)));
-  const back = reconcile(gone.events, obs(BANNER), new Date(NOW.getTime() + min(10)));
+  const held = reconcile(state, obs(null), new Date(NOW.getTime() + min(5)));       // first miss: held (DOG-11)
+  const gone = reconcile(held.events, obs(null), new Date(NOW.getTime() + min(10))); // second miss: deleted
+  assert.deepEqual(gone.events, {});
+  const back = reconcile(gone.events, obs(BANNER), new Date(NOW.getTime() + min(15)));
   assert.equal(Object.values(back.events)[0].attempts, 0);
 });
 
@@ -416,6 +420,38 @@ test('countdown digit changes do not spawn new events', () => {
   const b = reconcile(a.events, obs('usage limit reached, resets in 1 hours'), new Date(NOW.getTime() + min(60)));
   assert.equal(Object.keys(b.events).length, 1);
   assert.equal(Object.values(b.events)[0].detectedAt, NOW.toISOString());
+});
+
+test('reconcile: a banner missing for ONE tick marks clearedAt and keeps attempts; TWO ticks deletes (DOG-11)', () => {
+  const now = at(10);
+  const ev = { handle: H, kind: 'limit', platform: 'claude', bannerText: BANNER, detectedAt: at(0).toISOString(), resetAt: at(0).toISOString(),
+    attempts: 2, lastAttemptAt: at(5).toISOString(), status: 'waiting' };
+  const gone = { handle: H, banner: null, platform: 'claude' };
+  const r1 = reconcile({ [H]: ev }, [gone], now, [H]);
+  assert.ok(r1.events[H], 'kept after one absent tick');
+  assert.equal(r1.events[H].attempts, 2);
+  assert.equal(r1.events[H].clearedAt, now.toISOString());
+  assert.deepEqual(r1.sendCandidates, []);
+  const r2 = reconcile(r1.events, [gone], at(15), [H]);
+  assert.equal(r2.events[H], undefined, 'deleted after two consecutive absent ticks');
+});
+
+test('reconcile: the banner coming back clears clearedAt and keeps the attempt count', () => {
+  const ev = { handle: H, kind: 'limit', platform: 'claude', bannerText: BANNER, detectedAt: at(0).toISOString(), resetAt: at(0).toISOString(),
+    attempts: 2, lastAttemptAt: at(5).toISOString(), status: 'waiting', clearedAt: at(10).toISOString() };
+  const back = { handle: H, banner: { kind: 'limit', bannerText: BANNER, patternId: 'limit' }, platform: 'claude' };
+  const r = reconcile({ [H]: ev }, [back], at(40), [H]);
+  assert.equal(r.events[H].attempts, 2);
+  assert.equal(r.events[H].clearedAt, undefined);
+  assert.deepEqual(r.sendCandidates, [H]);
+});
+
+test('validateEvent accepts clearedAt absent or ISO, rejects garbage', () => {
+  const base = { handle: H, kind: 'limit', platform: 'claude', bannerText: BANNER, detectedAt: at(0).toISOString(), resetAt: at(0).toISOString(),
+    attempts: 0, lastAttemptAt: null, status: 'waiting' };
+  assert.equal(validateEvent(H, base), null);
+  assert.equal(validateEvent(H, { ...base, clearedAt: at(1).toISOString() }), null);
+  assert.match(validateEvent(H, { ...base, clearedAt: 'soon' }), /clearedAt/);
 });
 
 // --- outage lifecycle ---
@@ -473,7 +509,9 @@ test('outage: limit events have no deadline', () => {
 });
 
 test('gave_up event whose banner clears is deleted', () => {
-  const r = reconcile(seed({ attempts: 6, lastAttemptAt: at(1).toISOString(), status: 'gave_up' }), obs(null), at(300));
+  const held = reconcile(seed({ attempts: 6, lastAttemptAt: at(1).toISOString(), status: 'gave_up' }), obs(null), at(300));
+  assert.ok(held.events[H], 'held after one absent tick (DOG-11)');
+  const r = reconcile(held.events, obs(null), at(330));
   assert.deepEqual(r.events, {});
 });
 
@@ -639,6 +677,70 @@ test('tick: dry-run makes no sends and no network calls', async () => {
   assert.equal(h.saved(), null);
 });
 
+test('isInputOccupied: a ">" line with text after it is a user draft', () => {
+  assert.equal(isInputOccupied(['API Error: 529', '> my half typed draft', '? for shortcuts']), true);
+  assert.equal(isInputOccupied(['API Error: 529', '> ', '? for shortcuts']), false);
+  assert.equal(isInputOccupied(['API Error: 529', '>', '? for shortcuts']), false);
+  assert.equal(isInputOccupied([]), false);
+});
+
+test('tick: an occupied input box skips the send and leaves the event untouched (DOG-7)', async () => {
+  const h = harness({ tail: [CLAUDE_529, '', '> my half typed draft', '? for shortcuts'], terminals: [T], state: seed() });
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.saved()[H].attempts, 0);
+  assert.equal(h.saved()[H].status, 'waiting');
+});
+
+test('tick: a throwing send is logged and the remaining candidates still send (DOG-10)', async () => {
+  const H2 = 'term_second';
+  const T2 = { ...T, handle: H2 };
+  const sent = [];
+  const logged = [];
+  const orca = async (args) => {
+    const [scope, verb] = args;
+    if (scope === 'terminal' && verb === 'list') return { terminals: [T, T2] };
+    if (scope === 'terminal' && verb === 'read') return { terminal: { tail: OUTAGE_TAIL } };
+    if (scope === 'terminal' && verb === 'wait') return {};
+    if (scope === 'terminal' && verb === 'send') {
+      const handle = args[args.indexOf('--terminal') + 1];
+      if (handle === H) throw new Error('Command failed: agent_prompt_stalled');
+      sent.push(handle); return {};
+    }
+    throw new Error(`unexpected orca call ${args.join(' ')}`);
+  };
+  const state = { ...seed(), [H2]: { ...seed()[H], handle: H2 } };
+  let saved = null;
+  const deps = { orca, fetchImpl: fakeFetch(() => okJson({ status: { indicator: 'none' } })), env: {}, now: () => at(10),
+    loadState: () => structuredClone(state), saveState: (e) => { saved = structuredClone(e); }, log: (lvl, msg) => logged.push(`${lvl} ${msg}`) };
+  await tick({ dryRun: false }, deps);
+  assert.deepEqual(sent, [H2]);
+  assert.equal(saved[H].attempts, 1, 'attempt was persisted before the failed send');
+  assert.ok(logged.some((l) => l.startsWith('warn send failed for term_') && l.includes('agent_prompt_stalled')), logged.join('\n'));
+});
+
+test('tick: terminal reads run with bounded concurrency, not one at a time (DOG-9)', async () => {
+  const terminals = Array.from({ length: 8 }, (_, i) => ({ ...T, handle: `term_${i}` }));
+  let inFlight = 0, peak = 0;
+  const orca = async (args) => {
+    const [scope, verb] = args;
+    if (scope === 'terminal' && verb === 'list') return { terminals };
+    if (scope === 'terminal' && verb === 'read') {
+      inFlight += 1; peak = Math.max(peak, inFlight);
+      await new Promise((r) => setTimeout(r, 50));
+      inFlight -= 1;
+      return { terminal: { tail: ['> '] } };
+    }
+    throw new Error(`unexpected orca call ${args.join(' ')}`);
+  };
+  const deps = { orca, fetchImpl: fakeFetch(() => okJson({})), env: {}, now: () => at(10), loadState: () => ({}), saveState: () => {}, log: () => {} };
+  const started = Date.now();
+  await tick({ dryRun: false }, deps);
+  const elapsed = Date.now() - started;
+  assert.ok(peak >= 2 && peak <= 4, `peak in-flight reads ${peak}, expected 2..4`);
+  assert.ok(elapsed < 250, `8 reads at 50 ms took ${elapsed} ms; sequential would be >= 400`);
+});
+
 test('tick: fresh re-read failure leaves the event untouched and sends nothing', async () => {
   const state = seed();
   const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state });
@@ -650,26 +752,38 @@ test('tick: fresh re-read failure leaves the event untouched and sends nothing',
   assert.deepEqual(h.saved()[H], state[H]);
 });
 
-test('tick: banner cleared on fresh re-read deletes the event; kind change replaces it; neither sends', async () => {
-  const flip = (second) => {
-    const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });
+test('tick: banner cleared on fresh re-read holds one tick then deletes; kind change replaces it; neither sends', async () => {
+  const flip = (state, second) => {
+    const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state });
     let reads = 0; const inner = h.deps.orca;
     h.deps.orca = async (args) => (args[1] === 'read' && ++reads === 2) ? { terminal: { tail: second } } : inner(args);
     return h;
   };
-  const gone = flip(['all done', '> ', '? for shortcuts']);
-  await tick({ dryRun: false }, gone.deps);
-  assert.deepEqual(gone.sent, []); assert.deepEqual(gone.saved(), {});
-  const changed = flip([...CLAUDE_BANNER, '? for shortcuts']);
+  // gone: the banner clears on the fresh re-read. First tick holds (clearedAt);
+  // a second tick with the banner still absent deletes it (DOG-11). Never sends.
+  const gone1 = flip(seed(), ['all done', '> ', '? for shortcuts']);
+  await tick({ dryRun: false }, gone1.deps);
+  assert.deepEqual(gone1.sent, []);
+  assert.ok(gone1.saved()[H].clearedAt, 'first miss holds with clearedAt');
+  const gone2 = harness({ tail: ['all done', '> ', '? for shortcuts'], terminals: [T], state: gone1.saved() });
+  await tick({ dryRun: false }, gone2.deps);
+  assert.deepEqual(gone2.sent, []); assert.deepEqual(gone2.saved(), {});
+  // kind change on the fresh re-read replaces the event; never sends.
+  const changed = flip(seed(), [...CLAUDE_BANNER, '? for shortcuts']);
   await tick({ dryRun: false }, changed.deps);
   assert.deepEqual(changed.sent, []);
   assert.equal(changed.saved()[H].kind, 'limit'); assert.equal(changed.saved()[H].attempts, 0);
 });
 
 test('tick: shell prompt on the fresh tail deletes the event and sends nothing', async () => {
-  const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });
+  // A limit banner still detects with a trailing shell prompt (no final-block
+  // requirement), so the fresh re-read reaches the prompt guard: the agent has
+  // exited to a shell, the event is dropped and nothing is sent.
+  const st = { [H]: { ...LIMIT_EV, platform: 'claude', bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
+    attempts: 0, lastAttemptAt: null, status: 'waiting' } };
+  const h = harness({ tail: [...CLAUDE_BANNER, '? for shortcuts'], terminals: [T], state: st });
   let reads = 0; const inner = h.deps.orca;
-  h.deps.orca = async (args) => (args[1] === 'read' && ++reads === 2) ? { terminal: { tail: [CLAUDE_529, 'john@mac ~ %'] } } : inner(args);
+  h.deps.orca = async (args) => (args[1] === 'read' && ++reads === 2) ? { terminal: { tail: ['Claude usage limit reached. Your limit will reset at 3am.', 'john@mac ~ %'] } } : inner(args);
   await tick({ dryRun: false }, h.deps);
   assert.deepEqual(h.sent, []); assert.deepEqual(h.saved(), {});
 });
@@ -708,8 +822,11 @@ test('tick: codex terminal with a Claude-shaped tail cannot become a candidate; 
   // True cross-platform isolation is unreachable through the public path while Codex detection is disabled.
   await tick({ dryRun: false }, h.deps);
   assert.equal(h.deps.fetchImpl.calls.filter((c) => c.url === CLAUDE_URL).length, 1);
-  assert.deepEqual(h.sent, []);            // claude suppressed; codex terminal's tail cannot match (no codex row) ⇒ event deleted, no send
-  assert.equal(h.saved()[H2], undefined);
+  assert.deepEqual(h.sent, []);            // claude suppressed; codex terminal's tail cannot match (no codex row) ⇒ never a candidate
+  // The codex tail reads as no-banner: the first miss holds it (clearedAt) with
+  // attempts still 0 — never a send candidate; a second absent tick deletes it (DOG-11).
+  assert.ok(h.saved()[H2].clearedAt);
+  assert.equal(h.saved()[H2].attempts, 0);
 });
 
 test('tick: v1 state file on disk is saved back as v2', async () => {

@@ -37,6 +37,7 @@ const STATUSES = ['waiting', 'resumed', 'gave_up'];
 const GRACE_PAST_MS = 2 * 60 * MIN; // absolute time this recently past = already reset
 const TAIL_LINES = 15;
 const READ_BUDGET_MS = 3 * MIN;    // stop reading terminals before the 4-min tick deadline
+const READ_CONCURRENCY = 4;        // parallel `terminal read`s per tick; orca serialises beyond a few
 
 // --- pure logic (unit-tested) ---
 
@@ -186,6 +187,7 @@ export function validateEvent(key, ev) {
   if (!Number.isInteger(ev.attempts) || ev.attempts < 0 || ev.attempts > max) return `attempts: ${ev.attempts} (0..${max})`;
   if (ev.lastAttemptAt !== null && !isIso(ev.lastAttemptAt)) return 'lastAttemptAt: not null or a timestamp';
   if (ev.lastAttemptAt === null && (ev.status !== 'waiting' || ev.attempts > 0)) return 'lastAttemptAt: required once an attempt was made';
+  if (ev.clearedAt !== undefined && !isIso(ev.clearedAt)) return 'clearedAt: not a timestamp';
   return null;
 }
 
@@ -274,7 +276,14 @@ export function reconcile(state, observations, now, liveHandles = null) {
     if (!live.has(ev.handle)) { delete events[key]; continue; }             // 1. vanished
     const o = byHandle.get(ev.handle);
     if (!o) continue;                                                        // 2. live but unread: freeze
-    if (!o.banner) { delete events[key]; continue; }                         // 3. banner cleared
+    if (!o.banner) {                                                         // 3. banner cleared
+      // One absent read is not proof: the agent scrolls, orca returns a short
+      // tail, a redraw lands mid-read. Deleting on the first miss resets
+      // attempts to 0 and lets a flickering banner be sent to without bound.
+      if (ev.clearedAt) { delete events[key]; continue; }                    //    3a. second consecutive miss
+      ev.clearedAt = now.toISOString(); continue;                            //    3b. first miss: hold
+    }
+    delete ev.clearedAt;                                                     //    banner present again
     if (o.banner.kind !== ev.kind || (o.platform !== 'unknown' && o.platform !== ev.platform)) {
       events[key] = newEvent(o, now); continue;                              // 4. replace (never a candidate this tick)
     }
@@ -307,6 +316,14 @@ export function isShellPrompt(tail, agentIdentity) {
   if (last === undefined) return false;
   if (last === '>') return agentIdentity !== 'claude';
   return SHELL_PROMPT_RE.test(last);
+}
+
+// True when Claude Code's input box (a line starting with ">") already holds
+// text. A send would be appended to that draft and --enter would submit both,
+// so the tick skips and the event stays as it is (spec §6.4 spirit).
+const INPUT_DRAFT_RE = /^>\s+\S/;
+export function isInputOccupied(tail) {
+  return tail.map((l) => stripAnsi(l).trimEnd()).some((l) => INPUT_DRAFT_RE.test(l));
 }
 
 const STATUS_URLS = Object.freeze({
@@ -435,22 +452,26 @@ export async function tick({ dryRun }, depsIn = {}) {
 
   const observations = [];
   const startedAt = Date.now();
-  for (const t of terminals.filter((t) => t.connected && t.writable)) {
-    if (readBudgetExceeded(startedAt, Date.now())) {
-      log('warn', `read budget (${READ_BUDGET_MS / MIN} min) spent; skipping remaining terminals this tick`);
-      break;
-    }
-    try {
-      const tail = await readTail(t.handle, deps.orca);
-      const banner = detectBanner(tail, inferPlatform(t));
-      if (!banner && shouldLog('debug') && hasOutageLine(tail)) {
-        log('debug', `outage-pattern line present but not detected (platform gate, retry veto, or final block) on ${t.handle}: ${sanitize(tail.slice(-TAIL_LINES).join(' | '), 600)}`);
+  const queue = terminals.filter((t) => t.connected && t.writable);
+  let budgetSpent = false;
+  const worker = async () => {
+    while (queue.length > 0) {
+      if (readBudgetExceeded(startedAt, Date.now())) { budgetSpent = true; return; }
+      const t = queue.shift();
+      try {
+        const tail = await readTail(t.handle, deps.orca);
+        const banner = detectBanner(tail, inferPlatform(t));
+        if (!banner && shouldLog('debug') && hasOutageLine(tail)) {
+          log('debug', `outage-pattern line present but not detected (platform gate, retry veto, or final block) on ${t.handle}: ${sanitize(tail.slice(-TAIL_LINES).join(' | '), 600)}`);
+        }
+        observations.push({ handle: t.handle, banner, platform: inferPlatform(t, banner), window: tail.slice(-TAIL_LINES).join(' | ') });
+      } catch (e) {
+        log('warn', `read failed for ${t.handle}: ${sanitize(e.message)}`);
       }
-      observations.push({ handle: t.handle, banner, platform: inferPlatform(t, banner), window: tail.slice(-TAIL_LINES).join(' | ') });
-    } catch (e) {
-      log('warn', `read failed for ${t.handle}: ${e.message}`);
     }
-  }
+  };
+  await Promise.all(Array.from({ length: Math.min(READ_CONCURRENCY, queue.length) }, worker));
+  if (budgetSpent) log('warn', `read budget (${READ_BUDGET_MS / MIN} min) spent; skipped ${queue.length} terminal(s) this tick`);
 
   const now = deps.now();
   const state = deps.loadState();
@@ -497,7 +518,10 @@ export async function tick({ dryRun }, depsIn = {}) {
     }
     const term = byHandle.get(ev.handle);
     const fresh = detectBanner(tail, inferPlatform(term));
-    if (!fresh) { log('info', `skip ${ev.handle}: banner cleared before send`); delete events[key]; deps.saveState(events); continue; }
+    if (!fresh) {   // same hold as reconcile rule 3b: one miss is not proof
+      log('info', `skip ${ev.handle}: banner cleared before send; holding`);
+      ev.clearedAt = now.toISOString(); deps.saveState(events); continue;
+    }
     const platform = inferPlatform(term, fresh);
     if (fresh.kind !== ev.kind || (platform !== 'unknown' && platform !== ev.platform)) {
       log('info', `skip ${ev.handle}: banner changed to ${fresh.kind}/${platform} before send; fresh event`);
@@ -507,12 +531,21 @@ export async function tick({ dryRun }, depsIn = {}) {
       log('warn', `skip ${ev.handle}: shell prompt on last line, agent has exited; event dropped`);
       delete events[key]; deps.saveState(events); continue;
     }
+    if (isInputOccupied(tail)) {                                                     // 4b. draft guard
+      log('info', `skip ${ev.handle}: input box holds a draft; event untouched`); continue;
+    }
     ev.attempts += 1;                                                                // 5. persist, then send
     ev.lastAttemptAt = now.toISOString();
     ev.status = 'resumed';
     deps.saveState(events);
-    await deps.orca(['terminal', 'send', '--terminal', ev.handle, '--text', sch.resumeText, '--enter']);
-    log('info', `resumed ${ev.handle} (${ev.kind}, attempt ${ev.attempts})`);
+    try {
+      await deps.orca(['terminal', 'send', '--terminal', ev.handle, '--text', sch.resumeText, '--enter']);
+      log('info', `resumed ${ev.handle} (${ev.kind}, attempt ${ev.attempts})`);
+    } catch (e) {
+      // The attempt is already persisted (no double-send on retry); the other
+      // candidates and the GAVE UP pass must still run this tick.
+      log('warn', `send failed for ${ev.handle} (attempt ${ev.attempts}): ${sanitize(e.message)}`);
+    }
   }
 
   for (const [key, ev] of Object.entries(events)) {
