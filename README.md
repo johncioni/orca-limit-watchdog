@@ -27,7 +27,10 @@ Orca terminal's tail and looks for one of two banners in the last 15 lines:
   Up to 6 sends 30 min apart, hard stop 24 h after detection. Before each
   send it checks `status.claude.com`; a `major`/`critical` incident holds the
   send (without using an attempt). Any status-page problem fails open.
-  Codex outage detection is not enabled yet (no captured transcript).
+  Codex terminals are covered too: the TUI's own `■ …` error line (wording
+  taken from the Codex source; only on terminals Orca identifies as Codex),
+  gated on `status.openai.com`, and held while `Reconnecting... N/5` or
+  `esc to interrupt` is on screen.
 
 Both kinds refuse to send when the terminal's last line is a shell prompt
 (the agent exited). Network access is limited to the two status pages and

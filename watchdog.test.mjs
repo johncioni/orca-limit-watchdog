@@ -87,6 +87,9 @@ test('only scans the last 15 lines', () => {
 
 const CHROME_TAIL = ['', '─'.repeat(40), '> ', '? for shortcuts'];
 const CLAUDE_529 = 'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_011CTx"}';
+const CODEX_ERR = "■ We're currently experiencing high demand, which may cause temporary errors.";
+const CODEX_FOOTER = 'Context 16% used · 5h 36% left · weekly 90% left · gpt-5.6-sol medium · main · Ready · Custom permissions';
+const CODEX_TAIL = ['─ Worked for 2m 51s ───────────', CODEX_ERR, '', '› Ask Codex to do anything', CODEX_FOOTER];
 const outageTail = (line) => ['some earlier output', line, ...CHROME_TAIL];
 
 test('existing limit banners now carry kind "limit"', () => {
@@ -104,6 +107,36 @@ test('detects Claude API outage banners (529, 503, Connection error, ⎿ prefix)
       assert.match(b.bannerText, /^(?:⎿\s*)?API Error/);
     }
   }
+});
+
+test('detects Codex outage errors only on a codex-identified terminal (DOG-17)', () => {
+  const b = detectBanner(CODEX_TAIL, 'codex');
+  assert.ok(b); assert.equal(b.kind, 'outage'); assert.equal(b.patternId, 'codex-api-error');
+  assert.equal(detectBanner(CODEX_TAIL, 'claude'), null);
+  assert.equal(detectBanner(CODEX_TAIL, 'unknown'), null);
+  for (const line of [
+    '■ stream disconnected before completion: error sending request for url (https://chatgpt.com/backend-api/codex/responses)',
+    '■ Selected model is at capacity. Please try a different model.',
+    '■ exceeded retry limit, last status: 503 Service Unavailable, request id: 5036c677',
+    '■ request timed out',
+  ]) assert.ok(detectBanner([line, '›'], 'codex'), line);
+});
+
+test('Codex 429 retry-limit and usage-limit lines are not outages', () => {
+  assert.equal(detectBanner(['■ exceeded retry limit, last status: 429 Too Many Requests', '›'], 'codex'), null);
+  const b = detectBanner(["■ You've hit your usage limit. Try again at Sep 8th, 2026 2:00 PM.", '›'], 'codex');
+  assert.ok(b); assert.equal(b.kind, 'limit');
+});
+
+test('Reconnecting and esc-to-interrupt after the error veto the outage (still working)', () => {
+  assert.equal(detectBanner([CODEX_ERR, 'Reconnecting... 3/5 (13s • esc to interrupt)', '  └ Stream disconnected before completion: websocket closed'], 'codex'), null);
+  assert.equal(detectBanner([CODEX_ERR, 'Working (12s • esc to interrupt)'], 'codex'), null);
+  assert.equal(detectBanner([CODEX_ERR, 'Reconnecting... waiting for network'], 'codex'), null);
+});
+
+test('Codex chrome after the error keeps it final; real output after it does not', () => {
+  assert.ok(detectBanner([CODEX_ERR, '', '› Ask Codex to do anything', '42% context left'], 'codex'));
+  assert.equal(detectBanner([CODEX_ERR, 'I retried and the request succeeded; continuing with the refactor.', '›'], 'codex'), null);
 });
 
 test('outage bannerText is sanitized and capped at 200 chars', () => {
@@ -182,6 +215,10 @@ test('agentIdentity is authoritative; banner is the fallback; else unknown', () 
   assert.equal(inferPlatform({ agentIdentity: 'gpt' }, null), 'unknown');
   assert.equal(inferPlatform({}, { patternId: 'limit' }), 'unknown');
   assert.equal(inferPlatform({ agentIdentity: 'gpt' }), 'unknown');
+});
+
+test('inferPlatform maps the codex pattern to codex', () => {
+  assert.equal(inferPlatform({ agentIdentity: undefined }, { patternId: 'codex-api-error' }), 'codex');
 });
 
 // --- parseResetTime ---
@@ -659,6 +696,16 @@ test('tick: due outage event, status none ⇒ one outage resume, attempt persist
   assert.equal(h.fetchImpl.calls[0].url, CLAUDE_URL);
 });
 
+test('tick: a due Codex outage event fetches status.openai.com and sends the outage text', async () => {
+  const TC = { ...T, handle: 'term_codex', agentIdentity: 'codex' };
+  const ev = { ...seed()[H], handle: 'term_codex', platform: 'codex' };
+  const h = harness({ tail: CODEX_TAIL, terminals: [TC], state: { term_codex: ev } });
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, [OUTAGE_RESUME_TEXT]);
+  assert.equal(h.fetchImpl.calls.length, 1);
+  assert.match(h.fetchImpl.calls[0].url, /status\.openai\.com/);
+});
+
 test('tick: status major suppresses without consuming an attempt', async () => {
   const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed(), indicator: 'major' });
   await tick({ dryRun: false }, h.deps);
@@ -690,6 +737,12 @@ test('isInputOccupied: a ">" line with text after it is a user draft', () => {
   assert.equal(isInputOccupied(['API Error: 529', '> ', '? for shortcuts']), false);
   assert.equal(isInputOccupied(['API Error: 529', '>', '? for shortcuts']), false);
   assert.equal(isInputOccupied([]), false);
+});
+
+test('isInputOccupied: Codex draft counts, the placeholder does not', () => {
+  assert.equal(isInputOccupied([CODEX_ERR, '› fix the flaky test', CODEX_FOOTER]), true);
+  assert.equal(isInputOccupied([CODEX_ERR, '› Ask Codex to do anything', CODEX_FOOTER]), false);
+  assert.equal(isInputOccupied([CODEX_ERR, '›', CODEX_FOOTER]), false);
 });
 
 test('tick: an occupied input box skips the send and leaves the event untouched (DOG-7)', async () => {

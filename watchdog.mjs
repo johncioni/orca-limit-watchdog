@@ -77,17 +77,25 @@ export function sanitize(text, limit = 200) {
 
 // Outage banners are platform-owned TUI shapes; there is deliberately no
 // generic rule. `platforms` gates which terminal identities a row applies to.
-// Codex has no row yet (spec §Non-goals): nothing it prints is unambiguous.
 const OUTAGE_PATTERNS = [
   { id: 'claude-api-error', platforms: ['claude', 'unknown'],
     re: /^(⎿\s*)?API Error: (5\d\d\b|Connection error\b|.*\boverloaded_error\b)/i },
+  { id: 'codex-api-error', platforms: ['codex'],
+    // Codex TUI history marker "■" (a U+200A hair space may follow) + one of its
+    // fixed error texts (codex-rs/protocol/src/error.rs). 429 is the rate-limit
+    // path and deliberately not listed.
+    re: /^■\s*(stream disconnected before completion\b|We're currently experiencing high demand\b|Selected model is at capacity\b|exceeded retry limit, last status: 5\d\d\b|Error while reading the server response\b|Connection failed:|unexpected status 5\d\d\b|request timed out\b)/ },
 ];
-const RETRY_RE = /retrying in \d|attempt \d+\s*(\/|of)\s*\d+/i;
+const RETRY_RE = /retrying in \d|attempt \d+\s*(\/|of)\s*\d+|Reconnecting\.\.\. (\d+\/\d+|waiting for network)|esc to interrupt/i;
 // Lines allowed AFTER the error for it to count as the final, stalled banner.
 const CHROME_RES = [
   /^$/,
   /^[─│╭╮╰╯┃━┌┐└┘├┤⎿\s]+$/,
   /^>(\s.*)?$/,
+  /^›(\s+Ask Codex to do anything)?\s*$/,
+  /^\d+% context left$/,
+  /^Context \d+% used\b/,
+  /^─+\s*Worked for [^─]*─+$/,
   /^⎿/,
   /^(\? for shortcuts|Press |Esc |esc |Retry|⏵|⏸|✗|✓)/,
 ];
@@ -157,6 +165,7 @@ export function inferPlatform(terminal, banner = null) {
   const id = terminal?.agentIdentity;
   if (id === 'claude' || id === 'codex') return id;
   if (banner?.patternId === 'claude-api-error') return 'claude';
+  if (banner?.patternId === 'codex-api-error') return 'codex';
   return 'unknown';
 }
 
@@ -321,10 +330,10 @@ export function isShellPrompt(tail, agentIdentity) {
   return SHELL_PROMPT_RE.test(last);
 }
 
-// True when Claude Code's input box (a line starting with ">") already holds
-// text. A send would be appended to that draft and --enter would submit both,
-// so the tick skips and the event stays as it is (spec §6.4 spirit).
-const INPUT_DRAFT_RE = /^>\s+\S/;
+// True when an agent input box already holds text. A send would be appended to
+// that draft and --enter would submit both, so the tick skips and the event
+// stays as it is (spec §6.4 spirit).
+const INPUT_DRAFT_RE = /^[>›]\s+(?!Ask Codex to do anything\s*$)\S/;
 export function isInputOccupied(tail) {
   return tail.map((l) => stripAnsi(l).trimEnd()).some((l) => INPUT_DRAFT_RE.test(l));
 }

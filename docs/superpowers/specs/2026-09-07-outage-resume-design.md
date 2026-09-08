@@ -411,3 +411,43 @@ two consecutive ticks. The first miss stamps `clearedAt` on the event and
 freezes it; a second miss deletes it; the banner reappearing removes
 `clearedAt` and keeps `attempts`. This closes the loophole where a
 flickering read reset the retry cap every 30 minutes.
+
+## Amendment 2026-09-08 (DOG-17): Codex outage detection enabled
+
+The Non-goals section deferred Codex because no captured transcript existed.
+The Codex TUI's error wording was instead read from the Codex source tree
+(openai/codex @ 95327467, rust-v0.153.4: `codex-rs/protocol/src/error.rs`,
+`codex-rs/tui/src/history_cell/notices.rs`, `codex-rs/core/src/responses_retry.rs`)
+and corroborated by user-pasted terminal output in issues #14260, #19121,
+#15105, #25273, #41790 and #23304. Source-verified, platform-owned wording
+satisfies the same bar as a captured transcript; screen-layout details (a
+hair space after the marker, wrapping) remain medium confidence and are
+covered by tolerant regexes.
+
+**Pattern row** (`OUTAGE_PATTERNS`, `id: 'codex-api-error'`, `platforms: ['codex']`
+only; a terminal Orca cannot identify as Codex never matches, unlike the
+Claude row which also accepts `unknown`): a line starting with the red
+history marker `■` (optionally followed by whitespace, including U+200A)
+and one of Codex's fixed error texts: `stream disconnected before completion`,
+`We're currently experiencing high demand`, `Selected model is at capacity`,
+`exceeded retry limit, last status: 5xx`, `Error while reading the server
+response`, `Connection failed:`, `unexpected status 5xx`, `request timed out`.
+`exceeded retry limit, last status: 429` is deliberately excluded: it is the
+rate-limit path.
+
+**Retry veto additions** (apply to every platform, still only at or after the
+error line): `Reconnecting... N/M`, `Reconnecting... waiting for network`, and
+`esc to interrupt` (both Codex and Claude Code print it only while a turn is
+running, so its presence after the error means the agent is still working).
+
+**Chrome additions** for the final-block rule: the Codex composer line `›`
+(bare, or with the placeholder `Ask Codex to do anything`), the footer forms
+`N% context left` and `Context N% used · …`, and the turn separator
+`─ Worked for … ─`.
+
+**Draft guard**: `isInputOccupied` also recognises the Codex composer `›`
+followed by user text, but never the placeholder text itself.
+
+`inferPlatform` maps `patternId: 'codex-api-error'` to `codex`. The status
+gate already resolves `codex` to `status.openai.com`; schedule, backoff,
+deadline and the prompt guard are unchanged.

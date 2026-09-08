@@ -12,8 +12,11 @@ agent TUI and sends a resume prompt when it is safe to:
 - **Rate limit:** banner with a stated reset time; resumes after the reset.
   Spec: `docs/superpowers/specs/2026-07-23-orca-limit-watchdog-design.md`.
 - **API outage:** Claude Code's own `API Error: 5xx / Connection error /
-  overloaded_error` banner; resumes after a hold, gated on `status.claude.com`.
-  Spec: `docs/superpowers/specs/2026-09-07-outage-resume-design.md`.
+  overloaded_error` banner, or Codex's `■ …` error line (source-verified
+  wording, Codex-identified terminals only); resumes after a hold, gated on
+  `status.claude.com` / `status.openai.com`.
+  Spec: `docs/superpowers/specs/2026-09-07-outage-resume-design.md` (see its
+  DOG-17 amendment for the Codex row).
 
 Implementation plans with execution records live in `docs/superpowers/plans/`.
 Installed by `install.sh` (writes the plist, `launchctl bootstrap`), removed by
