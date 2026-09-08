@@ -45,6 +45,11 @@ const REACHED_RE = /(reached|hit|exceeded)/i;
 const RESET_RE = /(resets?\b|try again|available|come back)/i;
 const VETO_RE = /approaching[^\n]*limit/i;
 
+// Claude Code's persistent status footer ("Context … │ Usage … (resets in 3h 8m)")
+// is on screen in every Claude terminal and always satisfies RESET_RE. It is
+// chrome, never evidence: dropped before the limit rule runs.
+const FOOTER_RE = /│\s*Usage\s/;
+
 // CSI (ESC [ … final), OSC (ESC ] … BEL|ST), and stray C0/DEL control bytes.
 const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|[\x00-\x08\x0b-\x1f\x7f]/g;
 export function stripAnsi(s) { return String(s).replace(ANSI_RE, ''); }
@@ -112,11 +117,14 @@ export function detectBanner(lines, platform = 'unknown') {
   // Drop soft "approaching … limit" warning lines first, so such a warning can
   // neither be mistaken for a reached-banner nor veto a genuine reached-banner
   // that happens to share the same 15-line window (per-line veto, not whole-window).
-  const kept = window.filter((l) => !VETO_RE.test(l));
+  const kept = window.filter((l) => !VETO_RE.test(l) && !FOOTER_RE.test(l));
   const text = kept.join('\n');
   let limit = null;
-  if (LIMIT_RE.test(text) && REACHED_RE.test(text) && RESET_RE.test(text)) {
-    const isRelevant = (l) => !VETO_RE.test(l) && (LIMIT_RE.test(l) || RESET_RE.test(l));
+  // The limit phrase and the reached word must sit on ONE line: a banner says
+  // "usage limit reached"; prose and logs scatter the words across lines.
+  const reachedLine = (l) => LIMIT_RE.test(l) && REACHED_RE.test(l);
+  if (kept.some(reachedLine) && RESET_RE.test(text)) {
+    const isRelevant = (l) => !VETO_RE.test(l) && !FOOTER_RE.test(l) && (LIMIT_RE.test(l) || RESET_RE.test(l));
     const l = lastIndex(window, isRelevant);
     limit = { kind: 'limit', bannerText: sanitize(window.filter(isRelevant).join(' | '), 600),
       matchedLine: window[l], patternId: 'limit', index: l };

@@ -59,6 +59,25 @@ test('no match on ordinary code/log output mentioning limits', () => {
   assert.equal(detectBanner(['const usageLimit = 5; // reached?']), null);
 });
 
+const FOOTER = 'Context ██░░░░░░░░ 19% │ Usage ████░░░░░░ 41% (resets in 3h 8m)';
+
+test('usage footer does not turn a prose rate-limit line into a limit event (DOG-3)', () => {
+  assert.equal(detectBanner(['error: rate limit exceeded (HTTP 429)', FOOTER, '> ', '? for shortcuts'], 'claude'), null);
+  assert.equal(detectBanner(['Working around the rate limit we hit yesterday.', FOOTER, '> ', '? for shortcuts'], 'claude'), null);
+});
+
+test('limit phrase and reached word must share a line', () => {
+  assert.equal(detectBanner(['usage limit', 'reached', 'resets at 3pm']), null);
+});
+
+test('a real banner is still detected next to the footer, and the footer never enters bannerText', () => {
+  const b = detectBanner([...CLAUDE_BANNER, FOOTER, '? for shortcuts'], 'claude');
+  assert.ok(b);
+  assert.equal(b.kind, 'limit');
+  assert.match(b.bannerText, /reset at 3am/i);
+  assert.doesNotMatch(b.bannerText, /3h 8m/);
+});
+
 test('only scans the last 15 lines', () => {
   const lines = [...CLAUDE_BANNER, ...Array(20).fill('normal output')];
   assert.equal(detectBanner(lines), null);
