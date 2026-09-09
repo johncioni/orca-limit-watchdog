@@ -16,11 +16,12 @@ Companion to the outage-resume design
 (`2026-07-23-orca-limit-watchdog-design.md`). Tracked as DOG-19 (connectivity
 gate) and DOG-20 (reset-less alert); see "Sequencing".
 
-**Revision 3 (2026-09-08)** incorporates Codex spec-review rounds 1 and 2
-(`.superpowers/reviews/dog-19-20-spec-round-1.md` and `-round-2.md`). Round 1:
-13 findings, all accepted. Round 2: 10 confirmed resolved, remaining
-spec-precision items addressed here. See the two "review resolutions" sections
-at the end for the finding→fix maps.
+**Revision 4 (2026-09-08)** incorporates Codex spec-review rounds 1-3
+(`.superpowers/reviews/dog-19-20-spec-round-{1,2,3}.md`). Round 1: 13 findings,
+all accepted. Round 2: 10 confirmed resolved, rest addressed. Round 3: all
+round-2 fixes verified with no regressions, 2 bounded detection corrections
+(both my Revision-3 edits) fixed here. See the "review resolutions" sections at
+the end for the finding→fix maps.
 
 ## Problem
 
@@ -127,10 +128,14 @@ from that same block.
 **Codex `■`-anchored classification — both shapes, one split (findings R2
 #1, #8).** A Codex-platform `■` line that is EITHER:
 
-- `^■\s*exceeded retry limit, last status: <status>\b` — the retry-exhaustion
-  line (source: `codex-rs/protocol/src/error.rs`); it does not satisfy
-  `LIMIT_RE`, so it is recognised explicitly and its status (e.g. `429`) is
-  included in the evidence; **or**
+- `^■\s*exceeded retry limit, last status: 429\b` — the **429-only**
+  retry-exhaustion line (source: `codex-rs/protocol/src/error.rs`); it does not
+  satisfy `LIMIT_RE`, so it is recognised explicitly. **The status must be 429**:
+  `5\d\d` on this line is already the DOG-17 **outage** pattern
+  (`watchdog.mjs:87`) and stays there; any other status matches neither rule
+  (`null`). Generalising to `<status>` (a Revision-3 slip) would collide with the
+  outage pattern and, on the limit-favouring index tie, convert a status-gated
+  5xx outage into an alert — do not; **or**
 - `^■\s*` + a limit-reached phrase (`LIMIT_RE` **and** `REACHED_RE`, e.g.
   "You've hit your usage limit"),
 
@@ -171,7 +176,12 @@ trigger. The candidate block and its final-block check reuse DOG-17 exactly:
     purchase more credits`] [+ `or try again at <time>.`] — the live wrap spans
     "…to" / "purchase more credits or try again at <time>.";
   - `You've hit your usage limit. Try again at <time>.`;
-  - the single `exceeded retry limit, last status: <status>` line.
+  - `exceeded retry limit, last status: 429` [+ an optional bounded `Try again
+    at <time>.` continuation on the next line]. The bare line ⇒ `limit-open`; the
+    line **plus** the reset continuation puts that time in the evidence block so
+    the single parse yields `limit`. Unrelated following prose is not a valid
+    continuation and is rejected (finding R3 #2 — this keeps the "429 + reset ⇒
+    limit" contract reachable, which the single-line form contradicted).
   The block ends at the terminal sentence of the matched form. An *internal*
   period (after "usage limit.") is distinguished from the banner's end, so the
   required wrapped "purchase more credits." fixture is accepted while near-miss
@@ -502,6 +512,12 @@ All `node --test`, pure/injectable, never against live terminals (Safety).
 
 - `["■ exceeded retry limit, last status: 429", "› Ask Codex to do anything"]`,
   `codex` ⇒ `limit-open`.
+- **Exact-kind status coverage (finding R3 #1):** bare `…429` ⇒ `limit-open`;
+  `…429` + `Try again at 10:12 PM.` ⇒ `limit` (continuation parse, finding R3
+  #2); `…last status: 503 …` ⇒ **`outage`** (stays on the DOG-17 path, not a
+  limit); a non-429/non-5xx status ⇒ `null`. Assert the exact `kind`, not just
+  truthiness — the existing 503 fixture (`watchdog.test.mjs:120-122`) only
+  asserts truthy and would miss this regression; tighten it.
 - `["■ You've hit your usage limit. Upgrade to Pro …", "purchase more credits."]`,
   `codex` ⇒ `limit-open` (no reset present); wrapped continuation admitted.
 - The live "…or try again at 10:12 PM." banner ⇒ `limit` (regression guard).
@@ -637,8 +653,23 @@ addressed in Revision 3.
   loopback host (like `statusUrlFor`); `true` = "probe returned ok", never API
   reachability; portal-allows-probe caveat stated.
 
-Remaining review policy note: this is Revision 3 after the two-round default.
-The residual items were spec-precision, not design flaws; the detection
-mechanics (evidence selection, continuation regexes) are pinned in the DOG-20
-implementation plan and verified by TDD against the real captured fixtures under
-the Opus code-review loop.
+## Round-3 review resolutions (Revision 4)
+
+Codex round 3 (`.superpowers/reviews/dog-19-20-spec-round-3.md`) verified all
+nine round-2 fixes with no regressions in the settled helper/schema/connectivity
+design, and raised two bounded detection corrections (both introduced by
+Revision-3 edits); both fixed here:
+
+- **R3 #1 (retry-limit status over-broadened)** — §1: restored **429-only** for
+  the `exceeded retry limit` line; `5xx` stays on the DOG-17 outage path, other
+  statuses ⇒ `null`. §Testing adds exact-kind assertions (429⇒limit-open,
+  503⇒outage, other⇒null) and tightens the truthy-only 503 fixture.
+- **R3 #2 (429 reset-continuation unreachable)** — §1: the 429 named form now
+  allows an optional bounded `Try again at <time>.` continuation, so
+  `429`+reset ⇒ `limit` is reachable (resolving the contradiction with the
+  classification contract); bare 429 ⇒ `limit-open`; unrelated prose rejected.
+
+Review-policy note: rounds 1-3 are complete (round 3 was at John's request,
+beyond the two-round default). The design is verified stable; remaining work is
+implementation, where the detection fixtures above are pinned in the DOG-20 plan
+and TDD'd against the real captured strings under the Opus code-review loop.
