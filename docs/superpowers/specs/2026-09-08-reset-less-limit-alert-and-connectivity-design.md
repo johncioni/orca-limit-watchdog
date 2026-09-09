@@ -16,10 +16,11 @@ Companion to the outage-resume design
 (`2026-07-23-orca-limit-watchdog-design.md`). Tracked as DOG-19 (connectivity
 gate) and DOG-20 (reset-less alert); see "Sequencing".
 
-**Revision 2 (2026-09-08)** incorporates Codex spec-review round 1
-(`.superpowers/reviews/dog-19-20-spec-round-1.md`, REQUEST-CHANGES, 13
-findings, all accepted). See "Round-1 review resolutions" for the finding→fix
-map.
+**Revision 3 (2026-09-08)** incorporates Codex spec-review rounds 1 and 2
+(`.superpowers/reviews/dog-19-20-spec-round-1.md` and `-round-2.md`). Round 1:
+13 findings, all accepted. Round 2: 10 confirmed resolved, remaining
+spec-precision items addressed here. See the two "review resolutions" sections
+at the end for the finding→fix maps.
 
 ## Problem
 
@@ -107,62 +108,83 @@ discipline. The change is scoped so that **non-Codex and non-`■` inputs behave
 exactly as today** (including the existing `limit` `?? +60 min` fallback and the
 DOG HTTP-429 negative).
 
-**Single parse, once.** Detection builds one *banner-evidence string* — the
-limit-relevant window lines with footer/veto lines excluded (the same
-`isRelevant` filter the limit rule already uses for `bannerText`) — and calls
-the real API `parseResetTime(evidence, now)` exactly once. (Revision 1's
-`parseResetTime(window)` was wrong: the API is `(text, now)` and the raw window
-includes footer durations and unrelated clocks.)
+**Detector contract (finding R2 #2).** `detectBanner` gains an injectable `now`
+— `detectBanner(lines, platform = 'unknown', now = new Date())` — backward
+compatible with existing two-argument callers. When it selects a limit/limit-open
+banner it parses the reset time **once**, over the *selected evidence block*
+(below), and returns that parsed `resetAt` (or `null`) on the banner object so
+`newEvent` consumes it directly and **never re-parses** the truncated
+`bannerText`. (Revision 2 left a second parse in `newEvent` over the
+sanitized/600-char-capped `bannerText`; a reset beyond the cap could classify as
+`limit` then vanish at construction, reviving the blind fallback.)
 
-**Codex `■`-anchored classification.** When the window contains a
-Codex-platform line matching:
+**Selected evidence block.** Classification parses only the *chosen candidate's
+contiguous block* — the `■` line plus its bounded continuation (below) — **not**
+a whole-window `isRelevant` join, so an earlier, unrelated reset-bearing line can
+never be attached to a newer no-reset limit. `bannerText` for storage is built
+from that same block.
 
-- `^■\s*exceeded retry limit, last status: 429\b` — Codex's 429 retry-exhaustion
-  (source: `codex-rs/protocol/src/error.rs`). This line does not satisfy
-  `LIMIT_RE`, so it is an explicit pattern and never reaches the existing limit
-  rule ⇒ always `limit-open`; **or**
-- `^■\s*` followed by a limit-reached phrase (`LIMIT_RE` **and** `REACHED_RE` on
-  that line, e.g. "You've hit your usage limit") — then classify by the single
-  parse: `parseResetTime(evidence, now)` non-null ⇒ **`limit`** (auto-resume,
-  the existing path); null ⇒ **`limit-open`**.
+**Codex `■`-anchored classification — both shapes, one split (findings R2
+#1, #8).** A Codex-platform `■` line that is EITHER:
 
-**Precedence, stated precisely** (Revision 1's "unchanged rules first" was not
-implementable because the existing rule keys on `RESET_RE.test(text)`, not parse
-success):
+- `^■\s*exceeded retry limit, last status: <status>\b` — the retry-exhaustion
+  line (source: `codex-rs/protocol/src/error.rs`); it does not satisfy
+  `LIMIT_RE`, so it is recognised explicitly and its status (e.g. `429`) is
+  included in the evidence; **or**
+- `^■\s*` + a limit-reached phrase (`LIMIT_RE` **and** `REACHED_RE`, e.g.
+  "You've hit your usage limit"),
 
-- For a **Codex `■`-anchored reached-limit line**, the parse-success test above
-  decides `limit` vs `limit-open` — this **overrides** the old `RESET_RE`
-  presence gate for that specific case. So `■ …usage limit reached, try again
-  later` (RESET_RE matches "try again", but no clock parses) becomes
-  `limit-open` on Codex, instead of `limit` + blind +60 min. This is the
-  intended improvement and the only behaviour change; it is Codex-`■`-only.
-- Every other input is untouched: non-Codex, or no `■` anchor ⇒ the existing
-  `limit`/`outage`/`null` rules run verbatim, preserving the `RESET_RE`-gated
-  limit path, its `+60 min` fallback, and the HTTP-429-plus-footer negative
-  (which is Claude-platform, no `■`, chrome only ⇒ still `null`).
-- `limit-open` vs `outage`: distinct wordings; the existing last-contributing-
-  line index rule decides if both somehow match. `matchedLine` = the `■` line;
-  `patternId = 'limit-open'`; precedence index = that line's window index.
+forms a **Codex limit candidate**, classified by a single
+`parseResetTime(evidenceBlock, now)`: reset parses ⇒ **`limit`** (auto-resume);
+`null` ⇒ **`limit-open`**. Thus `■ exceeded retry limit, last status: 429` alone
+⇒ `limit-open`; that line (or a usage-limit line) **plus a real "try again at
+<time>" continuation** ⇒ `limit`; `■ …usage limit reached, try again later` (no
+clock) ⇒ `limit-open`. This resolves the Revision-2 contradiction (429 was
+wrongly "always limit-open" while a test required 429+reset ⇒ `limit`): **both
+shapes go through the same split.**
 
-**Stalled-banner safety (mirror DOG-17, do not just anchor).** A bare "window
-contains a line" test is unsafe: a *historical* limit-open error followed by
-resumed work or a `Reconnecting…` row would wrongly trigger and stay eligible.
-`limit-open` therefore reuses the DOG-17 machinery:
+**No legacy fallback for a rejected Codex candidate.** Once a line is a Codex
+`■` limit candidate it is classified only by the split above; it never falls
+through to the old `RESET_RE`-gated limit rule and cannot regain automatic
+eligibility that way. Non-Codex / non-`■` inputs still run the existing rules
+verbatim (preserving the `+60 min` fallback and the HTTP-429-plus-footer
+negative, which is Claude-platform, no `■` ⇒ still `null`).
 
-- **Retry vetoes** (already defined): `Reconnecting... N/M`, `Reconnecting...
-  waiting for network`, `esc to interrupt` at or after the `■` line ⇒ not
-  `limit-open` (the agent is still working).
-- **Bounded continuation grammar.** The banner is the `■` line plus its
-  wrapped continuation — the source-verified Codex usage-limit wording continues
-  across a line break to "…purchase more credits or try again at <time>." — up
-  to the sentence terminator. Continuation lines are matched, not treated as
-  free prose.
-- **Final block.** After the banner + continuation, only recognised chrome may
-  follow (the DOG-17 Codex chrome set: composer `›` bare/placeholder, `N%
-  context left`, `Context N% used · …`, `─ Worked for … ─`, `? for shortcuts`).
-  Arbitrary following prose ⇒ not a live banner. This admits the real wrapped
-  "purchase more credits." fixture and rejects a stale error followed by new
-  output.
+**Arbitration.** A parsed Codex `limit` competes with an `outage` by the existing
+last-contributing-line index — its index is the block's **last** line — same as
+today; `limit-open` uses the `■` line's index. With multiple limit lines the
+last wins. `matchedLine` = the `■` line; `patternId` = `'limit'` or
+`'limit-open'`.
+
+**Stalled-banner safety and continuation grammar (mirror DOG-17, findings R2
+#3, #9).** A bare "window contains a line" test is unsafe: a *historical*
+limit-open error followed by resumed work or a `Reconnecting…` row would wrongly
+trigger. The candidate block and its final-block check reuse DOG-17 exactly:
+
+- **Full retry veto set** (not only three examples): the complete existing veto
+  list applies at/after the `■` line — `esc to interrupt`, every `Reconnecting…`
+  form, etc. ⇒ not a stalled banner.
+- **Bounded continuation, named forms.** The banner block is the `■` line plus
+  the source-verified Codex usage-limit continuation, matched as **named forms up
+  to ≤ 3 wrapped lines**, not arbitrary following sentences:
+  - `You've hit your usage limit.` [+ `Upgrade to Pro (<url>), visit <url> to
+    purchase more credits`] [+ `or try again at <time>.`] — the live wrap spans
+    "…to" / "purchase more credits or try again at <time>.";
+  - `You've hit your usage limit. Try again at <time>.`;
+  - the single `exceeded retry limit, last status: <status>` line.
+  The block ends at the terminal sentence of the matched form. An *internal*
+  period (after "usage limit.") is distinguished from the banner's end, so the
+  required wrapped "purchase more credits." fixture is accepted while near-miss
+  trailing prose is rejected.
+- **Final block.** After the matched block, only DOG-17 Codex chrome may follow
+  (composer `›` bare/placeholder, `N% context left`, `Context N% used · …`,
+  `─ Worked for … ─`, `? for shortcuts`). Arbitrary prose ⇒ not live ⇒ the
+  candidate is rejected (and, per above, does not fall back to legacy limit
+  detection).
+
+The implementer writes tolerant regexes for these named forms and tests them
+against the real captured fixtures plus near-miss continuation / stale-prose
+negatives.
 
 `inferPlatform` is unchanged: a `limit-open` banner only arises on a
 Codex-identified terminal, so `platform` is always `codex` for it.
@@ -175,24 +197,35 @@ A new exported, injectable helper:
 hasConnectivity(fetchImpl = globalThis.fetch, url = CONNECTIVITY_URL): Promise<boolean>
 ```
 
-- **HTTPS, fail-closed**, mirroring `fetchIndicator`'s discipline: `fetch(url, {
-  redirect: 'error', signal: AbortSignal.timeout(3000) })`; return `true` only
-  on a genuine `r.ok` response; **any** thrown error, timeout, non-ok status, or
-  redirect ⇒ `false`. `redirect: 'error'` and the ok check make a captive
-  portal (which intercepts with a redirect, or fails TLS on HTTPS interception)
-  read as **offline**, which is the safe answer — a portal that can answer but
-  blocks the API must not count as connectivity.
+- **HTTPS default, fail-closed**, mirroring `fetchIndicator`'s discipline:
+  `fetch(url, { redirect: 'error', signal: AbortSignal.timeout(3000) })`; return
+  `true` only on a genuine `r.ok` response; **any** thrown error, timeout,
+  non-ok status, or redirect ⇒ `false`. `redirect: 'error'` and the ok check
+  make a captive portal that intercepts with a redirect, or fails TLS on HTTPS
+  interception, read as **offline** (the safe answer).
 - `CONNECTIVITY_URL` default `https://captive.apple.com/hotspot-detect.html`
-  (HTTPS; the macOS captive-check host, adding no new privacy surface).
-  Overridable via `WATCHDOG_CONNECTIVITY_URL`, validated like the status
-  override in `statusUrlFor` (must be `http:`/`https:`; a malformed override is
-  ignored with a warning and the default used). Injectable in tests.
-- **Safety claim, narrowed:** a `true` result means "an HTTPS request just
-  succeeded", not "the API will succeed." It is a necessary, not sufficient,
-  condition — enough to avoid the dead-network case without over-promising.
+  (the macOS captive-check host, no new privacy surface). **Override contract
+  (finding R2 #9), stated once and consistently:** overridable via
+  `WATCHDOG_CONNECTIVITY_URL` but — exactly like `statusUrlFor` — the override is
+  accepted **only for a loopback host** (`http:`/`https:`; this is how the
+  `e2e/status-stub` test drives it); any non-loopback or malformed override is
+  ignored with a warning and the default used. So `true` means "the configured
+  probe URL returned ok" (HTTPS for the real default; loopback HTTP only under a
+  test override).
+- **Safety claim, narrowed (finding R2 #9, #12):** `true` means a probe request
+  just succeeded, not that the API will succeed — a portal that *allows the probe
+  host* while restricting other traffic can still read online. It is a
+  necessary, not sufficient, condition: enough to avoid the dead-network case
+  without over-promising. Redirect/TLS failures hold sends; probe reachability
+  never establishes API reachability.
 
 **Placement in `tick`.** After `reconcile` yields `sendCandidates`, if there is
-**any** candidate, probe connectivity **once per tick** and cache the boolean:
+**any** candidate, probe connectivity **once per tick** and cache the boolean.
+**Dry-run bypass (finding R2 #7):** under `--dry-run` the tick performs **no
+network I/O at all** — neither the connectivity probe nor the outage
+`fetchIndicator` runs (the existing dry-run test forbids network calls); it logs
+the candidates it *would* gate and sends nothing. The gate below applies only on
+a real run:
 
 - Offline ⇒ **skip every send this tick** (limit, limit-open, **and** outage —
   the Revision-1 "skip the probe for outage-only ticks" optimisation is dropped
@@ -225,8 +258,16 @@ Additions:
   is normalised to `null` before validation (do not reject `undefined`); every
   `newEvent` branch initialises it (`null` for `limit`/`outage`).
 - New field `episodeId: string` on `limit-open` events — an immutable per-episode
-  nonce set at creation, binding the alert dialog to exactly this episode
-  (§5). Absent on `limit`/`outage`.
+  nonce binding the alert dialog to exactly this episode (§5). **Source (finding
+  R2 #5):** `randomUUID()` from `node:crypto` (dependency-free, available below
+  the Node 20 floor), generated once per new episode via an **injectable
+  generator** (`deps.newEpisodeId`) so reconcile tests are deterministic. A
+  timestamp or per-process counter is unacceptable — episode uniqueness is now
+  the consent-isolation boundary, and two same-handle episodes created at the
+  same injected `now` must still differ. The ID is filename-safe (UUID) and is
+  the only variable component of the choice-file name; the `handle` path
+  component is validated/encoded before use in a path. Absent on
+  `limit`/`outage`.
 
 `SCHEDULE['limit-open']` (retry cadence after consent — "every 30 min, capped"):
 
@@ -330,36 +371,52 @@ much later), writes the choice, and exits on its own.
 
 - **No shell, no code-interpolation.** The message is passed as **data**, never
   concatenated into an interpreter string (fixes the AppleScript-injection
-  blocker). The daemon spawns a detached copy of itself in a new internal
-  `--alert` mode:
+  blocker; the env→argv transport is what makes it safe, so it is kept). The
+  daemon spawns a detached copy of itself in a new internal `--alert` mode:
 
   ```
-  spawn(process.execPath, [__filename, '--alert'], {
+  import { fileURLToPath } from 'node:url';
+  const SELF = fileURLToPath(import.meta.url);   // __filename does NOT exist in ESM (R2 #4)
+  spawn(process.execPath, [SELF, '--alert'], {
     detached: true, stdio: 'ignore',
     env: { ...process.env,
-           WATCHDOG_ALERT_MESSAGE: sanitize(bannerText),   // data, via env
-           WATCHDOG_ALERT_HANDLE: handle,
+           WATCHDOG_ALERT_MESSAGE: <handle + ' — ' + sanitize(bannerText)>, // handle shown (R2 #6)
            WATCHDOG_ALERT_EPISODE: episodeId,
            WATCHDOG_ALERT_CHOICE_FILE: <per-episode final path> },
   }).unref()
   ```
 
-  Injectable as `deps.spawn`; tests never spawn.
-- **`--alert` mode** (same `watchdog.mjs`, so the single-file convention holds):
-  reads the env vars and runs `osascript` via `execFile('osascript', ['-e', 'on
-  run argv', '-e', 'return button returned of (display alert "orca-limit-
-  watchdog" message (item 1 of argv) buttons {"Stop","Wait 1h","Continue"}
-  default button "Continue")', '-e', 'end run', '--', message])`. The message is
-  `item 1 of argv` — **AppleScript data, not source** — so quotes, backslashes,
-  `$()`, backticks, newlines in the banner are inert. On a button return, write
-  `{ choice, episodeId, at }` to a **per-episode unique temp** then atomically
-  rename to the per-episode final path `choices/<handle>.<episodeId>.json`
-  (fixes the shared-`.tmp` race — each episode's temp and final names are
-  unique, so concurrent dialogs never cross). **On any osascript error,
-  non-zero exit, or empty result, write nothing** (the event stays
-  `awaiting-user`; no empty-choice file). Handle the child's async `error` event
-  as well as a throw. `--alert` never reads or writes state.json and never
-  sends.
+  The displayed message leads with the terminal `handle` (and, if cheaply
+  available, its title) **outside** the banner truncation, so two terminals with
+  identical banner text produce **distinguishable** dialogs (R2 #6). Injectable
+  as `deps.spawn`; tests never spawn.
+- **`--alert` mode — exclusive, early dispatch (finding R2 #4).** The entry
+  guard must detect `--alert` and route to the alert handler **before** any
+  normal `main()` / lock / state-file / disabled-file / tick-deadline
+  processing, and `return` — so `--alert` can never fall through to a tick,
+  inherit the 4-minute deadline, or send. (`main()` today ignores unknown flags
+  and reaches a tick, so an explicit early branch is required, not flag
+  tolerance.) A malformed/mixed alert invocation, or missing/invalid env data,
+  logs and exits **without** running a tick. The handler:
+  - runs `osascript` at its **absolute system path** via `execFile('/usr/bin/osascript',
+    ['-e', 'on run argv', '-e', 'return button returned of (display alert
+    "orca-limit-watchdog" message (item 1 of argv) buttons
+    {"Stop","Wait 1h","Continue"} default button "Continue")', '-e', 'end run',
+    '--', message])`. The message is `item 1 of argv` — **AppleScript data, not
+    source** — so quotes, backslashes, `$()`, backticks, newlines, a leading
+    dash, and Unicode are inert;
+  - **validates and trims** the returned button against the exact three-value
+    allow-list (`Stop` / `Wait 1h` / `Continue`); anything else ⇒ write nothing;
+  - **creates the `choices/` directory** if absent, writes `{ choice, episodeId,
+    at }` to a **per-episode unique temp**, then atomically renames to the
+    per-episode final path `choices/<handle>.<episodeId>.json` (unique temp and
+    final names ⇒ concurrent dialogs never cross);
+  - **awaits its own execFile/write** before exiting (it must not race the
+    parent's exit or enter any tick timeout);
+  - **on any osascript error, non-zero exit, or empty/invalid result, writes
+    nothing** (the event stays `awaiting-user`; no empty-choice file). Handles
+    the child's async `error` event as well as a throw.
+  `--alert` never reads or writes `state.json` and never sends.
 - **Consuming (`tick`, injectable `deps.readChoice`/`deps.clearChoice`):** for a
   handle's `awaiting-user` event, read `choices/<handle>.<episodeId>.json`;
   honour it only if its `episodeId` equals the event's; persist the transition;
@@ -436,6 +493,10 @@ All `node --test`, pure/injectable, never against live terminals (Safety).
 - `tick` online: the same candidates send (outage still subject to
   `suppressedByStatus`).
 - Captive-portal simulation: a redirecting/non-ok probe reads offline.
+- **Dry-run makes no network call (finding R2 #7):** due `limit`, `limit-open`,
+  `outage`, and mixed-candidate ticks under `--dry-run` with a `fetchImpl` that
+  **throws if called** — neither the connectivity probe nor `fetchIndicator`
+  runs; candidates are logged, nothing sends.
 
 **Reset-less detection (§1):** against the **real captured** strings —
 
@@ -454,16 +515,26 @@ All `node --test`, pure/injectable, never against live terminals (Safety).
   ⇒ `null`.
 - Cross-class chronology and footer/unrelated-clock inputs behave per the
   filtered-evidence rule.
-- **Amend the existing fallback test** (`watchdog.test.mjs:~391`): document that
-  non-Codex unparseable resets are unchanged (still `limit` + fallback), and add
-  the Codex-`■` override cases.
+- **Intentional existing-test changes (finding R2 #8):** the assertion at
+  `watchdog.test.mjs:~126` that the anchored Codex `■ …429` line returns `null`
+  **must flip to `limit-open`** (this is the feature). The unanchored fallback
+  test at `~391-394` **retains** its current expectation (non-Codex unparseable
+  reset ⇒ `limit` + fallback, unchanged). Keep an **ANSI-wrapped valid banner**
+  positive case distinct from the "ANSI-only ⇒ null" negative.
 
 **Alert lifecycle (§4/§5):** fake `deps.spawn`, `deps.readChoice`,
 `deps.clearChoice`, `deps.now` —
 
-- First tick: persists `alertedAt` before spawning (assert order), spawn args
-  carry the three buttons and the message via env (not concatenated), sends
-  nothing.
+- First tick: persists `alertedAt` before spawning (assert order); **parent
+  spawn** assertion checks argv `[SELF, '--alert']` + the env (message with
+  handle, episodeId, choice-file) — the three buttons belong to the **helper's
+  `execFile('/usr/bin/osascript', …)`**, asserted separately in an `--alert`-mode
+  test, not on the parent spawn (finding R2 #8). Sends nothing.
+- `--alert` mode (invoked directly with env set, `deps.execFile` faked): builds
+  the osascript argv with the three buttons and the message as `item 1 of argv`;
+  validates the returned button against the allow-list; writes the per-episode
+  choice file; is inert on osascript error/empty/invalid; never touches state or
+  sends; a bad/mixed invocation exits without a tick.
 - Second tick, no choice: no re-spawn, no send.
 - Continue ⇒ `waiting`, `resetAt = now`, `detectedAt = now`; then (online) sends
   on the `limit-open` schedule; capped at 6.
@@ -535,3 +606,39 @@ findings; all accepted, none dismissed.
 13. **(minor) tick ordering / survival evidence** — §4: consent sends next tick,
     no double-reconcile, freezes preserved; §Testing: isolated helper-survival
     test, launchd rendering deferred to a post-merge manual gate.
+
+## Round-2 review resolutions (Revision 3)
+
+Codex round 2 (`.superpowers/reviews/dog-19-20-spec-round-2.md`) confirmed 10 of
+13 round-1 findings resolved and raised the following; all accepted and
+addressed in Revision 3.
+
+- **R2 #1 / #8 (429 classification contradiction)** — §1: both Codex `■` limit
+  shapes (429 line and reached-limit line) go through the **same** reset/no-reset
+  split; 429+reset ⇒ `limit`, bare 429 ⇒ `limit-open`. Test-list corrected.
+- **R2 #2 (detector→event contract)** — §1: `detectBanner(lines, platform, now)`,
+  parse once over the *selected contiguous block*, carry `resetAt` into
+  `newEvent` (no second parse of capped `bannerText`); arbitration and legacy
+  construction specified.
+- **R2 #3 (continuation grammar)** — §1: named, bounded (≤3-line) Codex banner
+  forms; internal-period vs banner-end distinction; full veto set; final-block
+  chrome; rejected candidate does not fall back to legacy detection.
+- **R2 #4 (ESM self-reinvoke)** — §5: `fileURLToPath(import.meta.url)` (not
+  `__filename`); exclusive early `--alert` dispatch before main/lock/state/tick;
+  absolute `/usr/bin/osascript`; button allow-list; awaits its own work.
+- **R2 #5 (nonce source)** — §3: `randomUUID()` from `node:crypto`, injectable
+  generator, filename-safe, handle path component validated.
+- **R2 #6 (dialog identifies terminal)** — §5: displayed message leads with the
+  handle (outside truncation) so identical banners on different handles render
+  distinguishably.
+- **R2 #7 (probe in dry-run)** — §2/§Testing: dry-run does **no** network I/O
+  (no probe, no `fetchIndicator`); tests use a throwing `fetchImpl`.
+- **R2 #9 (override/portal contract)** — §2: override accepted only for a
+  loopback host (like `statusUrlFor`); `true` = "probe returned ok", never API
+  reachability; portal-allows-probe caveat stated.
+
+Remaining review policy note: this is Revision 3 after the two-round default.
+The residual items were spec-precision, not design flaws; the detection
+mechanics (evidence selection, continuation regexes) are pinned in the DOG-20
+implementation plan and verified by TDD against the real captured fixtures under
+the Opus code-review loop.
