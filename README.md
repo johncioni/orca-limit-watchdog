@@ -18,8 +18,9 @@ It resumes on two conditions:
   (`status.claude.com` / `status.openai.com`), and resumes once the incident
   clears.
 
-It is plain Node with no dependencies, no GUI, and no network access beyond the
-two status pages (contacted only when an outage resume is actually due).
+It is plain Node with no dependencies, no GUI, and no network access beyond a
+lightweight connectivity probe (before any resume) and the two status pages
+(contacted only when an outage resume is actually due).
 
 ## Requirements
 
@@ -150,10 +151,19 @@ lines:
   apart, with a hard stop 24 hours after detection. Codex terminals are held
   additionally while `Reconnecting... N/5` or `esc to interrupt` is on screen.
 
+Before sending **any** resume (limit or outage), the watchdog confirms the
+machine is actually online with a single HTTPS reachability probe to
+`https://captive.apple.com/hotspot-detect.html`. While offline it holds the send
+without spending an attempt and retries on a later tick once connectivity
+returns, so a resume prompt is never fired into the void during a local network
+drop. The probe host is overridable via `WATCHDOG_CONNECTIVITY_URL` (loopback
+hosts only, for testing); anything else is ignored with a warning.
+
 Both kinds **refuse to send when the terminal's last line is a shell prompt**
 (the agent has exited). Outage detection is scoped to terminals Orca identifies
 as Claude Code or Codex; rate-limit detection is generic. Network access is
-limited to the two status pages and happens only when an outage send is due.
+limited to the connectivity probe (once per tick that has a send due) and the two
+status pages (only when an outage send is due).
 
 ## Contributing & security
 

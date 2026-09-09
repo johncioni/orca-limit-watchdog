@@ -527,6 +527,7 @@ export async function tick({ dryRun }, depsIn = {}) {
   }
 
   const indicators = new Map();   // platform → indicator, fetched at most once per tick
+  let online = null;              // connectivity, probed lazily once per real (non-dry-run) tick
   for (const key of sendCandidates) {
     const ev = events[key];
     const sch = SCHEDULE[ev.kind];
@@ -535,6 +536,12 @@ export async function tick({ dryRun }, depsIn = {}) {
       console.log(`would resume ${ev.handle} (${ev.kind}/${ev.platform}, attempt ${ev.attempts + 1})`);
       continue;
     }
+    if (online === null) {   // 0. connectivity gate: never resume while offline; probe once per real tick
+      const { url, warn } = connectivityUrl(deps.env);
+      if (warn) log('warn', warn);
+      online = await hasConnectivity(deps.fetchImpl, url);
+    }
+    if (!online) { log('debug', `held ${ev.handle}: offline`); continue; }
     if (ev.kind === 'outage') {   // 1. status gate (validateEvent guarantees a known platform)
       if (!indicators.has(ev.platform)) {
         const { url, warn } = statusUrlFor(ev.platform, deps.env);
