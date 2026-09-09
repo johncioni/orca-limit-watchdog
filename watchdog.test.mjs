@@ -725,6 +725,63 @@ test('limit lifecycle still uses the 2-min buffer and 3-send cap', () => {
 
 // --- prompt guard ---
 
+const openObs = (banner = { kind: 'limit-open', bannerText: 'x', resetAt: null }, platform = 'codex') =>
+  [{ handle: H, banner, platform }];
+const roundTrip = (events) => assert.deepEqual(parseStateFile(JSON.stringify({ version: 2, events })), events);
+
+test('reconcile: dismissed survives kind/platform mutation (DOG-20)', () => {
+  const ev = LO({ status: 'dismissed', alertedAt: NOW.toISOString() });
+  for (const [banner, platform] of [[{ kind: 'limit', bannerText: 'try again at 5pm', resetAt: at(60).toISOString() }, 'codex'],
+    [OUTAGE_BANNER, 'claude']]) {
+    const r = reconcile({ [H]: ev }, openObs(banner, platform), at(1));
+    assert.equal(r.events[H].status, 'dismissed'); assert.equal(r.events[H].kind, 'limit-open');
+    assert.deepEqual(r.sendCandidates, []); roundTrip(r.events);
+  }
+});
+test('reconcile: pre-consent statuses never age into gave_up (DOG-20)', () => {
+  for (const status of ['awaiting-user', 'dismissed']) {
+    const r = reconcile({ [H]: LO({ status }) }, openObs(), at(25 * 60));
+    assert.equal(r.events[H].status, status); assert.deepEqual(r.sendCandidates, []); roundTrip(r.events);
+  }
+});
+test('reconcile: Stop clears only after two misses; new episode gets new id (DOG-20)', () => {
+  const first = reconcile({ [H]: LO({ status: 'dismissed' }) }, openObs(null), at(1), [H]);
+  assert.equal(first.events[H].status, 'dismissed'); assert.ok(first.events[H].clearedAt);
+  const gone = reconcile(first.events, openObs(null), at(2), [H]);
+  assert.deepEqual(gone.events, {});
+  const fresh = reconcile(gone.events, openObs(), at(2), [H], () => 'ep-fresh');
+  assert.equal(fresh.events[H].episodeId, 'ep-fresh'); roundTrip(fresh.events);
+});
+test('reconcile: unanswered mutation replaces and invalidates episode (DOG-20)', () => {
+  const r = reconcile({ [H]: LO() }, openObs({ kind: 'limit', bannerText: 'x', resetAt: at(60).toISOString() }), at(1));
+  assert.equal(r.events[H].kind, 'limit'); assert.equal(r.events[H].episodeId, undefined);
+  assert.deepEqual(r.sendCandidates, []); roundTrip(r.events);
+});
+test('reconcile: consent schedule caps six sends, deadline counts from consent (DOG-20)', () => {
+  let events = { [H]: LO({ status: 'waiting', resetAt: at(60).toISOString() }) };
+  assert.deepEqual(reconcile(events, openObs(), at(59)).sendCandidates, []);
+  for (let n = 0; n < 6; n++) {
+    const t = 60 + n * 30;
+    const r = reconcile(events, openObs(), at(t));
+    assert.deepEqual(r.sendCandidates, [H]);
+    events = r.events;
+    Object.assign(events[H], { attempts: n + 1, lastAttemptAt: at(t).toISOString(), status: 'resumed' });
+    roundTrip(events);
+    assert.deepEqual(reconcile(events, openObs(), at(t + 29)).sendCandidates, []);
+  }
+  const capped = reconcile(events, openObs(), at(240));
+  assert.equal(capped.events[H].status, 'gave_up'); roundTrip(capped.events);
+  for (const kind of ['outage', 'limit-open']) {
+    const ev = LO({ kind, status: 'waiting', ...(kind === 'outage' ? { platform: 'claude', episodeId: undefined } : {}) });
+    delete ev.episodeId;
+    if (kind === 'limit-open') ev.episodeId = 'ep-1';
+    const observation = openObs({ kind, bannerText: 'x' }, ev.platform);
+    assert.equal(reconcile({ [H]: ev }, observation, at(1439)).events[H].status, 'waiting');
+    const expired = reconcile({ [H]: ev }, observation, at(1440));
+    assert.equal(expired.events[H].status, 'gave_up'); roundTrip(expired.events);
+  }
+});
+
 test('isShellPrompt recognises shell prompt endings and fails closed on a bare ">"', () => {
   for (const p of ['john@mac ~ $', '~ %', 'root#', '❯', 'repo ➜', 'λ', '❱', 'foo>', 'cmd>  ']) {
     assert.equal(isShellPrompt(['API Error: 529', p, '', '  '], 'claude'), true, p);

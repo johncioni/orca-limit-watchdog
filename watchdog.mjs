@@ -340,10 +340,11 @@ export function reconcile(state, observations, now, liveHandles = null, newEpiso
       ev.clearedAt = now.toISOString(); continue;                            //    3b. first miss: hold
     }
     delete ev.clearedAt;                                                     //    banner present again
-    if (o.banner.kind !== ev.kind || (o.platform !== 'unknown' && o.platform !== ev.platform)) {
+    if (ev.status !== 'dismissed' && (o.banner.kind !== ev.kind || (o.platform !== 'unknown' && o.platform !== ev.platform))) {
       events[key] = newEvent(o, now, newEpisodeId); continue;                 // 4. replace (never a candidate this tick)
     }
     const sch = SCHEDULE[ev.kind];                                           // 5. same kind & platform
+    if (ev.status === 'awaiting-user' || ev.status === 'dismissed') continue;
     if (ev.status !== 'gave_up' && sch.deadlineMs !== null && now - new Date(ev.detectedAt) >= sch.deadlineMs) {
       ev.status = 'gave_up'; continue;                                       // 5a
     }
