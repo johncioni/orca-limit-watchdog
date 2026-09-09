@@ -520,7 +520,7 @@ async function readTail(handle, orcaFn = orca) {
 }
 
 const DEFAULT_DEPS = () => ({ orca, fetchImpl: globalThis.fetch, env: process.env, now: () => new Date(), loadState, saveState, log,
-  newEpisodeId: randomUUID });
+  newEpisodeId: randomUUID, spawn: () => {}, readChoice: async () => null, clearChoice: async () => {} });
 
 export async function tick({ dryRun }, depsIn = {}) {
   const deps = { ...DEFAULT_DEPS(), ...depsIn };
@@ -570,6 +570,38 @@ export async function tick({ dryRun }, depsIn = {}) {
     const o = observations.find((x) => x.handle === ev.handle);
     log('info', `detected ${ev.kind} on ${ev.handle} (${ev.platform}, ${o?.banner?.patternId ?? 'limit'}: ${sanitize(o?.banner?.matchedLine ?? ev.bannerText)}), resetAt ${ev.resetAt}`);
     if (ev.kind === 'outage' && shouldLog('debug')) log('debug', `outage window on ${ev.handle}: ${sanitize(o?.window ?? '', 600)}`);
+  }
+
+  // Reconcile has already selected sends. Consent becomes eligible next tick,
+  // preserving unread/first-miss freezes and never bypassing the send guards.
+  for (const ev of Object.values(events)) {
+    if (ev.kind !== 'limit-open' || ev.status !== 'awaiting-user') continue;
+    if (!observations.some((o) => o.handle === ev.handle && o.banner) || ev.clearedAt) continue;
+    if (dryRun) { log('info', `[dry-run] would await alert choice for ${ev.handle}`); continue; }
+    try {
+      if (ev.alertedAt === null) {
+        ev.alertedAt = now.toISOString();
+        deps.saveState(events); // claim before spawn: a crash cannot duplicate the dialog
+        const child = deps.spawn(ev);
+        child?.on('error', (e) => log('warn', `alert spawn failed for ${ev.handle}: ${sanitize(e.message)}`));
+        continue;
+      }
+      const result = await deps.readChoice(ev.handle, ev.episodeId);
+      if (result === null) continue;
+      if (result?.episodeId === ev.episodeId && isIso(result.at)
+        && ['Continue', 'Wait 1h', 'Stop'].includes(result.choice)) {
+        if (result.choice === 'Stop') ev.status = 'dismissed';
+        else {
+          ev.status = 'waiting';
+          ev.detectedAt = now.toISOString();
+          ev.resetAt = new Date(now.getTime() + (result.choice === 'Wait 1h' ? 60 * MIN : 0)).toISOString();
+        }
+        deps.saveState(events); // durable choice before deleting the child's result
+      } else log('warn', `ignored invalid or stale alert choice for ${ev.handle}`);
+      await deps.clearChoice(ev.handle, ev.episodeId);
+    } catch (e) {
+      log('warn', `alert failed for ${ev.handle}: ${sanitize(e.message)}`);
+    }
   }
 
   const indicators = new Map();   // platform → indicator, fetched at most once per tick

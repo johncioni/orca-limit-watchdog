@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
 import { isShellPrompt, isInputOccupied } from './watchdog.mjs';
@@ -888,6 +889,100 @@ function harness({ tail, terminals, indicator = 'none', state = {}, now = at(10)
 }
 const T = { handle: H, connected: true, writable: true, agentIdentity: 'claude' };
 const OUTAGE_TAIL = [CLAUDE_529, '', '> ', '? for shortcuts'];
+
+function alertHarness({ ev = LO(), choice = null, ...options } = {}) {
+  const h = harness({ tail: OPEN_TAIL, terminals: [{ ...T, agentIdentity: 'codex' }], state: { [H]: ev }, now: NOW, ...options });
+  const actions = [];
+  const save = h.deps.saveState;
+  Object.assign(h.deps, {
+    saveState: (events) => { actions.push('save'); save(events); },
+    spawn: (event) => { actions.push('spawn'); assert.equal(h.saved()[event.handle].alertedAt, NOW.toISOString()); },
+    readChoice: async (handle, episodeId) => { actions.push('read'); assert.equal(handle, H); assert.equal(episodeId, ev.episodeId); return choice; },
+    clearChoice: async () => { actions.push('clear'); },
+    newEpisodeId: () => 'ep-new',
+  });
+  return { ...h, actions };
+}
+const choiceOf = (choice, episodeId = 'ep-1') => ({ choice, episodeId, at: NOW.toISOString() });
+
+test('tick: awaiting-user claims before one spawn and never sends (DOG-20)', async () => {
+  const h = alertHarness({ state: {} });
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.actions, ['save', 'spawn', 'save']); assert.deepEqual(h.sent, []);
+  assert.equal(h.saved()[H].episodeId, 'ep-new'); roundTrip(h.saved());
+  const next = alertHarness({ ev: h.saved()[H] });
+  await tick({ dryRun: false }, next.deps);
+  assert.deepEqual(next.actions, ['read', 'save']); assert.deepEqual(next.sent, []);
+});
+for (const choice of ['Continue', 'Wait 1h', 'Stop']) {
+  test(`tick: pending ${choice} persists transition before clearing, no same-tick send (DOG-20)`, async () => {
+    const h = alertHarness({ ev: LO({ alertedAt: at(-100).toISOString(), detectedAt: at(-100).toISOString() }), choice: choiceOf(choice) });
+    h.deps.clearChoice = async () => {
+      h.actions.push('clear');
+      assert.equal(h.saved()[H].status, choice === 'Stop' ? 'dismissed' : 'waiting');
+    };
+    await tick({ dryRun: false }, h.deps);
+    const ev = h.saved()[H];
+    assert.deepEqual(h.actions, ['read', 'save', 'clear', 'save']); assert.deepEqual(h.sent, []);
+    assert.equal(ev.resetAt, at(choice === 'Wait 1h' ? 60 : 0).toISOString());
+    assert.equal(ev.detectedAt, at(choice === 'Stop' ? -100 : 0).toISOString()); roundTrip(h.saved());
+    const next = alertHarness({ ev, now: at(5) });
+    await tick({ dryRun: false }, next.deps);
+    assert.deepEqual(next.sent, choice === 'Continue' ? [RESUME_TEXT] : []);
+    assert.equal(next.fetchImpl.calls.length, choice === 'Continue' ? 1 : 0);
+  });
+}
+test('tick: stale choice ignored and cleared; invalid timestamp/button cannot consent (DOG-20)', async () => {
+  for (const choice of [choiceOf('Continue', 'ep-stale'), { ...choiceOf('Continue'), at: 'bad' }, choiceOf('Unknown')]) {
+    const h = alertHarness({ ev: LO({ alertedAt: NOW.toISOString() }), choice });
+    await tick({ dryRun: false }, h.deps);
+    assert.equal(h.saved()[H].status, 'awaiting-user'); assert.deepEqual(h.sent, []);
+    assert.ok(h.actions.includes('clear'));
+  }
+});
+test('tick: dry-run never spawns, persists, reads or clears choices (DOG-20)', async () => {
+  for (const choice of [null, ...['Continue', 'Wait 1h', 'Stop'].map((c) => choiceOf(c))]) {
+    const h = alertHarness({ ev: LO({ alertedAt: choice ? NOW.toISOString() : null }), choice });
+    const effects = [];
+    for (const dep of ['spawn', 'saveState', 'readChoice', 'clearChoice', 'fetchImpl']) h.deps[dep] = () => { effects.push(dep); throw new Error(dep); };
+    await tick({ dryRun: true }, h.deps);
+    assert.deepEqual(effects, []); assert.deepEqual(h.sent, []); assert.equal(h.saved(), null);
+  }
+});
+test('tick: spawn throws or emits error, claim persists and warning is logged (DOG-20)', async () => {
+  for (const asyncError of [false, true]) {
+    const h = alertHarness(); const warnings = []; const child = new EventEmitter();
+    h.deps.log = (level, message) => { if (level === 'warn') warnings.push(message); };
+    h.deps.spawn = () => { if (!asyncError) throw new Error('spawn failed'); return child; };
+    await tick({ dryRun: false }, h.deps);
+    if (asyncError) child.emit('error', new Error('spawn failed'));
+    assert.equal(h.saved()[H].alertedAt, NOW.toISOString()); assert.equal(h.saved()[H].status, 'awaiting-user');
+    assert.deepEqual(h.sent, []); assert.ok(warnings.some((m) => /spawn failed/.test(m)));
+  }
+});
+test('tick: choices stay bound to two terminals and read/unlink failures are bounded (DOG-20)', async () => {
+  for (const failure of [null, 'read', 'clear']) {
+    const ev = LO({ alertedAt: NOW.toISOString() });
+    const h = alertHarness({ state: { [H]: ev, term_other: { ...ev, handle: 'term_other', episodeId: 'ep-other' } },
+      terminals: [{ ...T, agentIdentity: 'codex' }, { ...T, handle: 'term_other', agentIdentity: 'codex' }] });
+    const cleared = [];
+    h.deps.readChoice = async (handle, episodeId) => {
+      if (handle === H && failure === 'read') throw new Error('read failed');
+      return choiceOf(handle === H ? 'Stop' : 'Continue', episodeId);
+    };
+    h.deps.clearChoice = async (handle) => { if (handle === H && failure === 'clear') throw new Error('unlink failed'); cleared.push(handle); };
+    await tick({ dryRun: false }, h.deps);
+    assert.equal(h.saved()[H].status, failure === 'read' ? 'awaiting-user' : 'dismissed');
+    assert.equal(h.saved().term_other.status, 'waiting'); assert.ok(cleared.includes('term_other')); assert.deepEqual(h.sent, []);
+  }
+});
+test('tick: alert pass preserves unread and first-miss freezes (DOG-20)', async () => {
+  for (const options of [{ readThrows: true }, { tail: ['›'] }]) {
+    const h = alertHarness({ ...options, choice: choiceOf('Continue') });
+    await tick({ dryRun: false }, h.deps);
+    assert.deepEqual(h.actions, ['save']); assert.equal(h.saved()[H].alertedAt, null);
+  }
+});
 
 test('tick: due outage event, status none ⇒ one outage resume, attempt persisted before send', async () => {
   const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });
