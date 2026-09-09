@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import * as watchdog from './watchdog.mjs';
+import { fileURLToPath } from 'node:url';
 import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
 import { isShellPrompt, isInputOccupied } from './watchdog.mjs';
@@ -982,6 +984,129 @@ test('tick: alert pass preserves unread and first-miss freezes (DOG-20)', async 
     await tick({ dryRun: false }, h.deps);
     assert.deepEqual(h.actions, ['save']); assert.equal(h.saved()[H].alertedAt, null);
   }
+});
+
+function alertFiles(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-alert-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return { dir, env: { WATCHDOG_ALERT_MESSAGE: 'term_x — hit limit', WATCHDOG_ALERT_EPISODE: 'ep9',
+    WATCHDOG_ALERT_CHOICE_FILE: path.join(dir, 'choices', 'term_x.ep9.json') } };
+}
+
+test('runAlert: allowed buttons write atomic episode-bound choice files, message is argv data (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.runAlert, 'function');
+  const { dir, env } = alertFiles(t);
+  const message = '- quotes " \\ $(touch nope) `echo nope`\nUnicode ■';
+  for (const button of ['Continue', 'Wait 1h', 'Stop']) {
+    await watchdog.runAlert({ ...env, WATCHDOG_ALERT_MESSAGE: message }, { execFileImpl: async (file, args) => {
+      assert.equal(file, '/usr/bin/osascript');
+      assert.deepEqual(args, ['-e', 'on run argv', '-e',
+        'return button returned of (display alert "orca-limit-watchdog" message (item 1 of argv) buttons {"Stop","Wait 1h","Continue"} default button "Continue")',
+        '-e', 'end run', '--', message]);
+      return { stdout: button + '\n' };
+    } });
+    const j = JSON.parse(fs.readFileSync(env.WATCHDOG_ALERT_CHOICE_FILE, 'utf8'));
+    assert.deepEqual(Object.keys(j).sort(), ['at', 'choice', 'episodeId']);
+    assert.equal(j.choice, button); assert.equal(j.episodeId, 'ep9'); assert.ok(Number.isFinite(Date.parse(j.at)));
+    assert.deepEqual(fs.readdirSync(path.join(dir, 'choices')), ['term_x.ep9.json']);
+  }
+  assert.deepEqual(fs.readdirSync(dir), ['choices']);
+});
+test('runAlert: osascript rejection, empty or invalid button writes nothing (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.runAlert, 'function');
+  const { dir, env } = alertFiles(t); const warnings = [];
+  for (const execFileImpl of [async () => { throw new Error('boom'); },
+    ...['', 'Delete everything\n', 'Continue\nStop'].map((stdout) => async () => ({ stdout }))]) {
+    await watchdog.runAlert(env, { execFileImpl, logImpl: (level, msg) => warnings.push([level, msg]) });
+    assert.equal(fs.existsSync(env.WATCHDOG_ALERT_CHOICE_FILE), false);
+  }
+  assert.deepEqual(fs.readdirSync(dir), []); assert.ok(warnings.length);
+});
+test('runAlert: missing/invalid env cannot launch osascript or write state paths (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.runAlert, 'function');
+  const { dir, env } = alertFiles(t); let calls = 0;
+  for (const bad of [{}, { ...env, WATCHDOG_ALERT_MESSAGE: '' }, { ...env, WATCHDOG_ALERT_EPISODE: '../escape' },
+    { ...env, WATCHDOG_ALERT_CHOICE_FILE: path.join(dir, 'state.json') },
+    { ...env, WATCHDOG_ALERT_CHOICE_FILE: path.join(dir, 'choices', 'term_x.other.json') }]) {
+    await watchdog.runAlert(bad, { execFileImpl: async () => { calls++; return { stdout: 'Continue' }; }, logImpl: () => {} });
+  }
+  assert.equal(calls, 0); assert.deepEqual(fs.readdirSync(dir), []);
+});
+test('runAlert: awaits completion and concurrent dialogs never cross choices (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.runAlert, 'function');
+  const { dir, env } = alertFiles(t); let finish;
+  const pending = new Promise((resolve) => { finish = resolve; });
+  const first = watchdog.runAlert(env, { execFileImpl: () => pending });
+  const other = { ...env, WATCHDOG_ALERT_EPISODE: 'ep10', WATCHDOG_ALERT_CHOICE_FILE: path.join(dir, 'choices', 'term_y.ep10.json') };
+  await watchdog.runAlert(other, { execFileImpl: async () => ({ stdout: 'Stop' }) });
+  assert.equal(fs.existsSync(env.WATCHDOG_ALERT_CHOICE_FILE), false);
+  finish({ stdout: 'Continue' }); await first;
+  assert.equal(JSON.parse(fs.readFileSync(env.WATCHDOG_ALERT_CHOICE_FILE)).choice, 'Continue');
+  assert.equal(JSON.parse(fs.readFileSync(other.WATCHDOG_ALERT_CHOICE_FILE)).choice, 'Stop');
+  assert.equal(fs.readdirSync(path.join(dir, 'choices')).length, 2);
+});
+test('spawnAlert: detached self argv and env keep terminal identity outside truncation (DOG-20)', (t) => {
+  assert.equal(typeof watchdog.spawnAlert, 'function');
+  const { dir } = alertFiles(t); const calls = []; let unrefs = 0;
+  const child = new EventEmitter(); child.unref = () => unrefs++;
+  const spawnImpl = (...args) => { calls.push(args); return child; };
+  for (const handle of ['term_one', 'term_two']) {
+    assert.equal(watchdog.spawnAlert(LO({ handle, bannerText: 'x '.repeat(500) }), { spawnImpl, stateDir: dir, env: {} }), child);
+  }
+  assert.equal(unrefs, 2);
+  for (const [i, [file, args, opts]] of calls.entries()) {
+    const handle = i ? 'term_two' : 'term_one';
+    assert.equal(file, process.execPath); assert.deepEqual(args, [fileURLToPath(new URL('./watchdog.mjs', import.meta.url)), '--alert']);
+    assert.equal(opts.detached, true); assert.equal(opts.stdio, 'ignore'); assert.equal(opts.shell, undefined);
+    assert.equal(opts.env.WATCHDOG_ALERT_MESSAGE, handle + ' — ' + 'x '.repeat(100) + '…');
+    assert.equal(opts.env.WATCHDOG_ALERT_EPISODE, 'ep-1');
+    assert.equal(opts.env.WATCHDOG_ALERT_CHOICE_FILE, path.join(dir, 'choices', `${handle}.ep-1.json`));
+  }
+  assert.throws(() => watchdog.spawnAlert(LO({ handle: '../unsafe' }), { spawnImpl, stateDir: dir }), /handle|path/);
+  assert.throws(() => watchdog.spawnAlert(LO({ episodeId: '../unsafe' }), { spawnImpl, stateDir: dir }), /episode|path/);
+  assert.equal(calls.length, 2); assert.deepEqual(fs.readdirSync(dir), []);
+});
+test('choice deps: real per-episode reads/deletes are bounded and isolated (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.readChoice, 'function'); assert.equal(typeof watchdog.clearChoice, 'function');
+  const { dir, env } = alertFiles(t); const warnings = []; const logger = (...args) => warnings.push(args);
+  assert.equal(await watchdog.readChoice('term_x', 'ep9', dir, logger), null);
+  await watchdog.runAlert(env, { execFileImpl: async () => ({ stdout: 'Continue' }) });
+  assert.equal((await watchdog.readChoice('term_x', 'ep9', dir, logger)).choice, 'Continue');
+  assert.equal(await watchdog.readChoice('term_x', 'ep10', dir, logger), null);
+  await watchdog.clearChoice('term_x', 'ep10', dir, logger);
+  assert.equal(fs.existsSync(env.WATCHDOG_ALERT_CHOICE_FILE), true);
+  fs.writeFileSync(env.WATCHDOG_ALERT_CHOICE_FILE, '{bad');
+  assert.equal(await watchdog.readChoice('term_x', 'ep9', dir, logger), null);
+  await watchdog.clearChoice('term_x', 'ep9', dir, logger);
+  assert.equal(fs.existsSync(env.WATCHDOG_ALERT_CHOICE_FILE), false);
+  fs.mkdirSync(env.WATCHDOG_ALERT_CHOICE_FILE);
+  await watchdog.clearChoice('term_x', 'ep9', dir, logger);
+  assert.ok(warnings.length >= 2);
+});
+test('--alert: missing env and mixed invocations exit without tick/lock/state/send (DOG-20)', async (t) => {
+  const { dir } = alertFiles(t);
+  const fakeOrca = path.join(dir, 'fake-orca'); const marker = path.join(dir, 'called');
+  fs.writeFileSync(fakeOrca, '#!/bin/sh\nprintf called > "$WD_MARKER"\nprintf \'{"ok":true,"result":{"terminals":[]}}\\n\'\n', { mode: 0o755 });
+  const env = { ...process.env, HOME: dir, ORCA_CLI: fakeOrca, WD_MARKER: marker };
+  for (const key of Object.keys(env)) if (key.startsWith('WATCHDOG_ALERT_')) delete env[key];
+  for (const args of [['--alert'], ['--alert', '--once'], ['--dry-run', '--alert'], ['--alert', '--alert']]) {
+    await pExecFile(process.execPath, [fileURLToPath(new URL('./watchdog.mjs', import.meta.url)), ...args], { env, timeout: 2000 });
+    assert.equal(fs.existsSync(marker), false);
+    assert.equal(fs.existsSync(path.join(dir, '.local')), false);
+  }
+});
+test('spawnAlert: harmless detached helper survives parent exit (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.spawnAlert, 'function');
+  const { dir } = alertFiles(t); const result = path.join(dir, 'survived');
+  const helper = `setTimeout(() => require('fs').writeFileSync(process.argv[1], 'survived'), 150)`;
+  const parent = `import { spawn } from 'node:child_process';
+    import { spawnAlert } from ${JSON.stringify(new URL('./watchdog.mjs', import.meta.url).href)};
+    spawnAlert({handle:'term_x',episodeId:'ep9',bannerText:'x'}, {stateDir:process.argv[1],
+      spawnImpl:(file,args,opts) => spawn(file,['-e',${JSON.stringify(helper)},process.argv[2]],opts)});`;
+  await pExecFile(process.execPath, ['--input-type=module', '-e', parent, dir, result], { timeout: 2000 });
+  const deadline = Date.now() + 2000;
+  while (!fs.existsSync(result) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+  assert.equal(fs.readFileSync(result, 'utf8'), 'survived');
 });
 
 test('tick: due outage event, status none ⇒ one outage resume, attempt persisted before send', async () => {

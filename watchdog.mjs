@@ -2,13 +2,13 @@
 // orca-limit-watchdog — detects rate-limited Orca agent terminals and sends a
 // resume prompt after the limit resets. Zero dependencies. See docs/superpowers/specs/.
 
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 
 export const RESUME_TEXT = 'Session rate limit has reset. Resume where you left off.';
 
@@ -445,6 +445,72 @@ export const suppressedByStatus = (indicator) => indicator === 'major' || indica
 
 const pExecFile = promisify(execFile);
 
+const CHOICES = ['Continue', 'Wait 1h', 'Stop'];
+const PATH_COMPONENT_RE = /^[A-Za-z0-9_-]+$/;
+function choicePath(handle, episodeId, stateDir = STATE_DIR) {
+  if (!PATH_COMPONENT_RE.test(handle) || !PATH_COMPONENT_RE.test(episodeId)
+    || typeof handle !== 'string' || typeof episodeId !== 'string') throw new Error('invalid handle/episode path component');
+  return path.join(stateDir, 'choices', `${handle}.${episodeId}.json`);
+}
+
+// The child outlives the tick. All untrusted display text travels as env/argv
+// data; no shell and no banner interpolation into AppleScript source.
+export function spawnAlert(ev, { spawnImpl = spawn, stateDir = STATE_DIR, env = process.env } = {}) {
+  const child = spawnImpl(process.execPath, [fileURLToPath(import.meta.url), '--alert'], {
+    detached: true, stdio: 'ignore', env: { ...env,
+      WATCHDOG_ALERT_MESSAGE: `${ev.handle} — ${sanitize(ev.bannerText)}`,
+      WATCHDOG_ALERT_EPISODE: ev.episodeId,
+      WATCHDOG_ALERT_CHOICE_FILE: choicePath(ev.handle, ev.episodeId, stateDir) },
+  });
+  child.unref();
+  return child; // tick attaches an async error listener before yielding
+}
+
+export async function readChoice(handle, episodeId, stateDir = STATE_DIR, logImpl = log) {
+  try { return JSON.parse(fs.readFileSync(choicePath(handle, episodeId, stateDir), 'utf8')); }
+  catch (e) {
+    if (e.code !== 'ENOENT') logImpl('warn', `choice read failed for ${handle}: ${sanitize(e.message)}`);
+    return null;
+  }
+}
+
+export async function clearChoice(handle, episodeId, stateDir = STATE_DIR, logImpl = log) {
+  try { fs.unlinkSync(choicePath(handle, episodeId, stateDir)); }
+  catch (e) { if (e.code !== 'ENOENT') logImpl('warn', `choice delete failed for ${handle}: ${sanitize(e.message)}`); }
+}
+
+// Separate from the daemon logger: --alert must not touch state/lock/log files.
+const alertLog = (level, msg) => console.error(`${level}: ${msg}`);
+export async function runAlert(env, { execFileImpl = pExecFile, logImpl = alertLog } = {}) {
+  let tmp;
+  try {
+    const message = env.WATCHDOG_ALERT_MESSAGE;
+    const episodeId = env.WATCHDOG_ALERT_EPISODE;
+    const file = env.WATCHDOG_ALERT_CHOICE_FILE;
+    if (typeof message !== 'string' || !message.trim() || message.includes('\0')
+      || typeof episodeId !== 'string' || !PATH_COMPONENT_RE.test(episodeId)
+      || typeof file !== 'string' || !path.isAbsolute(file) || path.normalize(file) !== file
+      || path.basename(path.dirname(file)) !== 'choices') throw new Error('invalid alert environment');
+    const suffix = `.${episodeId}.json`;
+    const name = path.basename(file);
+    if (!name.endsWith(suffix) || !PATH_COMPONENT_RE.test(name.slice(0, -suffix.length))) throw new Error('invalid alert choice path');
+    const { stdout } = await execFileImpl('/usr/bin/osascript', ['-e', 'on run argv', '-e',
+      'return button returned of (display alert "orca-limit-watchdog" message (item 1 of argv) buttons {"Stop","Wait 1h","Continue"} default button "Continue")',
+      '-e', 'end run', '--', message]);
+    const choice = stdout?.trim();
+    if (!CHOICES.includes(choice)) { logImpl('warn', 'alert returned no valid choice'); return; }
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    tmp = `${file}.${randomUUID()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ choice, episodeId, at: new Date().toISOString() }), { flag: 'wx' });
+    fs.renameSync(tmp, file);
+    tmp = undefined;
+  } catch (e) {
+    logImpl('warn', `alert failed: ${sanitize(e.message)}`);
+  } finally {
+    if (tmp) { try { fs.unlinkSync(tmp); } catch { /* best effort */ } }
+  }
+}
+
 function log(level, msg) {
   if (!shouldLog(level)) return;
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -520,7 +586,7 @@ async function readTail(handle, orcaFn = orca) {
 }
 
 const DEFAULT_DEPS = () => ({ orca, fetchImpl: globalThis.fetch, env: process.env, now: () => new Date(), loadState, saveState, log,
-  newEpisodeId: randomUUID, spawn: () => {}, readChoice: async () => null, clearChoice: async () => {} });
+  newEpisodeId: randomUUID, spawn: spawnAlert, readChoice, clearChoice });
 
 export async function tick({ dryRun }, depsIn = {}) {
   const deps = { ...DEFAULT_DEPS(), ...depsIn };
@@ -589,7 +655,7 @@ export async function tick({ dryRun }, depsIn = {}) {
       const result = await deps.readChoice(ev.handle, ev.episodeId);
       if (result === null) continue;
       if (result?.episodeId === ev.episodeId && isIso(result.at)
-        && ['Continue', 'Wait 1h', 'Stop'].includes(result.choice)) {
+        && CHOICES.includes(result.choice)) {
         if (result.choice === 'Stop') ev.status = 'dismissed';
         else {
           ev.status = 'waiting';
@@ -717,5 +783,8 @@ const entryIsThisFile = (() => {
   try { return import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href; } catch { return false; }
 })();
 if (entryIsThisFile) {
-  await main();
+  if (process.argv.slice(2).includes('--alert')) {
+    if (process.argv.length !== 3) alertLog('warn', 'invalid mixed --alert invocation');
+    else await runAlert(process.env);
+  } else await main();
 }
