@@ -7,7 +7,7 @@ is safe to. Zero AI, zero tokens: it does its job precisely when the agent
 subscriptions it watches are exhausted. (The installed command is
 `orca-limit-watchdog`.)
 
-It resumes on two conditions:
+It handles these conditions:
 
 - **Rate limit** — a terminal shows a limit banner with a stated reset time. The
   watchdog waits until that time has passed and the terminal is still idle on the
@@ -17,8 +17,10 @@ It resumes on two conditions:
   The watchdog waits out a hold, re-checks the relevant status page
   (`status.claude.com` / `status.openai.com`), and resumes once the incident
   clears.
+- **Codex limit with no reset time** — asks you what to do in a native macOS
+  alert; nothing is sent until you choose Continue or Wait 1h.
 
-It is plain Node with no dependencies, no GUI, and no network access beyond a
+It is plain Node with no dependencies and no network access beyond a
 lightweight connectivity probe (before any resume) and the two status pages
 (contacted only when an outage resume is actually due).
 
@@ -111,6 +113,8 @@ orca-limit-watchdog start
 ```
 
 Your pause state and tracked events are preserved across updates.
+Downgrading to a version from before the reset-less alert feature causes that
+version to back up and reset a state file containing the new event kind.
 
 ## Remove
 
@@ -159,7 +163,18 @@ returns, so a resume prompt is never fired into the void during a local network
 drop. The probe host is overridable via `WATCHDOG_CONNECTIVITY_URL` (loopback
 hosts only, for testing); anything else is ignored with a warning.
 
-Both kinds **refuse to send when the terminal's last line is a shell prompt**
+For a Codex `■` limit banner with no derivable reset time, the watchdog shows
+one native macOS alert per episode. **Continue** enables retries starting on
+the next tick, spaced 30 minutes apart, capped at 6 sends and 24 hours from
+your choice. **Wait 1h** delays the first retry by an hour, with the same
+24-hour cap from your choice; offline time counts toward that cap. **Stop**
+suppresses retries until the banner is confirmed gone, even if its wording or
+reset time changes. No click means no send. Choices are stored per terminal
+and episode under `~/.local/state/orca-limit-watchdog/choices/` and deleted
+after consumption. This alert is Codex-only; dry-run never opens it or consumes
+a choice.
+
+All kinds **refuse to send when the terminal's last line is a shell prompt**
 (the agent has exited). Outage detection is scoped to terminals Orca identifies
 as Claude Code or Codex; rate-limit detection is generic. Network access is
 limited to the connectivity probe (once per tick that has a send due) and the two
