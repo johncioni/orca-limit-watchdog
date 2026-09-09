@@ -423,10 +423,29 @@ test('schedule table matches the spec', () => {
 test('newEvent: outage resetAt is detectedAt + 10 min; limit parses the banner', () => {
   const o = newEvent({ handle: H, platform: 'claude', banner: { kind: 'outage', bannerText: 'API Error: 529', patternId: 'claude-api-error' } }, NOW);
   assert.deepEqual(o, { handle: H, kind: 'outage', platform: 'claude', bannerText: 'API Error: 529', detectedAt: NOW.toISOString(),
-    resetAt: new Date(NOW.getTime() + min(10)).toISOString(), attempts: 0, lastAttemptAt: null, status: 'waiting' });
+    resetAt: new Date(NOW.getTime() + min(10)).toISOString(), attempts: 0, lastAttemptAt: null, status: 'waiting', alertedAt: null });
   const l = newEvent({ handle: H, platform: 'unknown', banner: { kind: 'limit', bannerText: 'session limit reached, resets in 2 hours' } }, NOW);
   assert.equal(l.kind, 'limit');
   assert.equal(new Date(l.resetAt).getTime(), NOW.getTime() + min(120));
+});
+
+test('newEvent: limit-open ⇒ awaiting-user, injectable episodeId, resetAt=now (DOG-20)', () => {
+  const o = { handle: H, platform: 'codex', banner: { kind: 'limit-open', bannerText: 'x', resetAt: null } };
+  const ev = newEvent(o, NOW, () => 'ep-xyz');
+  assert.equal(ev.kind, 'limit-open'); assert.equal(ev.status, 'awaiting-user');
+  assert.equal(ev.alertedAt, null); assert.equal(ev.episodeId, 'ep-xyz');
+  assert.equal(ev.resetAt, NOW.toISOString()); assert.equal(validateEvent(H, ev), null);
+  assert.notEqual(newEvent(o, NOW).episodeId, newEvent(o, NOW).episodeId);
+  assert.equal(reconcile({}, [o], NOW, [H], () => 'ep-reconcile').events[H].episodeId, 'ep-reconcile');
+});
+test('newEvent: limit/outage initialise alertedAt without episodeId; carried reset wins (DOG-20)', () => {
+  const resetAt = new Date(NOW.getTime() + min(90)).toISOString();
+  const lim = newEvent({ handle: H, platform: 'codex', banner: { kind: 'limit', bannerText: 'x', resetAt } }, NOW);
+  assert.equal(lim.resetAt, resetAt);
+  for (const ev of [lim, newEvent({ handle: H, platform: 'claude', banner: OUTAGE_BANNER }, NOW)]) {
+    assert.equal(ev.alertedAt, null); assert.equal(ev.episodeId, undefined);
+    assert.equal(validateEvent(H, ev), null);
+  }
 });
 
 test('validateEvent accepts a valid v2 event and names the first violation otherwise', () => {

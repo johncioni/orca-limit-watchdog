@@ -4,6 +4,7 @@
 
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -200,15 +201,18 @@ export function inferPlatform(terminal, banner = null) {
   return 'unknown';
 }
 
-export function newEvent(o, now) {
+export function newEvent(o, now, newEpisodeId = randomUUID) {
   const kind = o.banner.kind;
   const resetAt = kind === 'outage'
     ? new Date(now.getTime() + SCHEDULE.outage.initialDelayMs)
+    : kind === 'limit-open' ? now
+    : o.banner.resetAt ? new Date(o.banner.resetAt)
     : (parseResetTime(o.banner.bannerText, now) ?? new Date(now.getTime() + 60 * MIN));
   return {
     handle: o.handle, kind, platform: o.platform ?? 'unknown', bannerText: o.banner.bannerText,
     detectedAt: now.toISOString(), resetAt: resetAt.toISOString(),
-    attempts: 0, lastAttemptAt: null, status: 'waiting',
+    attempts: 0, lastAttemptAt: null, status: kind === 'limit-open' ? 'awaiting-user' : 'waiting',
+    alertedAt: null, ...(kind === 'limit-open' ? { episodeId: newEpisodeId() } : {}),
   };
 }
 
@@ -315,7 +319,7 @@ export const eventKey = (handle) => handle;
 
 // observations: [{ handle, banner: { kind, bannerText, … } | null, platform }]
 // Applies spec §5's transition order per stored event; first matching rule wins.
-export function reconcile(state, observations, now, liveHandles = null) {
+export function reconcile(state, observations, now, liveHandles = null, newEpisodeId = randomUUID) {
   const events = structuredClone(state);
   const sendCandidates = [];
   const byHandle = new Map(observations.map((o) => [o.handle, { ...o, platform: o.platform ?? 'unknown' }]));
@@ -337,7 +341,7 @@ export function reconcile(state, observations, now, liveHandles = null) {
     }
     delete ev.clearedAt;                                                     //    banner present again
     if (o.banner.kind !== ev.kind || (o.platform !== 'unknown' && o.platform !== ev.platform)) {
-      events[key] = newEvent(o, now); continue;                              // 4. replace (never a candidate this tick)
+      events[key] = newEvent(o, now, newEpisodeId); continue;                 // 4. replace (never a candidate this tick)
     }
     const sch = SCHEDULE[ev.kind];                                           // 5. same kind & platform
     if (ev.status !== 'gave_up' && sch.deadlineMs !== null && now - new Date(ev.detectedAt) >= sch.deadlineMs) {
@@ -354,7 +358,7 @@ export function reconcile(state, observations, now, liveHandles = null) {
     }
   }
   for (const o of byHandle.values()) {
-    if (o.banner && !events[eventKey(o.handle)]) events[eventKey(o.handle)] = newEvent(o, now);
+    if (o.banner && !events[eventKey(o.handle)]) events[eventKey(o.handle)] = newEvent(o, now, newEpisodeId);
   }
   return { events, sendCandidates };
 }
@@ -514,7 +518,8 @@ async function readTail(handle, orcaFn = orca) {
   return r.terminal?.tail ?? [];
 }
 
-const DEFAULT_DEPS = () => ({ orca, fetchImpl: globalThis.fetch, env: process.env, now: () => new Date(), loadState, saveState, log });
+const DEFAULT_DEPS = () => ({ orca, fetchImpl: globalThis.fetch, env: process.env, now: () => new Date(), loadState, saveState, log,
+  newEpisodeId: randomUUID });
 
 export async function tick({ dryRun }, depsIn = {}) {
   const deps = { ...DEFAULT_DEPS(), ...depsIn };
@@ -538,7 +543,7 @@ export async function tick({ dryRun }, depsIn = {}) {
       const t = queue.shift();
       try {
         const tail = await readTail(t.handle, deps.orca);
-        const banner = detectBanner(tail, inferPlatform(t));
+        const banner = detectBanner(tail, inferPlatform(t), deps.now());
         if (!banner && shouldLog('debug') && hasOutageLine(tail)) {
           log('debug', `outage-pattern line present but not detected (platform gate, retry veto, or final block) on ${t.handle}: ${sanitize(tail.slice(-TAIL_LINES).join(' | '), 600)}`);
         }
@@ -556,7 +561,7 @@ export async function tick({ dryRun }, depsIn = {}) {
   // Pass every terminal that still exists so reconcile can tell a vanished
   // terminal (delete) from one merely unread this tick (freeze).
   const liveHandles = terminals.map((t) => t.handle);
-  const { events, sendCandidates } = reconcile(state, observations, now, liveHandles);
+  const { events, sendCandidates } = reconcile(state, observations, now, liveHandles, deps.newEpisodeId);
 
   for (const key of Object.keys(events)) {
     const ev = events[key];
@@ -602,7 +607,7 @@ export async function tick({ dryRun }, depsIn = {}) {
       log('warn', `skip ${ev.handle}: re-read failed (${sanitize(e.message)}); event untouched`); continue;
     }
     const term = byHandle.get(ev.handle);
-    const fresh = detectBanner(tail, inferPlatform(term));
+    const fresh = detectBanner(tail, inferPlatform(term), now);
     if (!fresh) {   // same hold as reconcile rule 3b: one miss is not proof
       log('info', `skip ${ev.handle}: banner cleared before send; holding`);
       ev.clearedAt = now.toISOString(); deps.saveState(events); continue;
@@ -610,7 +615,7 @@ export async function tick({ dryRun }, depsIn = {}) {
     const platform = inferPlatform(term, fresh);
     if (fresh.kind !== ev.kind || (platform !== 'unknown' && platform !== ev.platform)) {
       log('info', `skip ${ev.handle}: banner changed to ${fresh.kind}/${platform} before send; fresh event`);
-      events[key] = newEvent({ handle: ev.handle, banner: fresh, platform }, now); deps.saveState(events); continue;
+      events[key] = newEvent({ handle: ev.handle, banner: fresh, platform }, now, deps.newEpisodeId); deps.saveState(events); continue;
     }
     if (isShellPrompt(tail, term?.agentIdentity)) {                                  // 4. prompt guard
       log('warn', `skip ${ev.handle}: shell prompt on last line, agent has exited; event dropped`);
