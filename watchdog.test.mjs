@@ -120,11 +120,11 @@ test('detects Codex outage errors only on a codex-identified terminal (DOG-17)',
     '■ Selected model is at capacity. Please try a different model.',
     '■ exceeded retry limit, last status: 503 Service Unavailable, request id: 5036c677',
     '■ request timed out',
-  ]) assert.ok(detectBanner([line, '›'], 'codex'), line);
+  ]) assert.equal(detectBanner([line, '›'], 'codex').kind, 'outage', line);
 });
 
 test('Codex 429 retry-limit and usage-limit lines are not outages', () => {
-  assert.equal(detectBanner(['■ exceeded retry limit, last status: 429 Too Many Requests', '›'], 'codex'), null);
+  assert.equal(detectBanner(['■ exceeded retry limit, last status: 429 Too Many Requests', '›'], 'codex').kind, 'limit-open');
   const b = detectBanner(["■ You've hit your usage limit. Try again at Sep 8th, 2026 2:00 PM.", '›'], 'codex');
   assert.ok(b); assert.equal(b.kind, 'limit');
 });
@@ -206,6 +206,62 @@ test('hasOutageLine reports a pattern line regardless of platform or trailing pr
 });
 
 // --- inferPlatform ---
+
+const OPEN_TAIL = ['■ exceeded retry limit, last status: 429', '› Ask Codex to do anything'];
+const USAGE_WRAP = ["■ You've hit your usage limit. Upgrade to Pro (https://x), visit https://y to",
+  'purchase more credits.'];
+
+test('detectBanner: Codex reset-less usage limit ⇒ limit-open (DOG-20)', () => {
+  assert.equal(detectBanner([...USAGE_WRAP, '›'], 'codex').kind, 'limit-open');
+});
+test('detectBanner: Codex usage limit WITH reset ⇒ limit (DOG-20)', () => {
+  const b = detectBanner([USAGE_WRAP[0], 'purchase more credits or try again at 10:12 PM.', '›'], 'codex', NOW);
+  assert.equal(b.kind, 'limit'); assert.ok(b.resetAt);
+});
+test('detectBanner: bare 429 ⇒ limit-open; reset continuation ⇒ limit (DOG-20)', () => {
+  assert.equal(detectBanner(OPEN_TAIL, 'codex').kind, 'limit-open');
+  assert.equal(detectBanner([OPEN_TAIL[0], 'Try again at 10:12 PM.', '›'], 'codex').kind, 'limit');
+});
+test('detectBanner: 5xx stays outage, other status ⇒ null (DOG-20)', () => {
+  assert.equal(detectBanner(['■ exceeded retry limit, last status: 503', '›'], 'codex').kind, 'outage');
+  assert.equal(detectBanner(['■ exceeded retry limit, last status: 418', '›'], 'codex'), null);
+});
+test('detectBanner: usage limit reached, try again later ⇒ limit-open (DOG-20)', () => {
+  assert.equal(detectBanner(['■ usage limit reached, try again later', '›'], 'codex').kind, 'limit-open');
+});
+test('detectBanner: limit-open requires Codex and marker (DOG-20)', () => {
+  assert.equal(detectBanner(OPEN_TAIL, 'unknown'), null);
+  assert.equal(detectBanner([OPEN_TAIL[0].slice(2), '›'], 'codex'), null);
+  assert.equal(detectBanner(['error: rate limit exceeded (HTTP 429)', FOOTER, '> ', '? for shortcuts'], 'claude'), null);
+});
+test('detectBanner: stale, retry, draft, shell and near-miss continuations rejected (DOG-20)', () => {
+  for (const trailing of ['• Reconnecting... 2/5', 'Reconnecting... waiting for network', 'esc to interrupt',
+    'Retrying in 5s', 'attempt 2 of 5', '› my half-typed reply', 'john@mac ~ %',
+    'Continuing the task at 10:12 PM.', 'Try again at 10:12 PM. Now editing files.']) {
+    assert.equal(detectBanner([OPEN_TAIL[0], trailing, '›'], 'codex'), null, trailing);
+    assert.equal(detectBanner([...USAGE_WRAP, trailing, '›'], 'codex'), null, trailing);
+  }
+  assert.equal(detectBanner([USAGE_WRAP[0], 'purchase more credits. Working now.', '›'], 'codex'), null);
+  assert.equal(detectBanner(["■ You've hit your usage limit. Try again at 10:12 PM.", 'Working now.', '›'], 'codex'), null);
+});
+test('detectBanner: ANSI positive and ANSI-only negative (DOG-20)', () => {
+  assert.equal(detectBanner(['\x1b[31m' + OPEN_TAIL[0] + '\x1b[0m', '›'], 'codex').kind, 'limit-open');
+  assert.equal(detectBanner(['\x1b[31m\x1b[0m'], 'codex'), null);
+});
+test('detectBanner: selected evidence excludes historical clocks and chrome (DOG-20)', () => {
+  const b = detectBanner(["■ You've hit your usage limit. Try again at 10:12 PM.", ...OPEN_TAIL, CODEX_FOOTER], 'codex');
+  assert.equal(b.kind, 'limit-open'); assert.equal(b.resetAt, null);
+  assert.equal(b.bannerText, OPEN_TAIL[0]);
+  assert.equal(detectBanner([...OPEN_TAIL, CODEX_ERR, '›'], 'codex').kind, 'outage');
+  assert.equal(detectBanner([CODEX_ERR, ...OPEN_TAIL], 'codex').kind, 'limit-open');
+});
+test('detectBanner: bounded three-line wrap carries reset beyond storage cap (DOG-20)', () => {
+  const b = detectBanner(["■ You've hit your usage limit. Upgrade to Pro (https://x/" + 'long/'.repeat(140) + '),',
+    'visit https://y to purchase more credits', 'or try again at 10:12 PM.', '›'], 'codex', NOW);
+  assert.equal(b.kind, 'limit'); assert.ok(b.resetAt); assert.ok(b.bannerText.length <= 601);
+  assert.equal(detectBanner(["■ You've hit your usage limit.", 'Upgrade to Pro (https://x),',
+    'visit https://y to purchase more credits', 'or try again at 10:12 PM.', '›'], 'codex'), null);
+});
 
 test('agentIdentity is authoritative; banner is the fallback; else unknown', () => {
   const claudeBanner = { patternId: 'claude-api-error' };

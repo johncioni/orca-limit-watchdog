@@ -124,8 +124,35 @@ export function hasOutageLine(lines) {
   return OUTAGE_PATTERNS.some((p) => window.some((l) => p.re.test(l)));
 }
 
-export function detectBanner(lines, platform = 'unknown') {
+// Named Codex limit forms, bounded to three physical lines below. Only the
+// time clause admits clock/date text; another sentence cannot join the block.
+const CODEX_429_RE = /^■\s*exceeded retry limit, last status: 429\b/;
+const CODEX_TIME = String.raw`(?:[A-Za-z]+ \d{1,2}(?:st|nd|rd|th)?(?:,? \d{4})? )?(?:\d{1,2}(?::\d{2})?(?: ?[ap]\.?m\.?)?)`;
+const CODEX_TRY = `try again at ${CODEX_TIME}\\.?`;
+const CODEX_LIMIT_FORMS = [
+  new RegExp(`^■\\s*exceeded retry limit, last status: 429(?: Too Many Requests)?(?:[.]? ${CODEX_TRY})?$`, 'i'),
+  new RegExp(`^■\\s*You've hit your usage limit\\.(?: Upgrade to Pro \\(https?://\\S+\\), visit https?://\\S+ to purchase more credits(?: or ${CODEX_TRY})?\\.?| ${CODEX_TRY})?$`, 'i'),
+  /^■\s*usage limit reached, try again later\.?$/i,
+];
+
+export function detectBanner(lines, platform = 'unknown', now = new Date()) {
   const window = lines.slice(-TAIL_LINES).map((l) => stripAnsi(l).trim());
+  const codexCandidate = (l) => platform === 'codex' && /^■\s*/.test(l)
+    && (CODEX_429_RE.test(l) || (LIMIT_RE.test(l) && REACHED_RE.test(l)));
+  const c = lastIndex(window, codexCandidate);
+  let codexLimit = null;
+  if (c >= 0 && !VETO_RE.test(window[c]) && lastIndex(window, (l) => RETRY_RE.test(l)) < c) {
+    for (let end = c; end < Math.min(c + 3, window.length); end++) {
+      const block = window.slice(c, end + 1).join(' ');
+      if (!CODEX_LIMIT_FORMS.some((re) => re.test(block))) continue;
+      if (!window.slice(end + 1).every(isChrome)) continue;
+      const resetAt = parseResetTime(block, now)?.toISOString() ?? null;
+      const kind = resetAt ? 'limit' : 'limit-open';
+      codexLimit = { kind, resetAt, bannerText: sanitize(block, 600), matchedLine: window[c],
+        patternId: kind, index: resetAt ? end : c };
+      break;
+    }
+  }
 
   // --- limit rule (unchanged semantics; now on stripped lines) ---
   // Drop soft "approaching … limit" warning lines first, so such a warning can
@@ -137,12 +164,14 @@ export function detectBanner(lines, platform = 'unknown') {
   // The limit phrase and the reached word must sit on ONE line: a banner says
   // "usage limit reached"; prose and logs scatter the words across lines.
   const reachedLine = (l) => LIMIT_RE.test(l) && REACHED_RE.test(l);
-  if (kept.some(reachedLine) && RESET_RE.test(text)) {
+  if (c < 0 && kept.some(reachedLine) && RESET_RE.test(text)) {
     const isRelevant = (l) => !VETO_RE.test(l) && !FOOTER_RE.test(l) && (LIMIT_RE.test(l) || RESET_RE.test(l));
     const l = lastIndex(window, isRelevant);
     limit = { kind: 'limit', bannerText: sanitize(window.filter(isRelevant).join(' | '), 600),
       matchedLine: window[l], patternId: 'limit', index: l };
   }
+
+  if (codexLimit) limit = codexLimit;
 
   // --- outage rule ---
   let outage = null;
