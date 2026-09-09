@@ -1,5 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import * as watchdog from './watchdog.mjs';
+import { fileURLToPath } from 'node:url';
 import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
 import { isShellPrompt, isInputOccupied } from './watchdog.mjs';
@@ -120,11 +123,11 @@ test('detects Codex outage errors only on a codex-identified terminal (DOG-17)',
     '■ Selected model is at capacity. Please try a different model.',
     '■ exceeded retry limit, last status: 503 Service Unavailable, request id: 5036c677',
     '■ request timed out',
-  ]) assert.ok(detectBanner([line, '›'], 'codex'), line);
+  ]) assert.equal(detectBanner([line, '›'], 'codex').kind, 'outage', line);
 });
 
 test('Codex 429 retry-limit and usage-limit lines are not outages', () => {
-  assert.equal(detectBanner(['■ exceeded retry limit, last status: 429 Too Many Requests', '›'], 'codex'), null);
+  assert.equal(detectBanner(['■ exceeded retry limit, last status: 429 Too Many Requests', '›'], 'codex').kind, 'limit-open');
   const b = detectBanner(["■ You've hit your usage limit. Try again at Sep 8th, 2026 2:00 PM.", '›'], 'codex');
   assert.ok(b); assert.equal(b.kind, 'limit');
 });
@@ -206,6 +209,62 @@ test('hasOutageLine reports a pattern line regardless of platform or trailing pr
 });
 
 // --- inferPlatform ---
+
+const OPEN_TAIL = ['■ exceeded retry limit, last status: 429', '› Ask Codex to do anything'];
+const USAGE_WRAP = ["■ You've hit your usage limit. Upgrade to Pro (https://x), visit https://y to",
+  'purchase more credits.'];
+
+test('detectBanner: Codex reset-less usage limit ⇒ limit-open (DOG-20)', () => {
+  assert.equal(detectBanner([...USAGE_WRAP, '›'], 'codex').kind, 'limit-open');
+});
+test('detectBanner: Codex usage limit WITH reset ⇒ limit (DOG-20)', () => {
+  const b = detectBanner([USAGE_WRAP[0], 'purchase more credits or try again at 10:12 PM.', '›'], 'codex', NOW);
+  assert.equal(b.kind, 'limit'); assert.ok(b.resetAt);
+});
+test('detectBanner: bare 429 ⇒ limit-open; reset continuation ⇒ limit (DOG-20)', () => {
+  assert.equal(detectBanner(OPEN_TAIL, 'codex').kind, 'limit-open');
+  assert.equal(detectBanner([OPEN_TAIL[0], 'Try again at 10:12 PM.', '›'], 'codex').kind, 'limit');
+});
+test('detectBanner: 5xx stays outage, other status ⇒ null (DOG-20)', () => {
+  assert.equal(detectBanner(['■ exceeded retry limit, last status: 503', '›'], 'codex').kind, 'outage');
+  assert.equal(detectBanner(['■ exceeded retry limit, last status: 418', '›'], 'codex'), null);
+});
+test('detectBanner: usage limit reached, try again later ⇒ limit-open (DOG-20)', () => {
+  assert.equal(detectBanner(['■ usage limit reached, try again later', '›'], 'codex').kind, 'limit-open');
+});
+test('detectBanner: limit-open requires Codex and marker (DOG-20)', () => {
+  assert.equal(detectBanner(OPEN_TAIL, 'unknown'), null);
+  assert.equal(detectBanner([OPEN_TAIL[0].slice(2), '›'], 'codex'), null);
+  assert.equal(detectBanner(['error: rate limit exceeded (HTTP 429)', FOOTER, '> ', '? for shortcuts'], 'claude'), null);
+});
+test('detectBanner: stale, retry, draft, shell and near-miss continuations rejected (DOG-20)', () => {
+  for (const trailing of ['• Reconnecting... 2/5', 'Reconnecting... waiting for network', 'esc to interrupt',
+    'Retrying in 5s', 'attempt 2 of 5', '› my half-typed reply', 'john@mac ~ %',
+    'Continuing the task at 10:12 PM.', 'Try again at 10:12 PM. Now editing files.']) {
+    assert.equal(detectBanner([OPEN_TAIL[0], trailing, '›'], 'codex'), null, trailing);
+    assert.equal(detectBanner([...USAGE_WRAP, trailing, '›'], 'codex'), null, trailing);
+  }
+  assert.equal(detectBanner([USAGE_WRAP[0], 'purchase more credits. Working now.', '›'], 'codex'), null);
+  assert.equal(detectBanner(["■ You've hit your usage limit. Try again at 10:12 PM.", 'Working now.', '›'], 'codex'), null);
+});
+test('detectBanner: ANSI positive and ANSI-only negative (DOG-20)', () => {
+  assert.equal(detectBanner(['\x1b[31m' + OPEN_TAIL[0] + '\x1b[0m', '›'], 'codex').kind, 'limit-open');
+  assert.equal(detectBanner(['\x1b[31m\x1b[0m'], 'codex'), null);
+});
+test('detectBanner: selected evidence excludes historical clocks and chrome (DOG-20)', () => {
+  const b = detectBanner(["■ You've hit your usage limit. Try again at 10:12 PM.", ...OPEN_TAIL, CODEX_FOOTER], 'codex');
+  assert.equal(b.kind, 'limit-open'); assert.equal(b.resetAt, null);
+  assert.equal(b.bannerText, OPEN_TAIL[0]);
+  assert.equal(detectBanner([...OPEN_TAIL, CODEX_ERR, '›'], 'codex').kind, 'outage');
+  assert.equal(detectBanner([CODEX_ERR, ...OPEN_TAIL], 'codex').kind, 'limit-open');
+});
+test('detectBanner: bounded three-line wrap carries reset beyond storage cap (DOG-20)', () => {
+  const b = detectBanner(["■ You've hit your usage limit. Upgrade to Pro (https://x/" + 'long/'.repeat(140) + '),',
+    'visit https://y to purchase more credits', 'or try again at 10:12 PM.', '›'], 'codex', NOW);
+  assert.equal(b.kind, 'limit'); assert.ok(b.resetAt); assert.ok(b.bannerText.length <= 601);
+  assert.equal(detectBanner(["■ You've hit your usage limit.", 'Upgrade to Pro (https://x),',
+    'visit https://y to purchase more credits', 'or try again at 10:12 PM.', '›'], 'codex'), null);
+});
 
 test('agentIdentity is authoritative; banner is the fallback; else unknown', () => {
   const claudeBanner = { patternId: 'claude-api-error' };
@@ -310,7 +369,51 @@ const BANNER = 'Claude usage limit reached. | Your limit will reset at 3am.';
 
 const V1 = { handle: H, bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
   attempts: 1, lastAttemptAt: NOW.toISOString(), status: 'resumed' };
-const V2 = { ...V1, kind: 'limit', platform: 'unknown' };
+const V2 = { ...V1, kind: 'limit', platform: 'unknown', alertedAt: null };
+
+const LO = (over = {}) => ({ handle: H, kind: 'limit-open', platform: 'codex', bannerText: 'x',
+  detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(), attempts: 0, lastAttemptAt: null,
+  status: 'awaiting-user', alertedAt: null, episodeId: 'ep-1', ...over });
+
+test('validateEvent: well-formed limit-open accepted (DOG-20)', () => {
+  for (const status of ['awaiting-user', 'dismissed', 'waiting']) {
+    assert.equal(validateEvent(H, LO({ status })), null);
+  }
+  assert.equal(validateEvent(H, LO({ status: 'waiting', alertedAt: NOW.toISOString() })), null);
+});
+
+test('validateEvent: limit-open rejections (DOG-20)', () => {
+  for (const [field, over] of [['platform', { platform: 'claude' }], ['episodeId', { episodeId: '' }],
+    ['episodeId', { episodeId: undefined }], ['alertedAt', { alertedAt: 'nope' }],
+    ['attempts|lastAttemptAt', { attempts: 1 }], ['attempts', { attempts: 1, lastAttemptAt: NOW.toISOString() }]]) {
+    assert.match(validateEvent(H, LO(over)), new RegExp(field));
+  }
+});
+
+test('validateEvent: awaiting-user/dismissed and episodeId illegal for limit/outage (DOG-20)', () => {
+  for (const kind of ['limit', 'outage']) {
+    for (const status of ['awaiting-user', 'dismissed']) {
+      assert.match(validateEvent(H, { ...V2, kind, platform: 'claude', status }), /status/);
+    }
+    assert.match(validateEvent(H, { ...V2, kind, platform: 'claude', episodeId: 'ep1' }), /episodeId/);
+  }
+});
+
+test('validateEvent: zero-attempt gave_up accepted for deadline-bearing kinds (DOG-20)', () => {
+  assert.equal(validateEvent(H, LO({ kind: 'outage', platform: 'claude', episodeId: undefined, status: 'gave_up' })), null);
+  assert.equal(validateEvent(H, LO({ status: 'gave_up' })), null);
+  assert.match(validateEvent(H, { ...V2, attempts: 0, lastAttemptAt: null, status: 'gave_up' }), /lastAttemptAt/);
+});
+
+test('parseStateFile: legacy events normalise alertedAt and mix with limit-open (DOG-20)', () => {
+  const { alertedAt, ...legacy } = V2;
+  for (const events of [{ [H]: legacy }, { [H]: legacy, term_new: LO({ handle: 'term_new' }) }]) {
+    const parsed = parseStateFile(JSON.stringify({ version: 2, events }));
+    assert.ok(parsed);
+    assert.equal(parsed[H].alertedAt, null);
+    assert.deepEqual(parseStateFile(JSON.stringify({ version: 2, events: parsed })), parsed);
+  }
+});
 
 test('schedule table matches the spec', () => {
   assert.deepEqual(SCHEDULE.limit, { bufferMs: min(2), retrySpacingMs: min(30), rearmMs: min(10), maxSends: 3, deadlineMs: null,
@@ -323,10 +426,29 @@ test('schedule table matches the spec', () => {
 test('newEvent: outage resetAt is detectedAt + 10 min; limit parses the banner', () => {
   const o = newEvent({ handle: H, platform: 'claude', banner: { kind: 'outage', bannerText: 'API Error: 529', patternId: 'claude-api-error' } }, NOW);
   assert.deepEqual(o, { handle: H, kind: 'outage', platform: 'claude', bannerText: 'API Error: 529', detectedAt: NOW.toISOString(),
-    resetAt: new Date(NOW.getTime() + min(10)).toISOString(), attempts: 0, lastAttemptAt: null, status: 'waiting' });
+    resetAt: new Date(NOW.getTime() + min(10)).toISOString(), attempts: 0, lastAttemptAt: null, status: 'waiting', alertedAt: null });
   const l = newEvent({ handle: H, platform: 'unknown', banner: { kind: 'limit', bannerText: 'session limit reached, resets in 2 hours' } }, NOW);
   assert.equal(l.kind, 'limit');
   assert.equal(new Date(l.resetAt).getTime(), NOW.getTime() + min(120));
+});
+
+test('newEvent: limit-open ⇒ awaiting-user, injectable episodeId, resetAt=now (DOG-20)', () => {
+  const o = { handle: H, platform: 'codex', banner: { kind: 'limit-open', bannerText: 'x', resetAt: null } };
+  const ev = newEvent(o, NOW, () => 'ep-xyz');
+  assert.equal(ev.kind, 'limit-open'); assert.equal(ev.status, 'awaiting-user');
+  assert.equal(ev.alertedAt, null); assert.equal(ev.episodeId, 'ep-xyz');
+  assert.equal(ev.resetAt, NOW.toISOString()); assert.equal(validateEvent(H, ev), null);
+  assert.notEqual(newEvent(o, NOW).episodeId, newEvent(o, NOW).episodeId);
+  assert.equal(reconcile({}, [o], NOW, [H], () => 'ep-reconcile').events[H].episodeId, 'ep-reconcile');
+});
+test('newEvent: limit/outage initialise alertedAt without episodeId; carried reset wins (DOG-20)', () => {
+  const resetAt = new Date(NOW.getTime() + min(90)).toISOString();
+  const lim = newEvent({ handle: H, platform: 'codex', banner: { kind: 'limit', bannerText: 'x', resetAt } }, NOW);
+  assert.equal(lim.resetAt, resetAt);
+  for (const ev of [lim, newEvent({ handle: H, platform: 'claude', banner: OUTAGE_BANNER }, NOW)]) {
+    assert.equal(ev.alertedAt, null); assert.equal(ev.episodeId, undefined);
+    assert.equal(validateEvent(H, ev), null);
+  }
 });
 
 test('validateEvent accepts a valid v2 event and names the first violation otherwise', () => {
@@ -494,7 +616,7 @@ test('reconcile: the banner coming back clears clearedAt and keeps the attempt c
 
 test('validateEvent accepts clearedAt absent or ISO, rejects garbage', () => {
   const base = { handle: H, kind: 'limit', platform: 'claude', bannerText: BANNER, detectedAt: at(0).toISOString(), resetAt: at(0).toISOString(),
-    attempts: 0, lastAttemptAt: null, status: 'waiting' };
+    attempts: 0, lastAttemptAt: null, status: 'waiting', alertedAt: null };
   assert.equal(validateEvent(H, base), null);
   assert.equal(validateEvent(H, { ...base, clearedAt: at(1).toISOString() }), null);
   assert.match(validateEvent(H, { ...base, clearedAt: 'soon' }), /clearedAt/);
@@ -606,6 +728,63 @@ test('limit lifecycle still uses the 2-min buffer and 3-send cap', () => {
 
 // --- prompt guard ---
 
+const openObs = (banner = { kind: 'limit-open', bannerText: 'x', resetAt: null }, platform = 'codex') =>
+  [{ handle: H, banner, platform }];
+const roundTrip = (events) => assert.deepEqual(parseStateFile(JSON.stringify({ version: 2, events })), events);
+
+test('reconcile: dismissed survives kind/platform mutation (DOG-20)', () => {
+  const ev = LO({ status: 'dismissed', alertedAt: NOW.toISOString() });
+  for (const [banner, platform] of [[{ kind: 'limit', bannerText: 'try again at 5pm', resetAt: at(60).toISOString() }, 'codex'],
+    [OUTAGE_BANNER, 'claude']]) {
+    const r = reconcile({ [H]: ev }, openObs(banner, platform), at(1));
+    assert.equal(r.events[H].status, 'dismissed'); assert.equal(r.events[H].kind, 'limit-open');
+    assert.deepEqual(r.sendCandidates, []); roundTrip(r.events);
+  }
+});
+test('reconcile: pre-consent statuses never age into gave_up (DOG-20)', () => {
+  for (const status of ['awaiting-user', 'dismissed']) {
+    const r = reconcile({ [H]: LO({ status }) }, openObs(), at(25 * 60));
+    assert.equal(r.events[H].status, status); assert.deepEqual(r.sendCandidates, []); roundTrip(r.events);
+  }
+});
+test('reconcile: Stop clears only after two misses; new episode gets new id (DOG-20)', () => {
+  const first = reconcile({ [H]: LO({ status: 'dismissed' }) }, openObs(null), at(1), [H]);
+  assert.equal(first.events[H].status, 'dismissed'); assert.ok(first.events[H].clearedAt);
+  const gone = reconcile(first.events, openObs(null), at(2), [H]);
+  assert.deepEqual(gone.events, {});
+  const fresh = reconcile(gone.events, openObs(), at(2), [H], () => 'ep-fresh');
+  assert.equal(fresh.events[H].episodeId, 'ep-fresh'); roundTrip(fresh.events);
+});
+test('reconcile: unanswered mutation replaces and invalidates episode (DOG-20)', () => {
+  const r = reconcile({ [H]: LO() }, openObs({ kind: 'limit', bannerText: 'x', resetAt: at(60).toISOString() }), at(1));
+  assert.equal(r.events[H].kind, 'limit'); assert.equal(r.events[H].episodeId, undefined);
+  assert.deepEqual(r.sendCandidates, []); roundTrip(r.events);
+});
+test('reconcile: consent schedule caps six sends, deadline counts from consent (DOG-20)', () => {
+  let events = { [H]: LO({ status: 'waiting', resetAt: at(60).toISOString() }) };
+  assert.deepEqual(reconcile(events, openObs(), at(59)).sendCandidates, []);
+  for (let n = 0; n < 6; n++) {
+    const t = 60 + n * 30;
+    const r = reconcile(events, openObs(), at(t));
+    assert.deepEqual(r.sendCandidates, [H]);
+    events = r.events;
+    Object.assign(events[H], { attempts: n + 1, lastAttemptAt: at(t).toISOString(), status: 'resumed' });
+    roundTrip(events);
+    assert.deepEqual(reconcile(events, openObs(), at(t + 29)).sendCandidates, []);
+  }
+  const capped = reconcile(events, openObs(), at(240));
+  assert.equal(capped.events[H].status, 'gave_up'); roundTrip(capped.events);
+  for (const kind of ['outage', 'limit-open']) {
+    const ev = LO({ kind, status: 'waiting', ...(kind === 'outage' ? { platform: 'claude', episodeId: undefined } : {}) });
+    delete ev.episodeId;
+    if (kind === 'limit-open') ev.episodeId = 'ep-1';
+    const observation = openObs({ kind, bannerText: 'x' }, ev.platform);
+    assert.equal(reconcile({ [H]: ev }, observation, at(1439)).events[H].status, 'waiting');
+    const expired = reconcile({ [H]: ev }, observation, at(1440));
+    assert.equal(expired.events[H].status, 'gave_up'); roundTrip(expired.events);
+  }
+});
+
 test('isShellPrompt recognises shell prompt endings and fails closed on a bare ">"', () => {
   for (const p of ['john@mac ~ $', '~ %', 'root#', '❯', 'repo ➜', 'λ', '❱', 'foo>', 'cmd>  ']) {
     assert.equal(isShellPrompt(['API Error: 529', p, '', '  '], 'claude'), true, p);
@@ -712,6 +891,223 @@ function harness({ tail, terminals, indicator = 'none', state = {}, now = at(10)
 }
 const T = { handle: H, connected: true, writable: true, agentIdentity: 'claude' };
 const OUTAGE_TAIL = [CLAUDE_529, '', '> ', '? for shortcuts'];
+
+function alertHarness({ ev = LO(), choice = null, ...options } = {}) {
+  const h = harness({ tail: OPEN_TAIL, terminals: [{ ...T, agentIdentity: 'codex' }], state: { [H]: ev }, now: NOW, ...options });
+  const actions = [];
+  const save = h.deps.saveState;
+  Object.assign(h.deps, {
+    saveState: (events) => { actions.push('save'); save(events); },
+    spawn: (event) => { actions.push('spawn'); assert.equal(h.saved()[event.handle].alertedAt, NOW.toISOString()); },
+    readChoice: async (handle, episodeId) => { actions.push('read'); assert.equal(handle, H); assert.equal(episodeId, ev.episodeId); return choice; },
+    clearChoice: async () => { actions.push('clear'); },
+    newEpisodeId: () => 'ep-new',
+  });
+  return { ...h, actions };
+}
+const choiceOf = (choice, episodeId = 'ep-1') => ({ choice, episodeId, at: NOW.toISOString() });
+
+test('tick: awaiting-user claims before one spawn and never sends (DOG-20)', async () => {
+  const h = alertHarness({ state: {} });
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.actions, ['save', 'spawn', 'save']); assert.deepEqual(h.sent, []);
+  assert.equal(h.saved()[H].episodeId, 'ep-new'); roundTrip(h.saved());
+  const next = alertHarness({ ev: h.saved()[H] });
+  await tick({ dryRun: false }, next.deps);
+  assert.deepEqual(next.actions, ['read', 'save']); assert.deepEqual(next.sent, []);
+});
+for (const choice of ['Continue', 'Wait 1h', 'Stop']) {
+  test(`tick: pending ${choice} persists transition before clearing, no same-tick send (DOG-20)`, async () => {
+    const h = alertHarness({ ev: LO({ alertedAt: at(-100).toISOString(), detectedAt: at(-100).toISOString() }), choice: choiceOf(choice) });
+    h.deps.clearChoice = async () => {
+      h.actions.push('clear');
+      assert.equal(h.saved()[H].status, choice === 'Stop' ? 'dismissed' : 'waiting');
+    };
+    await tick({ dryRun: false }, h.deps);
+    const ev = h.saved()[H];
+    assert.deepEqual(h.actions, ['read', 'save', 'clear', 'save']); assert.deepEqual(h.sent, []);
+    assert.equal(ev.resetAt, at(choice === 'Wait 1h' ? 60 : 0).toISOString());
+    assert.equal(ev.detectedAt, at(choice === 'Stop' ? -100 : 0).toISOString()); roundTrip(h.saved());
+    const next = alertHarness({ ev, now: at(5) });
+    await tick({ dryRun: false }, next.deps);
+    assert.deepEqual(next.sent, choice === 'Continue' ? [RESUME_TEXT] : []);
+    assert.equal(next.fetchImpl.calls.length, choice === 'Continue' ? 1 : 0);
+  });
+}
+test('tick: stale choice ignored and cleared; invalid timestamp/button cannot consent (DOG-20)', async () => {
+  for (const choice of [choiceOf('Continue', 'ep-stale'), { ...choiceOf('Continue'), at: 'bad' }, choiceOf('Unknown')]) {
+    const h = alertHarness({ ev: LO({ alertedAt: NOW.toISOString() }), choice });
+    await tick({ dryRun: false }, h.deps);
+    assert.equal(h.saved()[H].status, 'awaiting-user'); assert.deepEqual(h.sent, []);
+    assert.ok(h.actions.includes('clear'));
+  }
+});
+test('tick: dry-run never spawns, persists, reads or clears choices (DOG-20)', async () => {
+  for (const choice of [null, ...['Continue', 'Wait 1h', 'Stop'].map((c) => choiceOf(c))]) {
+    const h = alertHarness({ ev: LO({ alertedAt: choice ? NOW.toISOString() : null }), choice });
+    const effects = [];
+    for (const dep of ['spawn', 'saveState', 'readChoice', 'clearChoice', 'fetchImpl']) h.deps[dep] = () => { effects.push(dep); throw new Error(dep); };
+    await tick({ dryRun: true }, h.deps);
+    assert.deepEqual(effects, []); assert.deepEqual(h.sent, []); assert.equal(h.saved(), null);
+  }
+});
+test('tick: spawn throws or emits error, claim persists and warning is logged (DOG-20)', async () => {
+  for (const asyncError of [false, true]) {
+    const h = alertHarness(); const warnings = []; const child = new EventEmitter();
+    h.deps.log = (level, message) => { if (level === 'warn') warnings.push(message); };
+    h.deps.spawn = () => { if (!asyncError) throw new Error('spawn failed'); return child; };
+    await tick({ dryRun: false }, h.deps);
+    if (asyncError) child.emit('error', new Error('spawn failed'));
+    assert.equal(h.saved()[H].alertedAt, NOW.toISOString()); assert.equal(h.saved()[H].status, 'awaiting-user');
+    assert.deepEqual(h.sent, []); assert.ok(warnings.some((m) => /spawn failed/.test(m)));
+  }
+});
+test('tick: choices stay bound to two terminals and read/unlink failures are bounded (DOG-20)', async () => {
+  for (const failure of [null, 'read', 'clear']) {
+    const ev = LO({ alertedAt: NOW.toISOString() });
+    const h = alertHarness({ state: { [H]: ev, term_other: { ...ev, handle: 'term_other', episodeId: 'ep-other' } },
+      terminals: [{ ...T, agentIdentity: 'codex' }, { ...T, handle: 'term_other', agentIdentity: 'codex' }] });
+    const cleared = [];
+    h.deps.readChoice = async (handle, episodeId) => {
+      if (handle === H && failure === 'read') throw new Error('read failed');
+      return choiceOf(handle === H ? 'Stop' : 'Continue', episodeId);
+    };
+    h.deps.clearChoice = async (handle) => { if (handle === H && failure === 'clear') throw new Error('unlink failed'); cleared.push(handle); };
+    await tick({ dryRun: false }, h.deps);
+    assert.equal(h.saved()[H].status, failure === 'read' ? 'awaiting-user' : 'dismissed');
+    assert.equal(h.saved().term_other.status, 'waiting'); assert.ok(cleared.includes('term_other')); assert.deepEqual(h.sent, []);
+  }
+});
+test('tick: alert pass preserves unread and first-miss freezes (DOG-20)', async () => {
+  for (const options of [{ readThrows: true }, { tail: ['›'] }]) {
+    const h = alertHarness({ ...options, choice: choiceOf('Continue') });
+    await tick({ dryRun: false }, h.deps);
+    assert.deepEqual(h.actions, ['save']); assert.equal(h.saved()[H].alertedAt, null);
+  }
+});
+
+function alertFiles(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-alert-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return { dir, env: { WATCHDOG_ALERT_MESSAGE: 'term_x — hit limit', WATCHDOG_ALERT_EPISODE: 'ep9',
+    WATCHDOG_ALERT_CHOICE_FILE: path.join(dir, 'choices', 'term_x.ep9.json') } };
+}
+
+test('runAlert: allowed buttons write atomic episode-bound choice files, message is argv data (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.runAlert, 'function');
+  const { dir, env } = alertFiles(t);
+  const message = '- quotes " \\ $(touch nope) `echo nope`\nUnicode ■';
+  for (const button of ['Continue', 'Wait 1h', 'Stop']) {
+    await watchdog.runAlert({ ...env, WATCHDOG_ALERT_MESSAGE: message }, { execFileImpl: async (file, args) => {
+      assert.equal(file, '/usr/bin/osascript');
+      assert.deepEqual(args, ['-e', 'on run argv', '-e',
+        'return button returned of (display alert "orca-limit-watchdog" message (item 1 of argv) buttons {"Stop","Wait 1h","Continue"} default button "Continue")',
+        '-e', 'end run', '--', message]);
+      return { stdout: button + '\n' };
+    } });
+    const j = JSON.parse(fs.readFileSync(env.WATCHDOG_ALERT_CHOICE_FILE, 'utf8'));
+    assert.deepEqual(Object.keys(j).sort(), ['at', 'choice', 'episodeId']);
+    assert.equal(j.choice, button); assert.equal(j.episodeId, 'ep9'); assert.ok(Number.isFinite(Date.parse(j.at)));
+    assert.deepEqual(fs.readdirSync(path.join(dir, 'choices')), ['term_x.ep9.json']);
+  }
+  assert.deepEqual(fs.readdirSync(dir), ['choices']);
+});
+test('runAlert: osascript rejection, empty or invalid button writes nothing (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.runAlert, 'function');
+  const { dir, env } = alertFiles(t); const warnings = [];
+  for (const execFileImpl of [async () => { throw new Error('boom'); },
+    ...['', 'Delete everything\n', 'Continue\nStop'].map((stdout) => async () => ({ stdout }))]) {
+    await watchdog.runAlert(env, { execFileImpl, logImpl: (level, msg) => warnings.push([level, msg]) });
+    assert.equal(fs.existsSync(env.WATCHDOG_ALERT_CHOICE_FILE), false);
+  }
+  assert.deepEqual(fs.readdirSync(dir), []); assert.ok(warnings.length);
+});
+test('runAlert: missing/invalid env cannot launch osascript or write state paths (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.runAlert, 'function');
+  const { dir, env } = alertFiles(t); let calls = 0;
+  for (const bad of [{}, { ...env, WATCHDOG_ALERT_MESSAGE: '' }, { ...env, WATCHDOG_ALERT_EPISODE: '../escape' },
+    { ...env, WATCHDOG_ALERT_CHOICE_FILE: path.join(dir, 'state.json') },
+    { ...env, WATCHDOG_ALERT_CHOICE_FILE: path.join(dir, 'choices', 'term_x.other.json') }]) {
+    await watchdog.runAlert(bad, { execFileImpl: async () => { calls++; return { stdout: 'Continue' }; }, logImpl: () => {} });
+  }
+  assert.equal(calls, 0); assert.deepEqual(fs.readdirSync(dir), []);
+});
+test('runAlert: awaits completion and concurrent dialogs never cross choices (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.runAlert, 'function');
+  const { dir, env } = alertFiles(t); let finish;
+  const pending = new Promise((resolve) => { finish = resolve; });
+  const first = watchdog.runAlert(env, { execFileImpl: () => pending });
+  const other = { ...env, WATCHDOG_ALERT_EPISODE: 'ep10', WATCHDOG_ALERT_CHOICE_FILE: path.join(dir, 'choices', 'term_y.ep10.json') };
+  await watchdog.runAlert(other, { execFileImpl: async () => ({ stdout: 'Stop' }) });
+  assert.equal(fs.existsSync(env.WATCHDOG_ALERT_CHOICE_FILE), false);
+  finish({ stdout: 'Continue' }); await first;
+  assert.equal(JSON.parse(fs.readFileSync(env.WATCHDOG_ALERT_CHOICE_FILE)).choice, 'Continue');
+  assert.equal(JSON.parse(fs.readFileSync(other.WATCHDOG_ALERT_CHOICE_FILE)).choice, 'Stop');
+  assert.equal(fs.readdirSync(path.join(dir, 'choices')).length, 2);
+});
+test('spawnAlert: detached self argv and env keep terminal identity outside truncation (DOG-20)', (t) => {
+  assert.equal(typeof watchdog.spawnAlert, 'function');
+  const { dir } = alertFiles(t); const calls = []; let unrefs = 0;
+  const child = new EventEmitter(); child.unref = () => unrefs++;
+  const spawnImpl = (...args) => { calls.push(args); return child; };
+  for (const handle of ['term_one', 'term_two']) {
+    assert.equal(watchdog.spawnAlert(LO({ handle, bannerText: 'x '.repeat(500) }), { spawnImpl, stateDir: dir, env: {} }), child);
+  }
+  assert.equal(unrefs, 2);
+  for (const [i, [file, args, opts]] of calls.entries()) {
+    const handle = i ? 'term_two' : 'term_one';
+    assert.equal(file, process.execPath); assert.deepEqual(args, [fileURLToPath(new URL('./watchdog.mjs', import.meta.url)), '--alert']);
+    assert.equal(opts.detached, true); assert.equal(opts.stdio, 'ignore'); assert.equal(opts.shell, undefined);
+    assert.equal(opts.env.WATCHDOG_ALERT_MESSAGE, handle + ' — ' + 'x '.repeat(100) + '…');
+    assert.equal(opts.env.WATCHDOG_ALERT_EPISODE, 'ep-1');
+    assert.equal(opts.env.WATCHDOG_ALERT_CHOICE_FILE, path.join(dir, 'choices', `${handle}.ep-1.json`));
+  }
+  assert.throws(() => watchdog.spawnAlert(LO({ handle: '../unsafe' }), { spawnImpl, stateDir: dir }), /handle|path/);
+  assert.throws(() => watchdog.spawnAlert(LO({ episodeId: '../unsafe' }), { spawnImpl, stateDir: dir }), /episode|path/);
+  assert.equal(calls.length, 2); assert.deepEqual(fs.readdirSync(dir), []);
+});
+test('choice deps: real per-episode reads/deletes are bounded and isolated (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.readChoice, 'function'); assert.equal(typeof watchdog.clearChoice, 'function');
+  const { dir, env } = alertFiles(t); const warnings = []; const logger = (...args) => warnings.push(args);
+  assert.equal(await watchdog.readChoice('term_x', 'ep9', dir, logger), null);
+  await watchdog.runAlert(env, { execFileImpl: async () => ({ stdout: 'Continue' }) });
+  assert.equal((await watchdog.readChoice('term_x', 'ep9', dir, logger)).choice, 'Continue');
+  assert.equal(await watchdog.readChoice('term_x', 'ep10', dir, logger), null);
+  await watchdog.clearChoice('term_x', 'ep10', dir, logger);
+  assert.equal(fs.existsSync(env.WATCHDOG_ALERT_CHOICE_FILE), true);
+  fs.writeFileSync(env.WATCHDOG_ALERT_CHOICE_FILE, '{bad');
+  assert.equal(await watchdog.readChoice('term_x', 'ep9', dir, logger), null);
+  await watchdog.clearChoice('term_x', 'ep9', dir, logger);
+  assert.equal(fs.existsSync(env.WATCHDOG_ALERT_CHOICE_FILE), false);
+  fs.mkdirSync(env.WATCHDOG_ALERT_CHOICE_FILE);
+  await watchdog.clearChoice('term_x', 'ep9', dir, logger);
+  assert.ok(warnings.length >= 2);
+});
+test('--alert: missing env and mixed invocations exit without tick/lock/state/send (DOG-20)', async (t) => {
+  const { dir } = alertFiles(t);
+  const fakeOrca = path.join(dir, 'fake-orca'); const marker = path.join(dir, 'called');
+  fs.writeFileSync(fakeOrca, '#!/bin/sh\nprintf called > "$WD_MARKER"\nprintf \'{"ok":true,"result":{"terminals":[]}}\\n\'\n', { mode: 0o755 });
+  const env = { ...process.env, HOME: dir, ORCA_CLI: fakeOrca, WD_MARKER: marker };
+  for (const key of Object.keys(env)) if (key.startsWith('WATCHDOG_ALERT_')) delete env[key];
+  for (const args of [['--alert'], ['--alert', '--once'], ['--dry-run', '--alert'], ['--alert', '--alert']]) {
+    await pExecFile(process.execPath, [fileURLToPath(new URL('./watchdog.mjs', import.meta.url)), ...args], { env, timeout: 2000 });
+    assert.equal(fs.existsSync(marker), false);
+    assert.equal(fs.existsSync(path.join(dir, '.local')), false);
+  }
+});
+test('spawnAlert: harmless detached helper survives parent exit (DOG-20)', async (t) => {
+  assert.equal(typeof watchdog.spawnAlert, 'function');
+  const { dir } = alertFiles(t); const result = path.join(dir, 'survived');
+  const helper = `setTimeout(() => require('fs').writeFileSync(process.argv[1], 'survived'), 150)`;
+  const parent = `import { spawn } from 'node:child_process';
+    import { spawnAlert } from ${JSON.stringify(new URL('./watchdog.mjs', import.meta.url).href)};
+    spawnAlert({handle:'term_x',episodeId:'ep9',bannerText:'x'}, {stateDir:process.argv[1],
+      spawnImpl:(file,args,opts) => spawn(file,['-e',${JSON.stringify(helper)},process.argv[2]],opts)});`;
+  await pExecFile(process.execPath, ['--input-type=module', '-e', parent, dir, result], { timeout: 2000 });
+  const deadline = Date.now() + 2000;
+  while (!fs.existsSync(result) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
+  assert.equal(fs.readFileSync(result, 'utf8'), 'survived');
+});
 
 test('tick: due outage event, status none ⇒ one outage resume, attempt persisted before send', async () => {
   const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });

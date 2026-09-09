@@ -2,12 +2,13 @@
 // orca-limit-watchdog — detects rate-limited Orca agent terminals and sends a
 // resume prompt after the limit resets. Zero dependencies. See docs/superpowers/specs/.
 
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 
 export const RESUME_TEXT = 'Session rate limit has reset. Resume where you left off.';
 
@@ -31,10 +32,12 @@ export const SCHEDULE = Object.freeze({
     resumeText: RESUME_TEXT }),
   outage: Object.freeze({ bufferMs: 0, retrySpacingMs: 30 * MIN, rearmMs: 10 * MIN, maxSends: 6, deadlineMs: 24 * 60 * MIN,
     initialDelayMs: 10 * MIN, resumeText: OUTAGE_RESUME_TEXT }),
+  'limit-open': Object.freeze({ bufferMs: 0, retrySpacingMs: 30 * MIN, rearmMs: 10 * MIN,
+    maxSends: 6, deadlineMs: 24 * 60 * MIN, resumeText: RESUME_TEXT }),
 });
 const KINDS = Object.keys(SCHEDULE);
 const PLATFORMS = ['claude', 'codex', 'unknown'];
-const STATUSES = ['waiting', 'resumed', 'gave_up'];
+const STATUSES = ['waiting', 'resumed', 'gave_up', 'awaiting-user', 'dismissed'];
 const GRACE_PAST_MS = 2 * 60 * MIN; // absolute time this recently past = already reset
 const TAIL_LINES = 15;
 const READ_BUDGET_MS = 3 * MIN;    // stop reading terminals before the 4-min tick deadline
@@ -122,8 +125,35 @@ export function hasOutageLine(lines) {
   return OUTAGE_PATTERNS.some((p) => window.some((l) => p.re.test(l)));
 }
 
-export function detectBanner(lines, platform = 'unknown') {
+// Named Codex limit forms, bounded to three physical lines below. Only the
+// time clause admits clock/date text; another sentence cannot join the block.
+const CODEX_429_RE = /^■\s*exceeded retry limit, last status: 429\b/;
+const CODEX_TIME = String.raw`(?:[A-Za-z]+ \d{1,2}(?:st|nd|rd|th)?(?:,? \d{4})? )?(?:\d{1,2}(?::\d{2})?(?: ?[ap]\.?m\.?)?)`;
+const CODEX_TRY = `try again at ${CODEX_TIME}\\.?`;
+const CODEX_LIMIT_FORMS = [
+  new RegExp(`^■\\s*exceeded retry limit, last status: 429(?: Too Many Requests)?(?:[.]? ${CODEX_TRY})?$`, 'i'),
+  new RegExp(`^■\\s*You've hit your usage limit\\.(?: Upgrade to Pro \\(https?://\\S+\\), visit https?://\\S+ to purchase more credits(?: or ${CODEX_TRY})?\\.?| ${CODEX_TRY})?$`, 'i'),
+  /^■\s*usage limit reached, try again later\.?$/i,
+];
+
+export function detectBanner(lines, platform = 'unknown', now = new Date()) {
   const window = lines.slice(-TAIL_LINES).map((l) => stripAnsi(l).trim());
+  const codexCandidate = (l) => platform === 'codex' && /^■\s*/.test(l)
+    && (CODEX_429_RE.test(l) || (LIMIT_RE.test(l) && REACHED_RE.test(l)));
+  const c = lastIndex(window, codexCandidate);
+  let codexLimit = null;
+  if (c >= 0 && !VETO_RE.test(window[c]) && lastIndex(window, (l) => RETRY_RE.test(l)) < c) {
+    for (let end = c; end < Math.min(c + 3, window.length); end++) {
+      const block = window.slice(c, end + 1).join(' ');
+      if (!CODEX_LIMIT_FORMS.some((re) => re.test(block))) continue;
+      if (!window.slice(end + 1).every(isChrome)) continue;
+      const resetAt = parseResetTime(block, now)?.toISOString() ?? null;
+      const kind = resetAt ? 'limit' : 'limit-open';
+      codexLimit = { kind, resetAt, bannerText: sanitize(block, 600), matchedLine: window[c],
+        patternId: kind, index: resetAt ? end : c };
+      break;
+    }
+  }
 
   // --- limit rule (unchanged semantics; now on stripped lines) ---
   // Drop soft "approaching … limit" warning lines first, so such a warning can
@@ -135,12 +165,14 @@ export function detectBanner(lines, platform = 'unknown') {
   // The limit phrase and the reached word must sit on ONE line: a banner says
   // "usage limit reached"; prose and logs scatter the words across lines.
   const reachedLine = (l) => LIMIT_RE.test(l) && REACHED_RE.test(l);
-  if (kept.some(reachedLine) && RESET_RE.test(text)) {
+  if (c < 0 && kept.some(reachedLine) && RESET_RE.test(text)) {
     const isRelevant = (l) => !VETO_RE.test(l) && !FOOTER_RE.test(l) && (LIMIT_RE.test(l) || RESET_RE.test(l));
     const l = lastIndex(window, isRelevant);
     limit = { kind: 'limit', bannerText: sanitize(window.filter(isRelevant).join(' | '), 600),
       matchedLine: window[l], patternId: 'limit', index: l };
   }
+
+  if (codexLimit) limit = codexLimit;
 
   // --- outage rule ---
   let outage = null;
@@ -169,15 +201,18 @@ export function inferPlatform(terminal, banner = null) {
   return 'unknown';
 }
 
-export function newEvent(o, now) {
+export function newEvent(o, now, newEpisodeId = randomUUID) {
   const kind = o.banner.kind;
   const resetAt = kind === 'outage'
     ? new Date(now.getTime() + SCHEDULE.outage.initialDelayMs)
+    : kind === 'limit-open' ? now
+    : o.banner.resetAt ? new Date(o.banner.resetAt)
     : (parseResetTime(o.banner.bannerText, now) ?? new Date(now.getTime() + 60 * MIN));
   return {
     handle: o.handle, kind, platform: o.platform ?? 'unknown', bannerText: o.banner.bannerText,
     detectedAt: now.toISOString(), resetAt: resetAt.toISOString(),
-    attempts: 0, lastAttemptAt: null, status: 'waiting',
+    attempts: 0, lastAttemptAt: null, status: kind === 'limit-open' ? 'awaiting-user' : 'waiting',
+    alertedAt: null, ...(kind === 'limit-open' ? { episodeId: newEpisodeId() } : {}),
   };
 }
 
@@ -191,13 +226,22 @@ export function validateEvent(key, ev) {
   if (!PLATFORMS.includes(ev.platform)) return `platform: ${ev.platform}`;
   if (ev.kind === 'outage' && ev.platform === 'unknown') return 'platform: outage requires a known platform';
   if (!STATUSES.includes(ev.status)) return `status: ${ev.status}`;
+  if (['awaiting-user', 'dismissed'].includes(ev.status) && ev.kind !== 'limit-open') return 'status: requires limit-open';
+  if (ev.kind === 'limit-open') {
+    if (ev.platform !== 'codex') return 'platform: limit-open requires codex';
+    if (typeof ev.episodeId !== 'string' || !ev.episodeId.trim()) return 'episodeId: required';
+    if (ev.status === 'awaiting-user' && ev.attempts !== 0) return 'attempts: awaiting-user requires zero';
+  } else if (ev.episodeId !== undefined) return 'episodeId: only legal for limit-open';
+  if (ev.alertedAt !== null && !isIso(ev.alertedAt)) return 'alertedAt: not null or a timestamp';
   if (typeof ev.bannerText !== 'string') return 'bannerText: not a string';
   if (!isIso(ev.detectedAt)) return 'detectedAt: not a timestamp';
   if (!isIso(ev.resetAt)) return 'resetAt: not a timestamp';
   const max = SCHEDULE[ev.kind].maxSends;
   if (!Number.isInteger(ev.attempts) || ev.attempts < 0 || ev.attempts > max) return `attempts: ${ev.attempts} (0..${max})`;
   if (ev.lastAttemptAt !== null && !isIso(ev.lastAttemptAt)) return 'lastAttemptAt: not null or a timestamp';
-  if (ev.lastAttemptAt === null && (ev.status !== 'waiting' || ev.attempts > 0)) return 'lastAttemptAt: required once an attempt was made';
+  const unsentStatus = ['waiting', 'awaiting-user', 'dismissed'].includes(ev.status)
+    || (ev.status === 'gave_up' && SCHEDULE[ev.kind].deadlineMs !== null);
+  if (ev.lastAttemptAt === null && (!unsentStatus || ev.attempts > 0)) return 'lastAttemptAt: required once an attempt was made';
   if (ev.clearedAt !== undefined && !isIso(ev.clearedAt)) return 'clearedAt: not a timestamp';
   return null;
 }
@@ -211,7 +255,7 @@ export function parseStateFile(text) {
   if (s.version !== 1 && s.version !== 2) return null;
   const events = {};
   for (const [key, raw] of Object.entries(s.events)) {
-    const ev = s.version === 1 ? { ...raw, kind: 'limit', platform: 'unknown' } : raw;
+    const ev = { alertedAt: null, ...raw, ...(s.version === 1 ? { kind: 'limit', platform: 'unknown' } : {}) };
     if (validateEvent(key, ev) !== null) return null;
     events[key] = ev;
   }
@@ -275,7 +319,7 @@ export const eventKey = (handle) => handle;
 
 // observations: [{ handle, banner: { kind, bannerText, … } | null, platform }]
 // Applies spec §5's transition order per stored event; first matching rule wins.
-export function reconcile(state, observations, now, liveHandles = null) {
+export function reconcile(state, observations, now, liveHandles = null, newEpisodeId = randomUUID) {
   const events = structuredClone(state);
   const sendCandidates = [];
   const byHandle = new Map(observations.map((o) => [o.handle, { ...o, platform: o.platform ?? 'unknown' }]));
@@ -296,10 +340,11 @@ export function reconcile(state, observations, now, liveHandles = null) {
       ev.clearedAt = now.toISOString(); continue;                            //    3b. first miss: hold
     }
     delete ev.clearedAt;                                                     //    banner present again
-    if (o.banner.kind !== ev.kind || (o.platform !== 'unknown' && o.platform !== ev.platform)) {
-      events[key] = newEvent(o, now); continue;                              // 4. replace (never a candidate this tick)
+    if (ev.status !== 'dismissed' && (o.banner.kind !== ev.kind || (o.platform !== 'unknown' && o.platform !== ev.platform))) {
+      events[key] = newEvent(o, now, newEpisodeId); continue;                 // 4. replace (never a candidate this tick)
     }
     const sch = SCHEDULE[ev.kind];                                           // 5. same kind & platform
+    if (ev.status === 'awaiting-user' || ev.status === 'dismissed') continue;
     if (ev.status !== 'gave_up' && sch.deadlineMs !== null && now - new Date(ev.detectedAt) >= sch.deadlineMs) {
       ev.status = 'gave_up'; continue;                                       // 5a
     }
@@ -314,7 +359,7 @@ export function reconcile(state, observations, now, liveHandles = null) {
     }
   }
   for (const o of byHandle.values()) {
-    if (o.banner && !events[eventKey(o.handle)]) events[eventKey(o.handle)] = newEvent(o, now);
+    if (o.banner && !events[eventKey(o.handle)]) events[eventKey(o.handle)] = newEvent(o, now, newEpisodeId);
   }
   return { events, sendCandidates };
 }
@@ -400,6 +445,72 @@ export const suppressedByStatus = (indicator) => indicator === 'major' || indica
 
 const pExecFile = promisify(execFile);
 
+const CHOICES = ['Continue', 'Wait 1h', 'Stop'];
+const PATH_COMPONENT_RE = /^[A-Za-z0-9_-]+$/;
+function choicePath(handle, episodeId, stateDir = STATE_DIR) {
+  if (!PATH_COMPONENT_RE.test(handle) || !PATH_COMPONENT_RE.test(episodeId)
+    || typeof handle !== 'string' || typeof episodeId !== 'string') throw new Error('invalid handle/episode path component');
+  return path.join(stateDir, 'choices', `${handle}.${episodeId}.json`);
+}
+
+// The child outlives the tick. All untrusted display text travels as env/argv
+// data; no shell and no banner interpolation into AppleScript source.
+export function spawnAlert(ev, { spawnImpl = spawn, stateDir = STATE_DIR, env = process.env } = {}) {
+  const child = spawnImpl(process.execPath, [fileURLToPath(import.meta.url), '--alert'], {
+    detached: true, stdio: 'ignore', env: { ...env,
+      WATCHDOG_ALERT_MESSAGE: `${ev.handle} — ${sanitize(ev.bannerText)}`,
+      WATCHDOG_ALERT_EPISODE: ev.episodeId,
+      WATCHDOG_ALERT_CHOICE_FILE: choicePath(ev.handle, ev.episodeId, stateDir) },
+  });
+  child.unref();
+  return child; // tick attaches an async error listener before yielding
+}
+
+export async function readChoice(handle, episodeId, stateDir = STATE_DIR, logImpl = log) {
+  try { return JSON.parse(fs.readFileSync(choicePath(handle, episodeId, stateDir), 'utf8')); }
+  catch (e) {
+    if (e.code !== 'ENOENT') logImpl('warn', `choice read failed for ${handle}: ${sanitize(e.message)}`);
+    return null;
+  }
+}
+
+export async function clearChoice(handle, episodeId, stateDir = STATE_DIR, logImpl = log) {
+  try { fs.unlinkSync(choicePath(handle, episodeId, stateDir)); }
+  catch (e) { if (e.code !== 'ENOENT') logImpl('warn', `choice delete failed for ${handle}: ${sanitize(e.message)}`); }
+}
+
+// Separate from the daemon logger: --alert must not touch state/lock/log files.
+const alertLog = (level, msg) => console.error(`${level}: ${msg}`);
+export async function runAlert(env, { execFileImpl = pExecFile, logImpl = alertLog } = {}) {
+  let tmp;
+  try {
+    const message = env.WATCHDOG_ALERT_MESSAGE;
+    const episodeId = env.WATCHDOG_ALERT_EPISODE;
+    const file = env.WATCHDOG_ALERT_CHOICE_FILE;
+    if (typeof message !== 'string' || !message.trim() || message.includes('\0')
+      || typeof episodeId !== 'string' || !PATH_COMPONENT_RE.test(episodeId)
+      || typeof file !== 'string' || !path.isAbsolute(file) || path.normalize(file) !== file
+      || path.basename(path.dirname(file)) !== 'choices') throw new Error('invalid alert environment');
+    const suffix = `.${episodeId}.json`;
+    const name = path.basename(file);
+    if (!name.endsWith(suffix) || !PATH_COMPONENT_RE.test(name.slice(0, -suffix.length))) throw new Error('invalid alert choice path');
+    const { stdout } = await execFileImpl('/usr/bin/osascript', ['-e', 'on run argv', '-e',
+      'return button returned of (display alert "orca-limit-watchdog" message (item 1 of argv) buttons {"Stop","Wait 1h","Continue"} default button "Continue")',
+      '-e', 'end run', '--', message]);
+    const choice = stdout?.trim();
+    if (!CHOICES.includes(choice)) { logImpl('warn', 'alert returned no valid choice'); return; }
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    tmp = `${file}.${randomUUID()}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ choice, episodeId, at: new Date().toISOString() }), { flag: 'wx' });
+    fs.renameSync(tmp, file);
+    tmp = undefined;
+  } catch (e) {
+    logImpl('warn', `alert failed: ${sanitize(e.message)}`);
+  } finally {
+    if (tmp) { try { fs.unlinkSync(tmp); } catch { /* best effort */ } }
+  }
+}
+
 function log(level, msg) {
   if (!shouldLog(level)) return;
   fs.mkdirSync(STATE_DIR, { recursive: true });
@@ -474,7 +585,8 @@ async function readTail(handle, orcaFn = orca) {
   return r.terminal?.tail ?? [];
 }
 
-const DEFAULT_DEPS = () => ({ orca, fetchImpl: globalThis.fetch, env: process.env, now: () => new Date(), loadState, saveState, log });
+const DEFAULT_DEPS = () => ({ orca, fetchImpl: globalThis.fetch, env: process.env, now: () => new Date(), loadState, saveState, log,
+  newEpisodeId: randomUUID, spawn: spawnAlert, readChoice, clearChoice });
 
 export async function tick({ dryRun }, depsIn = {}) {
   const deps = { ...DEFAULT_DEPS(), ...depsIn };
@@ -498,7 +610,7 @@ export async function tick({ dryRun }, depsIn = {}) {
       const t = queue.shift();
       try {
         const tail = await readTail(t.handle, deps.orca);
-        const banner = detectBanner(tail, inferPlatform(t));
+        const banner = detectBanner(tail, inferPlatform(t), deps.now());
         if (!banner && shouldLog('debug') && hasOutageLine(tail)) {
           log('debug', `outage-pattern line present but not detected (platform gate, retry veto, or final block) on ${t.handle}: ${sanitize(tail.slice(-TAIL_LINES).join(' | '), 600)}`);
         }
@@ -516,7 +628,7 @@ export async function tick({ dryRun }, depsIn = {}) {
   // Pass every terminal that still exists so reconcile can tell a vanished
   // terminal (delete) from one merely unread this tick (freeze).
   const liveHandles = terminals.map((t) => t.handle);
-  const { events, sendCandidates } = reconcile(state, observations, now, liveHandles);
+  const { events, sendCandidates } = reconcile(state, observations, now, liveHandles, deps.newEpisodeId);
 
   for (const key of Object.keys(events)) {
     const ev = events[key];
@@ -524,6 +636,38 @@ export async function tick({ dryRun }, depsIn = {}) {
     const o = observations.find((x) => x.handle === ev.handle);
     log('info', `detected ${ev.kind} on ${ev.handle} (${ev.platform}, ${o?.banner?.patternId ?? 'limit'}: ${sanitize(o?.banner?.matchedLine ?? ev.bannerText)}), resetAt ${ev.resetAt}`);
     if (ev.kind === 'outage' && shouldLog('debug')) log('debug', `outage window on ${ev.handle}: ${sanitize(o?.window ?? '', 600)}`);
+  }
+
+  // Reconcile has already selected sends. Consent becomes eligible next tick,
+  // preserving unread/first-miss freezes and never bypassing the send guards.
+  for (const ev of Object.values(events)) {
+    if (ev.kind !== 'limit-open' || ev.status !== 'awaiting-user') continue;
+    if (!observations.some((o) => o.handle === ev.handle && o.banner) || ev.clearedAt) continue;
+    if (dryRun) { log('info', `[dry-run] would await alert choice for ${ev.handle}`); continue; }
+    try {
+      if (ev.alertedAt === null) {
+        ev.alertedAt = now.toISOString();
+        deps.saveState(events); // claim before spawn: a crash cannot duplicate the dialog
+        const child = deps.spawn(ev);
+        child?.on('error', (e) => log('warn', `alert spawn failed for ${ev.handle}: ${sanitize(e.message)}`));
+        continue;
+      }
+      const result = await deps.readChoice(ev.handle, ev.episodeId);
+      if (result === null) continue;
+      if (result?.episodeId === ev.episodeId && isIso(result.at)
+        && CHOICES.includes(result.choice)) {
+        if (result.choice === 'Stop') ev.status = 'dismissed';
+        else {
+          ev.status = 'waiting';
+          ev.detectedAt = now.toISOString();
+          ev.resetAt = new Date(now.getTime() + (result.choice === 'Wait 1h' ? 60 * MIN : 0)).toISOString();
+        }
+        deps.saveState(events); // durable choice before deleting the child's result
+      } else log('warn', `ignored invalid or stale alert choice for ${ev.handle}`);
+      await deps.clearChoice(ev.handle, ev.episodeId);
+    } catch (e) {
+      log('warn', `alert failed for ${ev.handle}: ${sanitize(e.message)}`);
+    }
   }
 
   const indicators = new Map();   // platform → indicator, fetched at most once per tick
@@ -562,7 +706,7 @@ export async function tick({ dryRun }, depsIn = {}) {
       log('warn', `skip ${ev.handle}: re-read failed (${sanitize(e.message)}); event untouched`); continue;
     }
     const term = byHandle.get(ev.handle);
-    const fresh = detectBanner(tail, inferPlatform(term));
+    const fresh = detectBanner(tail, inferPlatform(term), now);
     if (!fresh) {   // same hold as reconcile rule 3b: one miss is not proof
       log('info', `skip ${ev.handle}: banner cleared before send; holding`);
       ev.clearedAt = now.toISOString(); deps.saveState(events); continue;
@@ -570,7 +714,7 @@ export async function tick({ dryRun }, depsIn = {}) {
     const platform = inferPlatform(term, fresh);
     if (fresh.kind !== ev.kind || (platform !== 'unknown' && platform !== ev.platform)) {
       log('info', `skip ${ev.handle}: banner changed to ${fresh.kind}/${platform} before send; fresh event`);
-      events[key] = newEvent({ handle: ev.handle, banner: fresh, platform }, now); deps.saveState(events); continue;
+      events[key] = newEvent({ handle: ev.handle, banner: fresh, platform }, now, deps.newEpisodeId); deps.saveState(events); continue;
     }
     if (isShellPrompt(tail, term?.agentIdentity)) {                                  // 4. prompt guard
       log('warn', `skip ${ev.handle}: shell prompt on last line, agent has exited; event dropped`);
@@ -639,5 +783,8 @@ const entryIsThisFile = (() => {
   try { return import.meta.url === pathToFileURL(fs.realpathSync(process.argv[1])).href; } catch { return false; }
 })();
 if (entryIsThisFile) {
-  await main();
+  if (process.argv.slice(2).includes('--alert')) {
+    if (process.argv.length !== 3) alertLog('warn', 'invalid mixed --alert invocation');
+    else await runAlert(process.env);
+  } else await main();
 }
