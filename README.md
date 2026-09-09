@@ -39,6 +39,9 @@ terminal is ever touched until you explicitly `start` it.
 
 ### Homebrew (recommended)
 
+On newer Homebrew, first trust the third-party tap with `brew trust johncioni/tap`
+(or approve interactively) before installing:
+
 ```bash
 brew install johncioni/tap/orca-limit-watchdog
 ```
