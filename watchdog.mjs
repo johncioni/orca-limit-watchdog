@@ -479,6 +479,23 @@ export async function clearChoice(handle, episodeId, stateDir = STATE_DIR, logIm
   catch (e) { if (e.code !== 'ENOENT') logImpl('warn', `choice delete failed for ${handle}: ${sanitize(e.message)}`); }
 }
 
+export function reapChoices(liveNames, stateDir = STATE_DIR, logImpl = log) {
+  const dir = path.join(stateDir, 'choices');
+  let names;
+  try { names = fs.readdirSync(dir); }
+  catch (e) {
+    if (e.code !== 'ENOENT') logImpl('debug', `choice reaper read failed: ${sanitize(e.message)}`);
+    return 0;
+  }
+  let reaped = 0;
+  for (const name of names) {
+    if (!name.endsWith('.json') || liveNames.has(name)) continue;
+    try { fs.unlinkSync(path.join(dir, name)); reaped++; }
+    catch { /* raced unlink or otherwise unavailable; retry next tick */ }
+  }
+  return reaped;
+}
+
 // Separate from the daemon logger: --alert must not touch state/lock/log files.
 const alertLog = (level, msg) => console.error(`${level}: ${msg}`);
 export async function runAlert(env, { execFileImpl = pExecFile, logImpl = alertLog } = {}) {
@@ -586,7 +603,7 @@ async function readTail(handle, orcaFn = orca) {
 }
 
 const DEFAULT_DEPS = () => ({ orca, fetchImpl: globalThis.fetch, env: process.env, now: () => new Date(), loadState, saveState, log,
-  newEpisodeId: randomUUID, spawn: spawnAlert, readChoice, clearChoice });
+  newEpisodeId: randomUUID, spawn: spawnAlert, readChoice, clearChoice, reapChoices });
 
 export async function tick({ dryRun }, depsIn = {}) {
   const deps = { ...DEFAULT_DEPS(), ...depsIn };
@@ -668,6 +685,14 @@ export async function tick({ dryRun }, depsIn = {}) {
     } catch (e) {
       log('warn', `alert failed for ${ev.handle}: ${sanitize(e.message)}`);
     }
+  }
+
+  if (!dryRun) {
+    const liveChoiceNames = new Set(Object.values(events)
+      .filter((e) => e.kind === 'limit-open' && e.status === 'awaiting-user' && e.episodeId)
+      .map((e) => `${e.handle}.${e.episodeId}.json`));
+    try { await deps.reapChoices(liveChoiceNames); }
+    catch (e) { log('debug', `choice reaper failed: ${sanitize(e.message)}`); }
   }
 
   const indicators = new Map();   // platform → indicator, fetched at most once per tick
