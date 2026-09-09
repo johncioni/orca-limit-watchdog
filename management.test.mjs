@@ -121,8 +121,9 @@ test('public CLI help/version do not inspect terminals and unknown args fail clo
     assert.match(noArgs.stdout, /Usage: orca-limit-watchdog/);
     const help = await runCli(['--help'], h.env);
     assert.match(help.stdout, /doctor.*start.*stop/s);
+    const { VERSION } = await loadManagement();
     const version = await runCli(['--version'], h.env);
-    assert.equal(version.stdout.trim(), 'orca-limit-watchdog 0.1.0');
+    assert.equal(version.stdout.trim(), `orca-limit-watchdog ${VERSION}`);
     await assert.rejects(runCli(['--bogus'], h.env), (error) => {
       assert.equal(error.code, 2);
       assert.match(error.stderr, /unknown command.*--bogus/i);
