@@ -780,6 +780,8 @@ test('tick: offline holds a due limit send too (DOG-19)', async () => {
   await tick({ dryRun: false }, h.deps);
   assert.deepEqual(h.sent, []);
   assert.equal(h.saved()[H].attempts, 0);
+  assert.equal(h.saved()[H].lastAttemptAt, null);
+  assert.equal(h.saved()[H].status, 'waiting');
 });
 
 test('tick: online probe runs once and permits the send (DOG-19)', async () => {
@@ -930,6 +932,7 @@ test('tick: two due Claude outages share one status fetch and both send when sta
   const state = { ...seed(), [H2]: { ...seed()[H], handle: H2 } };
   const h = harness({ tail: OUTAGE_TAIL, terminals: [T, T2], state });
   await tick({ dryRun: false }, h.deps);
+  assert.equal(h.fetchImpl.calls.filter((c) => c.url === CONNECTIVITY_URL).length, 1);
   assert.equal(h.fetchImpl.calls.filter((c) => c.url === CLAUDE_URL).length, 1);
   assert.deepEqual(h.sent, [OUTAGE_RESUME_TEXT, OUTAGE_RESUME_TEXT]);
 });
