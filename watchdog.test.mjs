@@ -4,6 +4,7 @@ import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
 import { isShellPrompt, isInputOccupied } from './watchdog.mjs';
 import { statusUrlFor, fetchIndicator, suppressedByStatus } from './watchdog.mjs';
+import { CONNECTIVITY_URL, connectivityUrl, hasConnectivity } from './watchdog.mjs';
 import { tick, RESUME_TEXT } from './watchdog.mjs';
 
 const CLAUDE_BANNER = [
@@ -658,6 +659,32 @@ test('fetchIndicator returns null on non-200, bad JSON, missing field, or throw'
   assert.equal(await fetchIndicator(CLAUDE_URL, fakeFetch(() => { throw new TypeError('redirect'); })), null);
 });
 
+test('hasConnectivity: ok ⇒ true; non-ok / thrown / redirect ⇒ false (DOG-19)', async () => {
+  assert.equal(await hasConnectivity(fakeFetch(() => ({ ok: true, status: 200 }))), true);
+  assert.equal(await hasConnectivity(fakeFetch(() => ({ ok: false, status: 503 }))), false);
+  assert.equal(await hasConnectivity(fakeFetch(() => { throw new TypeError('redirect'); })), false);
+  assert.equal(await hasConnectivity(fakeFetch(() => { throw new Error('offline'); })), false);
+});
+
+test('hasConnectivity: requests the resolved URL with redirect:error (DOG-19)', async () => {
+  const f = fakeFetch(() => ({ ok: true, status: 200 }));
+  await hasConnectivity(f, CONNECTIVITY_URL);
+  assert.equal(f.calls[0].url, CONNECTIVITY_URL);
+  assert.equal(f.calls[0].opts.redirect, 'error');
+});
+
+test('connectivityUrl: loopback override honoured; non-loopback ignored with warn (DOG-19)', () => {
+  assert.equal(connectivityUrl({}).url, CONNECTIVITY_URL);
+  assert.equal(connectivityUrl({}).warn, null);
+  assert.equal(connectivityUrl({ WATCHDOG_CONNECTIVITY_URL: 'http://127.0.0.1:9/x' }).url, 'http://127.0.0.1:9/x');
+  const bad = connectivityUrl({ WATCHDOG_CONNECTIVITY_URL: 'https://evil.example/x' });
+  assert.equal(bad.url, CONNECTIVITY_URL);
+  assert.match(bad.warn, /non-loopback/);
+  const malformed = connectivityUrl({ WATCHDOG_CONNECTIVITY_URL: 'not a url' });
+  assert.equal(malformed.url, CONNECTIVITY_URL);
+  assert.match(malformed.warn, /non-loopback/);
+});
+
 test('suppressedByStatus only for major/critical', () => {
   assert.equal(suppressedByStatus('major'), true);
   assert.equal(suppressedByStatus('critical'), true);
@@ -692,8 +719,9 @@ test('tick: due outage event, status none ⇒ one outage resume, attempt persist
   assert.deepEqual(h.sent, [OUTAGE_RESUME_TEXT]);
   assert.equal(h.saved()[H].attempts, 1);
   assert.equal(h.saved()[H].status, 'resumed');
-  assert.equal(h.fetchImpl.calls.length, 1);
-  assert.equal(h.fetchImpl.calls[0].url, CLAUDE_URL);
+  assert.equal(h.fetchImpl.calls.length, 2);
+  assert.equal(h.fetchImpl.calls[0].url, CONNECTIVITY_URL);
+  assert.equal(h.fetchImpl.calls[1].url, CLAUDE_URL);
 });
 
 test('tick: a due Codex outage event fetches status.openai.com and sends the outage text', async () => {
@@ -702,8 +730,9 @@ test('tick: a due Codex outage event fetches status.openai.com and sends the out
   const h = harness({ tail: CODEX_TAIL, terminals: [TC], state: { term_codex: ev } });
   await tick({ dryRun: false }, h.deps);
   assert.deepEqual(h.sent, [OUTAGE_RESUME_TEXT]);
-  assert.equal(h.fetchImpl.calls.length, 1);
-  assert.match(h.fetchImpl.calls[0].url, /status\.openai\.com/);
+  assert.equal(h.fetchImpl.calls.length, 2);
+  assert.equal(h.fetchImpl.calls[0].url, CONNECTIVITY_URL);
+  assert.match(h.fetchImpl.calls[1].url, /status\.openai\.com/);
 });
 
 test('tick: status major suppresses without consuming an attempt', async () => {
@@ -715,13 +744,14 @@ test('tick: status major suppresses without consuming an attempt', async () => {
   assert.equal(h.saved()[H].status, 'waiting');
 });
 
-test('tick: limit events use the limit text and never touch the network', async () => {
+test('tick: limit events probe connectivity once, then send the limit text (DOG-19)', async () => {
   const st = { [H]: { ...LIMIT_EV, platform: 'claude', bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
     attempts: 0, lastAttemptAt: null, status: 'waiting' } };
   const h = harness({ tail: [...CLAUDE_BANNER, '? for shortcuts'], terminals: [T], state: st, indicator: 'major' });
   await tick({ dryRun: false }, h.deps);
   assert.deepEqual(h.sent, [RESUME_TEXT]);
-  assert.equal(h.fetchImpl.calls.length, 0);
+  assert.equal(h.fetchImpl.calls.length, 1);
+  assert.equal(h.fetchImpl.calls[0].url, CONNECTIVITY_URL);
 });
 
 test('tick: dry-run makes no sends and no network calls', async () => {
@@ -730,6 +760,35 @@ test('tick: dry-run makes no sends and no network calls', async () => {
   assert.deepEqual(h.sent, []);
   assert.equal(h.fetchImpl.calls.length, 0);
   assert.equal(h.saved(), null);
+});
+
+test('tick: offline holds all sends without spending an attempt (DOG-19)', async () => {
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });
+  h.deps.fetchImpl = fakeFetch(() => { throw new Error('offline'); });   // probe fails ⇒ offline
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.saved()[H].attempts, 0);
+  assert.equal(h.saved()[H].lastAttemptAt, null);
+  assert.equal(h.saved()[H].status, 'waiting');
+});
+
+test('tick: offline holds a due limit send too (DOG-19)', async () => {
+  const st = { [H]: { ...LIMIT_EV, platform: 'claude', bannerText: BANNER, detectedAt: NOW.toISOString(),
+    resetAt: NOW.toISOString(), attempts: 0, lastAttemptAt: null, status: 'waiting' } };
+  const h = harness({ tail: [...CLAUDE_BANNER, '? for shortcuts'], terminals: [T], state: st });
+  h.deps.fetchImpl = fakeFetch(() => { throw new Error('offline'); });
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.saved()[H].attempts, 0);
+  assert.equal(h.saved()[H].lastAttemptAt, null);
+  assert.equal(h.saved()[H].status, 'waiting');
+});
+
+test('tick: online probe runs once and permits the send (DOG-19)', async () => {
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });   // fake fetch is ok by default
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, [OUTAGE_RESUME_TEXT]);
+  assert.equal(h.fetchImpl.calls[0].url, CONNECTIVITY_URL);   // probe first
 });
 
 test('isInputOccupied: a ">" line with text after it is a user draft', () => {
@@ -873,6 +932,7 @@ test('tick: two due Claude outages share one status fetch and both send when sta
   const state = { ...seed(), [H2]: { ...seed()[H], handle: H2 } };
   const h = harness({ tail: OUTAGE_TAIL, terminals: [T, T2], state });
   await tick({ dryRun: false }, h.deps);
+  assert.equal(h.fetchImpl.calls.filter((c) => c.url === CONNECTIVITY_URL).length, 1);
   assert.equal(h.fetchImpl.calls.filter((c) => c.url === CLAUDE_URL).length, 1);
   assert.deepEqual(h.sent, [OUTAGE_RESUME_TEXT, OUTAGE_RESUME_TEXT]);
 });

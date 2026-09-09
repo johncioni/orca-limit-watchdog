@@ -342,6 +342,7 @@ const STATUS_URLS = Object.freeze({
   claude: 'https://status.claude.com/api/v2/status.json',
   codex: 'https://status.openai.com/api/v2/status.json',
 });
+export const CONNECTIVITY_URL = 'https://captive.apple.com/hotspot-detect.html';
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '[::1]', 'localhost']);
 
 // Resolve the status page for a platform. The env override exists for the E2E
@@ -355,6 +356,31 @@ export function statusUrlFor(platform, env = process.env) {
     if ((u.protocol === 'http:' || u.protocol === 'https:') && LOOPBACK_HOSTS.has(u.hostname)) return { url: override, warn: null };
   } catch { /* fall through */ }
   return { url, warn: `ignoring non-loopback status URL override for ${platform}` };
+}
+
+// Resolve the connectivity probe URL. An override is accepted only for a
+// loopback host (as statusUrlFor does), so the e2e loopback stub can drive it;
+// anything else is ignored with a warning and the default used.
+export function connectivityUrl(env = process.env) {
+  const override = env.WATCHDOG_CONNECTIVITY_URL;
+  if (!override) return { url: CONNECTIVITY_URL, warn: null };
+  try {
+    const u = new URL(override);
+    if ((u.protocol === 'http:' || u.protocol === 'https:') && LOOPBACK_HOSTS.has(u.hostname)) {
+      return { url: override, warn: null };
+    }
+  } catch { /* fall through */ }
+  return { url: CONNECTIVITY_URL, warn: 'ignoring non-loopback connectivity URL override' };
+}
+
+// True when a reachability probe succeeds. Fail-closed: any error, timeout,
+// non-ok status, or redirect ⇒ false. Reachability, not API-correctness — a
+// captive portal that redirects or fails TLS reads as offline (the safe answer).
+export async function hasConnectivity(fetchImpl = globalThis.fetch, url = CONNECTIVITY_URL) {
+  try {
+    const r = await fetchImpl(url, { redirect: 'error', signal: AbortSignal.timeout(3000) });
+    return r.ok === true;
+  } catch { return false; }
 }
 
 // Fetch a Statuspage indicator. Never throws: any failure is null (fail open).
@@ -501,6 +527,7 @@ export async function tick({ dryRun }, depsIn = {}) {
   }
 
   const indicators = new Map();   // platform → indicator, fetched at most once per tick
+  let online = null;              // connectivity, probed lazily once per real (non-dry-run) tick
   for (const key of sendCandidates) {
     const ev = events[key];
     const sch = SCHEDULE[ev.kind];
@@ -509,6 +536,12 @@ export async function tick({ dryRun }, depsIn = {}) {
       console.log(`would resume ${ev.handle} (${ev.kind}/${ev.platform}, attempt ${ev.attempts + 1})`);
       continue;
     }
+    if (online === null) {   // 0. connectivity gate: never resume while offline; probe once per real tick
+      const { url, warn } = connectivityUrl(deps.env);
+      if (warn) log('warn', warn);
+      online = await hasConnectivity(deps.fetchImpl, url);
+    }
+    if (!online) { log('debug', `held ${ev.handle}: offline`); continue; }
     if (ev.kind === 'outage') {   // 1. status gate (validateEvent guarantees a known platform)
       if (!indicators.has(ev.platform)) {
         const { url, warn } = statusUrlFor(ev.platform, deps.env);
