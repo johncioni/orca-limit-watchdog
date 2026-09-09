@@ -4,6 +4,7 @@ import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
 import { isShellPrompt, isInputOccupied } from './watchdog.mjs';
 import { statusUrlFor, fetchIndicator, suppressedByStatus } from './watchdog.mjs';
+import { CONNECTIVITY_URL, connectivityUrl, hasConnectivity } from './watchdog.mjs';
 import { tick, RESUME_TEXT } from './watchdog.mjs';
 
 const CLAUDE_BANNER = [
@@ -656,6 +657,32 @@ test('fetchIndicator returns null on non-200, bad JSON, missing field, or throw'
   assert.equal(await fetchIndicator(CLAUDE_URL, fakeFetch(() => ({ ok: true, status: 200, json: async () => { throw new SyntaxError('x'); } }))), null);
   assert.equal(await fetchIndicator(CLAUDE_URL, fakeFetch(() => okJson({ page: {} }))), null);
   assert.equal(await fetchIndicator(CLAUDE_URL, fakeFetch(() => { throw new TypeError('redirect'); })), null);
+});
+
+test('hasConnectivity: ok ⇒ true; non-ok / thrown / redirect ⇒ false (DOG-19)', async () => {
+  assert.equal(await hasConnectivity(fakeFetch(() => ({ ok: true, status: 200 }))), true);
+  assert.equal(await hasConnectivity(fakeFetch(() => ({ ok: false, status: 503 }))), false);
+  assert.equal(await hasConnectivity(fakeFetch(() => { throw new TypeError('redirect'); })), false);
+  assert.equal(await hasConnectivity(fakeFetch(() => { throw new Error('offline'); })), false);
+});
+
+test('hasConnectivity: requests the resolved URL with redirect:error (DOG-19)', async () => {
+  const f = fakeFetch(() => ({ ok: true, status: 200 }));
+  await hasConnectivity(f, CONNECTIVITY_URL);
+  assert.equal(f.calls[0].url, CONNECTIVITY_URL);
+  assert.equal(f.calls[0].opts.redirect, 'error');
+});
+
+test('connectivityUrl: loopback override honoured; non-loopback ignored with warn (DOG-19)', () => {
+  assert.equal(connectivityUrl({}).url, CONNECTIVITY_URL);
+  assert.equal(connectivityUrl({}).warn, null);
+  assert.equal(connectivityUrl({ WATCHDOG_CONNECTIVITY_URL: 'http://127.0.0.1:9/x' }).url, 'http://127.0.0.1:9/x');
+  const bad = connectivityUrl({ WATCHDOG_CONNECTIVITY_URL: 'https://evil.example/x' });
+  assert.equal(bad.url, CONNECTIVITY_URL);
+  assert.match(bad.warn, /non-loopback/);
+  const malformed = connectivityUrl({ WATCHDOG_CONNECTIVITY_URL: 'not a url' });
+  assert.equal(malformed.url, CONNECTIVITY_URL);
+  assert.match(malformed.warn, /non-loopback/);
 });
 
 test('suppressedByStatus only for major/critical', () => {
