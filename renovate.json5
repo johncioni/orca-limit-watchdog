@@ -1,0 +1,31 @@
+{
+  $schema: "https://docs.renovatebot.com/renovate-schema.json",
+
+  // Scope: only the SHA-pinned GitHub Actions in .github/workflows. The
+  // watchdog has no package.json dependencies (plain Node, no lockfile), so
+  // the npm manager has nothing to do; an explicit allow-list keeps it that
+  // way until someone deliberately widens it.
+  extends: ["config:recommended", ":semanticCommitTypeAll(chore)", "helpers:pinGitHubActionDigests"],
+  enabledManagers: ["github-actions"],
+
+  // 7-day soak, same as every other repo. "strict" is required, otherwise
+  // Renovate still creates the branch and only delays the PR.
+  minimumReleaseAge: "7 days",
+  internalChecksFilter: "strict",
+
+  schedule: ["* 0-6 * * 1"],
+  prConcurrentLimit: 3,
+  labels: ["dependencies"],
+
+  vulnerabilityAlerts: { minimumReleaseAge: null, schedule: null, labels: ["dependencies", "security"] },
+  osvVulnerabilityAlerts: true,
+
+  // No Dependency Dashboard issue; majors open as ordinary standalone PRs
+  // after a 14-day soak, same as the other repos (close the PR to decline).
+  dependencyDashboard: false,
+
+  packageRules: [
+    { matchManagers: ["github-actions"], groupName: "github actions" },
+    { matchUpdateTypes: ["major"], groupName: null, labels: ["dependencies", "major"], minimumReleaseAge: "14 days" },
+  ],
+}

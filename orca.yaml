@@ -1,0 +1,9 @@
+# Orca repo hooks (shared with everyone who opens this repo in Orca).
+# Supported keys: scripts.setup, scripts.archive, issueCommand.
+# Orca asks once to trust each script version (content hash) before running it.
+scripts:
+  setup: |
+    bash scripts/orca-setup.sh
+  archive: |
+    echo "Cleaning up $ORCA_WORKSPACE_NAME"
+issueCommand: Complete {{artifact_url}}

@@ -1,0 +1,12 @@
+# gitleaks config. Extends the default ruleset.
+#
+# IMPORTANT: gitleaks 8.x defaults multiple allowlist criteria to OR, so a block
+# with both `paths` and `regexes` allowlists EVERY finding in those paths.
+# `condition = "AND"` is required for the pair to mean "this value, in this
+# file" -- a real secret added to a test file must still fail the gate.
+#
+# No allowlists yet: the repo has no committed test secrets. The gitleaks
+# workflow reads this file from the PR's base commit, so a PR cannot widen its
+# own allowlist.
+[extend]
+useDefault = true

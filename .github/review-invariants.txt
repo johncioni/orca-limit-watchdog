@@ -1,0 +1,11 @@
+# Paths ineligible for the docs/test/size review skips (the opus-implementer
+# skip in ~/.agents/MODELS.md still applies). Bash glob; '*' spans '/'.
+# Keep in sync with CLAUDE.md "Review loop".
+watchdog.mjs
+install.sh
+uninstall.sh
+com.john.orca-limit-watchdog.plist
+orca.yaml
+scripts/orca-setup.sh
+.github/*
+CLAUDE.md
