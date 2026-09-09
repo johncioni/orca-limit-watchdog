@@ -569,7 +569,7 @@ function loadState() {
     const s = JSON.parse(text);
     if (s?.version !== 1 && s?.version !== 2) why = `unsupported version ${s?.version}`;
     else for (const [k, raw] of Object.entries(s.events ?? {})) {
-      const v = validateEvent(k, s.version === 1 ? { ...raw, kind: 'limit', platform: 'unknown' } : raw);
+      const v = validateEvent(k, { alertedAt: null, ...raw, ...(s.version === 1 ? { kind: 'limit', platform: 'unknown' } : {}) });
       if (v) { why = `${k}: ${v}`; break; }
     }
   } catch (e) { why = e.message; }
