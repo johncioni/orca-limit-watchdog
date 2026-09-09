@@ -191,6 +191,35 @@ test('start works with a restricted PATH and never invokes env lookup under laun
   } finally { h.cleanup(); }
 });
 
+test('start preserves an explicit stable Node symlink in the plist', async () => {
+  const h = harness();
+  try {
+    const symlinkPath = path.join(path.dirname(h.orca), 'stable-node');
+    fs.symlinkSync(process.execPath, symlinkPath);
+    await runCli(['start'], { ...h.env, ORCA_WATCHDOG_NODE: symlinkPath });
+    const plist = fs.readFileSync(path.join(h.home, 'Library', 'LaunchAgents', 'com.john.orca-limit-watchdog.plist'), 'utf8');
+    assert.ok(plist.includes(`<string>${symlinkPath}</string>`));
+    assert.ok(!plist.includes(`<string>${fs.realpathSync(symlinkPath)}</string>`));
+  } finally { h.cleanup(); }
+});
+
+for (const kind of ['missing', 'non-executable']) {
+  test(`${kind} Node override is an actionable start error and never registers`, async () => {
+    const h = harness();
+    try {
+      const nodePath = path.join(path.dirname(h.orca), 'invalid-node');
+      if (kind === 'non-executable') fs.writeFileSync(nodePath, '#!/bin/sh\n', { mode: 0o644 });
+      await assert.rejects(
+        runCli(['start'], { ...h.env, ORCA_WATCHDOG_NODE: nodePath }),
+        kind === 'missing' ? /Node.*not found.*absolute executable path/i : /Node.*not executable.*absolute executable path/i,
+      );
+      assert.equal(fs.existsSync(h.launchctlState), false);
+      const calls = fs.existsSync(h.launchctlLog) ? fs.readFileSync(h.launchctlLog, 'utf8') : '';
+      assert.doesNotMatch(calls, /bootstrap/);
+    } finally { h.cleanup(); }
+  });
+}
+
 test('missing Orca is an actionable start error and never registers', async () => {
   const h = harness();
   try {
