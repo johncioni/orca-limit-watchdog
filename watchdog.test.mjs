@@ -886,7 +886,7 @@ function harness({ tail, terminals, indicator = 'none', state = {}, now = at(10)
     throw new Error(`unexpected orca call ${args.join(' ')}`);
   };
   const fetchImpl = fakeFetch(() => okJson({ status: { indicator } }));
-  const deps = { orca, fetchImpl, env: {}, now: () => now, loadState: () => structuredClone(state), saveState: (e) => { saved = structuredClone(e); }, log: () => {} };
+  const deps = { orca, fetchImpl, env: {}, now: () => now, loadState: () => structuredClone(state), saveState: (e) => { saved = structuredClone(e); }, log: () => {}, reapChoices: () => 0 };
   return { deps, sent, orcaCalls, fetchImpl, saved: () => saved };
 }
 const T = { handle: H, connected: true, writable: true, agentIdentity: 'claude' };
@@ -946,7 +946,7 @@ test('tick: dry-run never spawns, persists, reads or clears choices (DOG-20)', a
   for (const choice of [null, ...['Continue', 'Wait 1h', 'Stop'].map((c) => choiceOf(c))]) {
     const h = alertHarness({ ev: LO({ alertedAt: choice ? NOW.toISOString() : null }), choice });
     const effects = [];
-    for (const dep of ['spawn', 'saveState', 'readChoice', 'clearChoice', 'fetchImpl']) h.deps[dep] = () => { effects.push(dep); throw new Error(dep); };
+    for (const dep of ['spawn', 'saveState', 'readChoice', 'clearChoice', 'reapChoices', 'fetchImpl']) h.deps[dep] = () => { effects.push(dep); throw new Error(dep); };
     await tick({ dryRun: true }, h.deps);
     assert.deepEqual(effects, []); assert.deepEqual(h.sent, []); assert.equal(h.saved(), null);
   }
@@ -984,6 +984,74 @@ test('tick: alert pass preserves unread and first-miss freezes (DOG-20)', async 
     await tick({ dryRun: false }, h.deps);
     assert.deepEqual(h.actions, ['save']); assert.equal(h.saved()[H].alertedAt, null);
   }
+});
+
+test('reapChoices: keeps exact live basenames and ignores non-json entries (DOG-21)', (t) => {
+  assert.equal(typeof watchdog.reapChoices, 'function');
+  const { dir } = alertFiles(t);
+  const choices = path.join(dir, 'choices');
+  fs.mkdirSync(choices);
+  for (const name of ['term_x.ep1.json', 'term_x.ep10.json', 'other.ep1.json', 'partial.tmp']) {
+    fs.writeFileSync(path.join(choices, name), '{}');
+  }
+  assert.equal(watchdog.reapChoices(new Set(['term_x.ep1.json']), dir), 2);
+  assert.deepEqual(fs.readdirSync(choices).sort(), ['partial.tmp', 'term_x.ep1.json']);
+});
+
+test('reapChoices: missing directory is inert; other read errors log debug (DOG-21)', (t) => {
+  assert.equal(typeof watchdog.reapChoices, 'function');
+  const { dir } = alertFiles(t); const logs = [];
+  const logger = (...args) => logs.push(args);
+  assert.equal(watchdog.reapChoices(new Set(), dir, logger), 0);
+  assert.deepEqual(logs, []);
+  fs.writeFileSync(path.join(dir, 'choices'), 'not a directory');
+  assert.equal(watchdog.reapChoices(new Set(), dir, logger), 0);
+  assert.equal(logs.length, 1); assert.equal(logs[0][0], 'debug');
+});
+
+test('reapChoices: unlink failure does not throw or count as reaped (DOG-21)', (t) => {
+  assert.equal(typeof watchdog.reapChoices, 'function');
+  const { dir } = alertFiles(t); const choices = path.join(dir, 'choices');
+  fs.mkdirSync(path.join(choices, 'blocked.json'), { recursive: true });
+  fs.writeFileSync(path.join(choices, 'orphan.json'), '{}');
+  assert.equal(watchdog.reapChoices(new Set(), dir), 1);
+  assert.deepEqual(fs.readdirSync(choices), ['blocked.json']);
+});
+
+test('tick: reaps reconciled orphans while retaining an unread live choice; dry-run is inert (DOG-21)', async (t) => {
+  const { dir } = alertFiles(t); const choices = path.join(dir, 'choices');
+  fs.mkdirSync(choices);
+  const live = `${H}.ep-1.json`; const orphan = 'term_absent.ep-old.json';
+  for (const name of [live, orphan]) fs.writeFileSync(path.join(choices, name), JSON.stringify(choiceOf('Continue')));
+  for (const dryRun of [true, false]) {
+    const ev = LO({ alertedAt: NOW.toISOString() });
+    const h = alertHarness({ ev, readThrows: true,
+      state: { [H]: ev, term_absent: { ...ev, handle: 'term_absent', episodeId: 'ep-old' } } });
+    h.deps.reapChoices = (names) => watchdog.reapChoices(names, dir);
+    await tick({ dryRun }, h.deps);
+    assert.equal(fs.existsSync(path.join(choices, live)), true);
+    assert.equal(fs.existsSync(path.join(choices, orphan)), dryRun);
+    assert.deepEqual(h.sent, []);
+  }
+});
+
+test('tick: reaper runs after consent consumption and errors do not block sends (DOG-21)', async () => {
+  const h = alertHarness({ ev: LO({ alertedAt: NOW.toISOString() }), choice: choiceOf('Stop') });
+  let reaped = false;
+  h.deps.reapChoices = (names) => {
+    assert.ok(h.actions.includes('clear'));
+    assert.deepEqual([...names], []);
+    reaped = true;
+  };
+  await tick({ dryRun: false }, h.deps);
+  assert.equal(reaped, true);
+  const due = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });
+  const logs = [];
+  due.deps.log = (level, msg) => logs.push(msg);
+  due.deps.reapChoices = async () => { throw new Error('reaper failed'); };
+  await tick({ dryRun: false }, due.deps);
+  assert.deepEqual(due.sent, [OUTAGE_RESUME_TEXT]);
+  assert.ok(logs.some((msg) => msg.includes('reaper failed')));
 });
 
 function alertFiles(t) {
@@ -1083,6 +1151,28 @@ test('choice deps: real per-episode reads/deletes are bounded and isolated (DOG-
   await watchdog.clearChoice('term_x', 'ep9', dir, logger);
   assert.ok(warnings.length >= 2);
 });
+test('loadState: v2 rejection names the normalized violation when alertedAt is omitted (DOG-21)', async (t) => {
+  const { dir } = alertFiles(t);
+  const stateDir = path.join(dir, '.local', 'state', 'orca-limit-watchdog');
+  fs.mkdirSync(stateDir, { recursive: true });
+  const ev = LO({ detectedAt: 'invalid-time' });
+  delete ev.alertedAt;
+  const text = JSON.stringify({ version: 2, events: { [H]: ev } });
+  assert.equal(parseStateFile(text), null);
+  fs.writeFileSync(path.join(stateDir, 'state.json'), text);
+  const { stdout } = await pExecFile(process.execPath,
+    [fileURLToPath(new URL('./watchdog.mjs', import.meta.url)), '--status'],
+    { env: { ...process.env, HOME: dir }, timeout: 2000 });
+  const logged = fs.readFileSync(path.join(stateDir, 'watchdog.log'), 'utf8');
+  assert.ok(logged.includes(`state file rejected (${H}: detectedAt: not a timestamp)`), logged);
+  assert.doesNotMatch(logged, /alertedAt:/);
+  assert.equal(fs.existsSync(path.join(stateDir, 'state.json')), false);
+  const backups = fs.readdirSync(stateDir).filter((name) => name.startsWith('state.json.bad-'));
+  assert.equal(backups.length, 1);
+  assert.equal(fs.readFileSync(path.join(stateDir, backups[0]), 'utf8'), text);
+  assert.equal(stdout.trim(), 'no active events');
+});
+
 test('--alert: missing env and mixed invocations exit without tick/lock/state/send (DOG-20)', async (t) => {
   const { dir } = alertFiles(t);
   const fakeOrca = path.join(dir, 'fake-orca'); const marker = path.join(dir, 'called');
@@ -1228,7 +1318,7 @@ test('tick: a throwing send is logged and the remaining candidates still send (D
   const state = { ...seed(), [H2]: { ...seed()[H], handle: H2 } };
   let saved = null;
   const deps = { orca, fetchImpl: fakeFetch(() => okJson({ status: { indicator: 'none' } })), env: {}, now: () => at(10),
-    loadState: () => structuredClone(state), saveState: (e) => { saved = structuredClone(e); }, log: (lvl, msg) => logged.push(`${lvl} ${msg}`) };
+    loadState: () => structuredClone(state), saveState: (e) => { saved = structuredClone(e); }, log: (lvl, msg) => logged.push(`${lvl} ${msg}`), reapChoices: () => 0 };
   await tick({ dryRun: false }, deps);
   assert.deepEqual(sent, [H2]);
   assert.equal(saved[H].attempts, 1, 'attempt was persisted before the failed send');
@@ -1245,7 +1335,7 @@ test('tick: multi-line orca errors are logged on one line (DOG-13)', async () =>
     throw new Error(`unexpected orca call ${args.join(' ')}`);
   };
   const deps = { orca, fetchImpl: fakeFetch(() => okJson({ status: { indicator: 'none' } })), env: {}, now: () => at(10),
-    loadState: () => seed(), saveState: () => {}, log: (lvl, msg) => logged.push(msg) };
+    loadState: () => seed(), saveState: () => {}, log: (lvl, msg) => logged.push(msg), reapChoices: () => 0 };
   await tick({ dryRun: false }, deps);
   const line = logged.find((m) => m.includes('not idle'));
   assert.ok(line, logged.join('\n'));
@@ -1267,7 +1357,7 @@ test('tick: terminal reads run with bounded concurrency, not one at a time (DOG-
     }
     throw new Error(`unexpected orca call ${args.join(' ')}`);
   };
-  const deps = { orca, fetchImpl: fakeFetch(() => okJson({})), env: {}, now: () => at(10), loadState: () => ({}), saveState: () => {}, log: () => {} };
+  const deps = { orca, fetchImpl: fakeFetch(() => okJson({})), env: {}, now: () => at(10), loadState: () => ({}), saveState: () => {}, log: () => {}, reapChoices: () => 0 };
   const started = Date.now();
   await tick({ dryRun: false }, deps);
   const elapsed = Date.now() - started;
