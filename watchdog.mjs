@@ -31,10 +31,12 @@ export const SCHEDULE = Object.freeze({
     resumeText: RESUME_TEXT }),
   outage: Object.freeze({ bufferMs: 0, retrySpacingMs: 30 * MIN, rearmMs: 10 * MIN, maxSends: 6, deadlineMs: 24 * 60 * MIN,
     initialDelayMs: 10 * MIN, resumeText: OUTAGE_RESUME_TEXT }),
+  'limit-open': Object.freeze({ bufferMs: 0, retrySpacingMs: 30 * MIN, rearmMs: 10 * MIN,
+    maxSends: 6, deadlineMs: 24 * 60 * MIN, resumeText: RESUME_TEXT }),
 });
 const KINDS = Object.keys(SCHEDULE);
 const PLATFORMS = ['claude', 'codex', 'unknown'];
-const STATUSES = ['waiting', 'resumed', 'gave_up'];
+const STATUSES = ['waiting', 'resumed', 'gave_up', 'awaiting-user', 'dismissed'];
 const GRACE_PAST_MS = 2 * 60 * MIN; // absolute time this recently past = already reset
 const TAIL_LINES = 15;
 const READ_BUDGET_MS = 3 * MIN;    // stop reading terminals before the 4-min tick deadline
@@ -191,13 +193,22 @@ export function validateEvent(key, ev) {
   if (!PLATFORMS.includes(ev.platform)) return `platform: ${ev.platform}`;
   if (ev.kind === 'outage' && ev.platform === 'unknown') return 'platform: outage requires a known platform';
   if (!STATUSES.includes(ev.status)) return `status: ${ev.status}`;
+  if (['awaiting-user', 'dismissed'].includes(ev.status) && ev.kind !== 'limit-open') return 'status: requires limit-open';
+  if (ev.kind === 'limit-open') {
+    if (ev.platform !== 'codex') return 'platform: limit-open requires codex';
+    if (typeof ev.episodeId !== 'string' || !ev.episodeId.trim()) return 'episodeId: required';
+    if (ev.status === 'awaiting-user' && ev.attempts !== 0) return 'attempts: awaiting-user requires zero';
+  } else if (ev.episodeId !== undefined) return 'episodeId: only legal for limit-open';
+  if (ev.alertedAt !== null && !isIso(ev.alertedAt)) return 'alertedAt: not null or a timestamp';
   if (typeof ev.bannerText !== 'string') return 'bannerText: not a string';
   if (!isIso(ev.detectedAt)) return 'detectedAt: not a timestamp';
   if (!isIso(ev.resetAt)) return 'resetAt: not a timestamp';
   const max = SCHEDULE[ev.kind].maxSends;
   if (!Number.isInteger(ev.attempts) || ev.attempts < 0 || ev.attempts > max) return `attempts: ${ev.attempts} (0..${max})`;
   if (ev.lastAttemptAt !== null && !isIso(ev.lastAttemptAt)) return 'lastAttemptAt: not null or a timestamp';
-  if (ev.lastAttemptAt === null && (ev.status !== 'waiting' || ev.attempts > 0)) return 'lastAttemptAt: required once an attempt was made';
+  const unsentStatus = ['waiting', 'awaiting-user', 'dismissed'].includes(ev.status)
+    || (ev.status === 'gave_up' && SCHEDULE[ev.kind].deadlineMs !== null);
+  if (ev.lastAttemptAt === null && (!unsentStatus || ev.attempts > 0)) return 'lastAttemptAt: required once an attempt was made';
   if (ev.clearedAt !== undefined && !isIso(ev.clearedAt)) return 'clearedAt: not a timestamp';
   return null;
 }
@@ -211,7 +222,7 @@ export function parseStateFile(text) {
   if (s.version !== 1 && s.version !== 2) return null;
   const events = {};
   for (const [key, raw] of Object.entries(s.events)) {
-    const ev = s.version === 1 ? { ...raw, kind: 'limit', platform: 'unknown' } : raw;
+    const ev = { alertedAt: null, ...raw, ...(s.version === 1 ? { kind: 'limit', platform: 'unknown' } : {}) };
     if (validateEvent(key, ev) !== null) return null;
     events[key] = ev;
   }

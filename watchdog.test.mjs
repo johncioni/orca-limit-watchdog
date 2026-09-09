@@ -310,7 +310,51 @@ const BANNER = 'Claude usage limit reached. | Your limit will reset at 3am.';
 
 const V1 = { handle: H, bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
   attempts: 1, lastAttemptAt: NOW.toISOString(), status: 'resumed' };
-const V2 = { ...V1, kind: 'limit', platform: 'unknown' };
+const V2 = { ...V1, kind: 'limit', platform: 'unknown', alertedAt: null };
+
+const LO = (over = {}) => ({ handle: H, kind: 'limit-open', platform: 'codex', bannerText: 'x',
+  detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(), attempts: 0, lastAttemptAt: null,
+  status: 'awaiting-user', alertedAt: null, episodeId: 'ep-1', ...over });
+
+test('validateEvent: well-formed limit-open accepted (DOG-20)', () => {
+  for (const status of ['awaiting-user', 'dismissed', 'waiting']) {
+    assert.equal(validateEvent(H, LO({ status })), null);
+  }
+  assert.equal(validateEvent(H, LO({ status: 'waiting', alertedAt: NOW.toISOString() })), null);
+});
+
+test('validateEvent: limit-open rejections (DOG-20)', () => {
+  for (const [field, over] of [['platform', { platform: 'claude' }], ['episodeId', { episodeId: '' }],
+    ['episodeId', { episodeId: undefined }], ['alertedAt', { alertedAt: 'nope' }],
+    ['attempts|lastAttemptAt', { attempts: 1 }], ['attempts', { attempts: 1, lastAttemptAt: NOW.toISOString() }]]) {
+    assert.match(validateEvent(H, LO(over)), new RegExp(field));
+  }
+});
+
+test('validateEvent: awaiting-user/dismissed and episodeId illegal for limit/outage (DOG-20)', () => {
+  for (const kind of ['limit', 'outage']) {
+    for (const status of ['awaiting-user', 'dismissed']) {
+      assert.match(validateEvent(H, { ...V2, kind, platform: 'claude', status }), /status/);
+    }
+    assert.match(validateEvent(H, { ...V2, kind, platform: 'claude', episodeId: 'ep1' }), /episodeId/);
+  }
+});
+
+test('validateEvent: zero-attempt gave_up accepted for deadline-bearing kinds (DOG-20)', () => {
+  assert.equal(validateEvent(H, LO({ kind: 'outage', platform: 'claude', episodeId: undefined, status: 'gave_up' })), null);
+  assert.equal(validateEvent(H, LO({ status: 'gave_up' })), null);
+  assert.match(validateEvent(H, { ...V2, attempts: 0, lastAttemptAt: null, status: 'gave_up' }), /lastAttemptAt/);
+});
+
+test('parseStateFile: legacy events normalise alertedAt and mix with limit-open (DOG-20)', () => {
+  const { alertedAt, ...legacy } = V2;
+  for (const events of [{ [H]: legacy }, { [H]: legacy, term_new: LO({ handle: 'term_new' }) }]) {
+    const parsed = parseStateFile(JSON.stringify({ version: 2, events }));
+    assert.ok(parsed);
+    assert.equal(parsed[H].alertedAt, null);
+    assert.deepEqual(parseStateFile(JSON.stringify({ version: 2, events: parsed })), parsed);
+  }
+});
 
 test('schedule table matches the spec', () => {
   assert.deepEqual(SCHEDULE.limit, { bufferMs: min(2), retrySpacingMs: min(30), rearmMs: min(10), maxSends: 3, deadlineMs: null,
@@ -494,7 +538,7 @@ test('reconcile: the banner coming back clears clearedAt and keeps the attempt c
 
 test('validateEvent accepts clearedAt absent or ISO, rejects garbage', () => {
   const base = { handle: H, kind: 'limit', platform: 'claude', bannerText: BANNER, detectedAt: at(0).toISOString(), resetAt: at(0).toISOString(),
-    attempts: 0, lastAttemptAt: null, status: 'waiting' };
+    attempts: 0, lastAttemptAt: null, status: 'waiting', alertedAt: null };
   assert.equal(validateEvent(H, base), null);
   assert.equal(validateEvent(H, { ...base, clearedAt: at(1).toISOString() }), null);
   assert.match(validateEvent(H, { ...base, clearedAt: 'soon' }), /clearedAt/);
