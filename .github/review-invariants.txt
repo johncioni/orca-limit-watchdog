@@ -4,7 +4,6 @@
 watchdog.mjs
 install.sh
 uninstall.sh
-com.john.orca-limit-watchdog.plist
 orca.yaml
 scripts/orca-setup.sh
 .github/*

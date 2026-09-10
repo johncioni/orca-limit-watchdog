@@ -5,7 +5,7 @@ agents read `AGENTS.md`, which is a symlink to this file. Keep it that way.
 
 ## Project snapshot
 
-**orca-limit-watchdog** is a macOS launchd daemon (`watchdog.mjs`, plain Node,
+**orca-watchdog** is a macOS launchd daemon (`watchdog.mjs`, plain Node,
 no dependencies) that watches every connected Orca terminal for a stalled
 agent TUI and sends a resume prompt when it is safe to:
 
@@ -19,7 +19,7 @@ Installed by `install.sh` (writes the plist, `launchctl bootstrap`), removed by
 `uninstall.sh`. Kill switch lives under `~/.local/state`. See `README.md` for
 run/status flags.
 
-Names: GitHub repo `orca-limit-watchdog`; Orca repo card **Orca Watchdog**;
+Names: GitHub repo `orca-watchdog`; Orca repo card **Orca Watchdog**;
 Linear team **Orca Watchdog**, key `DOG`, workspace `johncioni`.
 
 ## Working agreement
@@ -37,7 +37,7 @@ Linear team **Orca Watchdog**, key `DOG`, workspace `johncioni`.
   when: (a) **only he can act** — Orca app repo settings or hook-trust prompts,
   launchd on his machine, anything needing his credentials; (b) the action is
   **destructive** — `uninstall.sh`, `launchctl bootout`, deleting or
-  rewriting `~/.local/state/orca-limit-watchdog/*`; (c) it's
+  rewriting `~/.local/state/orca-watchdog/*`; (c) it's
   **outward-facing** — any `orca terminal send` to a live agent terminal
   (that is the watchdog's entire blast radius: a bad send lands in every
   session); or (d) there's a **genuine decision or ambiguity** — scope,
@@ -129,4 +129,4 @@ the work across sessions.
   PR merges, run `install.sh` from the main checkout (launchd caches the
   plist). Never run `install.sh` from a feature worktree: it would repoint the
   live LaunchAgent at an unmerged, disposable checkout. `--status` shows
-  stored events, not service health; check `launchctl print gui/$(id -u)/com.john.orca-limit-watchdog`.
+  stored events, not service health; check `launchctl print gui/$(id -u)/com.john.orca-watchdog`.

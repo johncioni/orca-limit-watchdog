@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 
 import { RELEASE_FILES, RUNTIME_ROOT, VERSION, validateReleaseRoot } from '../lib/management.mjs';
 
-export const NAME = 'orca-limit-watchdog';
+export const NAME = 'orca-watchdog';
 // Fixed so the archive bytes depend only on file contents, not build time.
 const RELEASE_MTIME = 1577836800; // 2020-01-01T00:00:00Z
 const BLOCK = 512;

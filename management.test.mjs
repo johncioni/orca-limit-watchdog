@@ -8,7 +8,7 @@ import path from 'node:path';
 
 const pExecFile = promisify(execFile);
 const ROOT = process.cwd();
-const CLI = path.join(ROOT, 'bin', 'orca-limit-watchdog.mjs');
+const CLI = path.join(ROOT, 'bin', 'orca-watchdog.mjs');
 
 async function loadManagement() {
   return import('./lib/management.mjs');
@@ -118,12 +118,12 @@ test('public CLI help/version do not inspect terminals and unknown args fail clo
   const h = harness();
   try {
     const noArgs = await runCli([], h.env);
-    assert.match(noArgs.stdout, /Usage: orca-limit-watchdog/);
+    assert.match(noArgs.stdout, /Usage: orca-watchdog/);
     const help = await runCli(['--help'], h.env);
     assert.match(help.stdout, /doctor.*start.*stop/s);
     const { VERSION } = await loadManagement();
     const version = await runCli(['--version'], h.env);
-    assert.equal(version.stdout.trim(), `orca-limit-watchdog ${VERSION}`);
+    assert.equal(version.stdout.trim(), `orca-watchdog ${VERSION}`);
     await assert.rejects(runCli(['--bogus'], h.env), (error) => {
       assert.equal(error.code, 2);
       assert.match(error.stderr, /unknown command.*--bogus/i);
@@ -153,7 +153,7 @@ test('start resolves absolute paths, validates a real plist, and repeat start do
   try {
     const first = await runCli(['start'], h.env);
     assert.match(first.stdout, /started/);
-    const plist = path.join(h.home, 'Library', 'LaunchAgents', 'com.john.orca-limit-watchdog.plist');
+    const plist = path.join(h.home, 'Library', 'LaunchAgents', 'com.john.orca-watchdog.plist');
     await pExecFile('/usr/bin/plutil', ['-lint', plist]);
     const xml = fs.readFileSync(plist, 'utf8');
     assert.match(xml, new RegExp(process.execPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
@@ -186,7 +186,7 @@ test('start works with a restricted PATH and never invokes env lookup under laun
   const h = harness();
   try {
     await runCli(['start'], { ...h.env, PATH: '/empty' });
-    const plist = fs.readFileSync(path.join(h.home, 'Library', 'LaunchAgents', 'com.john.orca-limit-watchdog.plist'), 'utf8');
+    const plist = fs.readFileSync(path.join(h.home, 'Library', 'LaunchAgents', 'com.john.orca-watchdog.plist'), 'utf8');
     assert.match(plist, new RegExp(`<string>${process.execPath.replace(/&/g, '&amp;')}</string>`));
     assert.match(plist, /<key>PATH<\/key>\s*<string>\/usr\/bin:\/bin<\/string>/);
   } finally { h.cleanup(); }
@@ -198,7 +198,7 @@ test('start preserves an explicit stable Node symlink in the plist', async () =>
     const symlinkPath = path.join(path.dirname(h.orca), 'stable-node');
     fs.symlinkSync(process.execPath, symlinkPath);
     await runCli(['start'], { ...h.env, ORCA_WATCHDOG_NODE: symlinkPath });
-    const plist = fs.readFileSync(path.join(h.home, 'Library', 'LaunchAgents', 'com.john.orca-limit-watchdog.plist'), 'utf8');
+    const plist = fs.readFileSync(path.join(h.home, 'Library', 'LaunchAgents', 'com.john.orca-watchdog.plist'), 'utf8');
     assert.ok(plist.includes(`<string>${symlinkPath}</string>`));
     assert.ok(!plist.includes(`<string>${fs.realpathSync(symlinkPath)}</string>`));
   } finally { h.cleanup(); }
@@ -237,11 +237,11 @@ test('archive install is stopped and repeatable; upgrade requires stop and faile
     const v1 = releaseCopy(h.base, '0.1.0');
     const first = await runInstall(v1, [], h.env);
     assert.match(first.stdout, /installed 0\.1\.0.*stopped/s);
-    const share = path.join(h.home, '.local', 'share', 'orca-limit-watchdog');
+    const share = path.join(h.home, '.local', 'share', 'orca-watchdog');
     const current = path.join(share, 'current');
-    const command = path.join(h.home, '.local', 'bin', 'orca-limit-watchdog');
+    const command = path.join(h.home, '.local', 'bin', 'orca-watchdog');
     assert.equal(fs.readlinkSync(current), '0.1.0');
-    assert.equal(fs.realpathSync(command), fs.realpathSync(path.join(share, '0.1.0', 'bin', 'orca-limit-watchdog')));
+    assert.equal(fs.realpathSync(command), fs.realpathSync(path.join(share, '0.1.0', 'bin', 'orca-watchdog')));
     await runInstall(v1, [], h.env);
     assert.equal(fs.readlinkSync(current), '0.1.0');
     const launchCalls = fs.readFileSync(h.launchctlLog, 'utf8');
@@ -299,11 +299,11 @@ test('install that throws at the command-link step leaves current unchanged (DOG
     const { installRelease } = await loadManagement();
     const v1 = releaseCopy(h.base, '0.1.0');
     installRelease({ sourceRoot: v1, version: '0.1.0', env: h.env });
-    const share = path.join(h.home, '.local', 'share', 'orca-limit-watchdog');
+    const share = path.join(h.home, '.local', 'share', 'orca-watchdog');
     const current = path.join(share, 'current');
     assert.equal(fs.readlinkSync(current), '0.1.0');
     // Put a regular file where the command symlink lives so the command-link step throws.
-    const commandLink = path.join(h.home, '.local', 'bin', 'orca-limit-watchdog');
+    const commandLink = path.join(h.home, '.local', 'bin', 'orca-watchdog');
     fs.rmSync(commandLink);
     fs.writeFileSync(commandLink, 'not a symlink');
     const v2 = releaseCopy(h.base, '0.2.0');
@@ -315,16 +315,16 @@ test('install that throws at the command-link step leaves current unchanged (DOG
 test('stopped legacy registration migrates on start without duplicate registration', async () => {
   const h = harness('wd migrate ');
   try {
-    const oldPlist = path.join(h.home, 'Library', 'LaunchAgents', 'com.john.orca-limit-watchdog.plist');
+    const oldPlist = path.join(h.home, 'Library', 'LaunchAgents', 'com.john.orca-watchdog.plist');
     fs.mkdirSync(path.dirname(oldPlist), { recursive: true });
     fs.writeFileSync(oldPlist, '<plist><string>/old/disposable/worktree/watchdog.mjs</string></plist>');
     const release = releaseCopy(h.base, '0.1.0');
     await runInstall(release, [], h.env);
-    const command = path.join(h.home, '.local', 'bin', 'orca-limit-watchdog');
+    const command = path.join(h.home, '.local', 'bin', 'orca-watchdog');
     await pExecFile(command, ['start'], { env: h.env });
     const migrated = fs.readFileSync(oldPlist, 'utf8');
     assert.doesNotMatch(migrated, /old\/disposable/);
-    assert.match(migrated, /\.local\/share\/orca-limit-watchdog\/0\.1\.0\/watchdog\.mjs/);
+    assert.match(migrated, /\.local\/share\/orca-watchdog\/0\.1\.0\/watchdog\.mjs/);
     const calls = fs.readFileSync(h.launchctlLog, 'utf8').trim().split('\n');
     assert.equal(calls.filter((line) => line.startsWith('bootstrap ')).length, 1);
   } finally { h.cleanup(); }
@@ -335,7 +335,7 @@ test('uninstall requires a stopped service and retains event state and pause', a
   try {
     const release = releaseCopy(h.base, '0.1.0');
     await runInstall(release, [], h.env);
-    const stateDir = path.join(h.home, '.local', 'state', 'orca-limit-watchdog');
+    const stateDir = path.join(h.home, '.local', 'state', 'orca-watchdog');
     fs.mkdirSync(stateDir, { recursive: true });
     fs.writeFileSync(path.join(stateDir, 'state.json'), '{"version":2,"events":{}}\n');
     fs.writeFileSync(path.join(stateDir, 'disabled'), '');
@@ -344,12 +344,12 @@ test('uninstall requires a stopped service and retains event state and pause', a
       pExecFile('/bin/bash', [path.join(release, 'uninstall.sh')], { env: h.env }),
       /stop.*before.*uninstall/i,
     );
-    assert.equal(fs.existsSync(path.join(h.home, '.local', 'share', 'orca-limit-watchdog')), true);
+    assert.equal(fs.existsSync(path.join(h.home, '.local', 'share', 'orca-watchdog')), true);
     fs.rmSync(h.launchctlState);
     const removed = await pExecFile('/bin/bash', [path.join(release, 'uninstall.sh')], { env: h.env });
     assert.match(removed.stdout, /uninstalled.*state retained/i);
-    assert.equal(fs.existsSync(path.join(h.home, '.local', 'share', 'orca-limit-watchdog')), false);
-    assert.equal(fs.existsSync(path.join(h.home, '.local', 'bin', 'orca-limit-watchdog')), false);
+    assert.equal(fs.existsSync(path.join(h.home, '.local', 'share', 'orca-watchdog')), false);
+    assert.equal(fs.existsSync(path.join(h.home, '.local', 'bin', 'orca-watchdog')), false);
     assert.equal(fs.existsSync(path.join(stateDir, 'state.json')), true);
     assert.equal(fs.existsSync(path.join(stateDir, 'disabled')), true);
   } finally { h.cleanup(); }
@@ -364,6 +364,6 @@ test('installer and uninstaller reject unknown arguments before mutation', async
       pExecFile('/bin/bash', [path.join(release, 'uninstall.sh'), '--wat'], { env: h.env }),
       /unknown argument.*--wat/i,
     );
-    assert.equal(fs.existsSync(path.join(h.home, '.local', 'share', 'orca-limit-watchdog')), false);
+    assert.equal(fs.existsSync(path.join(h.home, '.local', 'share', 'orca-watchdog')), false);
   } finally { h.cleanup(); }
 });

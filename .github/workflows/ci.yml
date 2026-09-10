@@ -40,20 +40,18 @@ jobs:
           node --check watchdog.mjs
           node --check version.mjs
           node --check lib/management.mjs
-          node --check bin/orca-limit-watchdog.mjs
+          node --check bin/orca-watchdog.mjs
           node --check scripts/install-archive.mjs
           node --check scripts/uninstall-archive.mjs
           node --check scripts/build-release.mjs
-          bash -n bin/orca-limit-watchdog
+          bash -n bin/orca-watchdog
           bash -n install.sh
           bash -n uninstall.sh
           bash -n scripts/orca-setup.sh
-      - name: Validate launchd plist
-        run: plutil -lint com.john.orca-limit-watchdog.plist
       - name: Build release archive (smoke)
         run: |
           node scripts/build-release.mjs
-          cd dist && shasum -a 256 -c orca-limit-watchdog-*.tar.gz.sha256
+          cd dist && shasum -a 256 -c orca-watchdog-*.tar.gz.sha256
 
   # Required status check. Stays green only when every matrix leg passes, so the
   # `ci` context that branch protection requires keeps reporting under one name.

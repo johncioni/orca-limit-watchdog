@@ -5,7 +5,7 @@ macOS that watches your connected [Orca](https://orca.dev) terminals for a
 stalled agent TUI and sends a one-line resume prompt when — and only when — it
 is safe to. Zero AI, zero tokens: it does its job precisely when the agent
 subscriptions it watches are exhausted. (The installed command is
-`orca-limit-watchdog`.)
+`orca-watchdog`.)
 
 It handles these conditions:
 
@@ -43,33 +43,33 @@ On newer Homebrew, first trust the third-party tap with `brew trust johncioni/ta
 (or approve interactively) before installing:
 
 ```bash
-brew install johncioni/tap/orca-limit-watchdog
+brew install johncioni/tap/orca-watchdog
 ```
 
 ### Archive
 
 Download the release archive and its checksum from the
-[releases page](https://github.com/johncioni/orca-limit-watchdog/releases),
+[releases page](https://github.com/johncioni/orca-watchdog/releases),
 verify it, then run the bundled installer:
 
 ```bash
 # from the download directory, with the .tar.gz and .sha256 side by side:
-shasum -a 256 -c orca-limit-watchdog-0.1.0.tar.gz.sha256   # verify the download
-tar xzf orca-limit-watchdog-0.1.0.tar.gz
-cd orca-limit-watchdog-0.1.0
+shasum -a 256 -c orca-watchdog-0.1.0.tar.gz.sha256   # verify the download
+tar xzf orca-watchdog-0.1.0.tar.gz
+cd orca-watchdog-0.1.0
 ./install.sh
 ```
 
 The archive installs a versioned copy under
-`~/.local/share/orca-limit-watchdog/<version>/` and links the command into
-`~/.local/bin/orca-limit-watchdog` (make sure `~/.local/bin` is on your `PATH`).
+`~/.local/share/orca-watchdog/<version>/` and links the command into
+`~/.local/bin/orca-watchdog` (make sure `~/.local/bin` is on your `PATH`).
 
 ## First run
 
 ```bash
-orca-limit-watchdog doctor   # confirm macOS, Node, Orca, and launchd state
-orca-limit-watchdog start    # validate, then register the LaunchAgent
-orca-limit-watchdog status   # service health, pause state, active events
+orca-watchdog doctor   # confirm macOS, Node, Orca, and launchd state
+orca-watchdog start    # validate, then register the LaunchAgent
+orca-watchdog status   # service health, pause state, active events
 ```
 
 Once started, `launchd` runs the watchdog every 5 minutes.
@@ -77,14 +77,14 @@ Once started, `launchd` runs the watchdog every 5 minutes.
 ## Operate
 
 ```bash
-orca-limit-watchdog status     # service / pause / events, reported separately
-orca-limit-watchdog pause      # stop acting without unregistering or losing state
-orca-limit-watchdog resume     # re-enable
-orca-limit-watchdog --dry-run  # run one observation-only tick; never sends input
-orca-limit-watchdog stop       # unregister the LaunchAgent (state is retained)
+orca-watchdog status     # service / pause / events, reported separately
+orca-watchdog pause      # stop acting without unregistering or losing state
+orca-watchdog resume     # re-enable
+orca-watchdog --dry-run  # run one observation-only tick; never sends input
+orca-watchdog stop       # unregister the LaunchAgent (state is retained)
 ```
 
-Logs and state live under `~/.local/state/orca-limit-watchdog/`:
+Logs and state live under `~/.local/state/orca-watchdog/`:
 `watchdog.log` (activity), `launchd.out.log` / `launchd.err.log` (service
 output), `state.json` (tracked events), and `disabled` (present while paused).
 
@@ -93,26 +93,26 @@ output), `state.json` (tracked events), and `disabled` (present while paused).
 **Homebrew:**
 
 ```bash
-orca-limit-watchdog stop
-brew upgrade johncioni/tap/orca-limit-watchdog
-orca-limit-watchdog doctor && orca-limit-watchdog start
+orca-watchdog stop
+brew upgrade johncioni/tap/orca-watchdog
+orca-watchdog doctor && orca-watchdog start
 ```
 
 **Archive:** stop, install the new archive (it keeps the previous version for
 rollback), then start again:
 
 ```bash
-orca-limit-watchdog stop
-cd orca-limit-watchdog-<new-version> && ./install.sh
-orca-limit-watchdog doctor && orca-limit-watchdog start
+orca-watchdog stop
+cd orca-watchdog-<new-version> && ./install.sh
+orca-watchdog doctor && orca-watchdog start
 ```
 
 If a new version misbehaves, roll back to the previous one and start:
 
 ```bash
-orca-limit-watchdog stop
+orca-watchdog stop
 ./install.sh --rollback
-orca-limit-watchdog start
+orca-watchdog start
 ```
 
 Your pause state and tracked events are preserved across updates.
@@ -122,24 +122,24 @@ version to back up and reset a state file containing the new event kind.
 ## Remove
 
 ```bash
-orca-limit-watchdog stop
-brew uninstall johncioni/tap/orca-limit-watchdog   # Homebrew
+orca-watchdog stop
+brew uninstall johncioni/tap/orca-watchdog   # Homebrew
 ./uninstall.sh                                      # archive
 ```
 
 Removal unregisters the service and deletes the installed copy but **retains
-your state** at `~/.local/state/orca-limit-watchdog/`. Delete that directory by
+your state** at `~/.local/state/orca-watchdog/`. Delete that directory by
 hand if you want a clean slate.
 
 ## Troubleshooting
 
-- **`orca-limit-watchdog doctor`** is the first stop: it reports macOS, Node,
+- **`orca-watchdog doctor`** is the first stop: it reports macOS, Node,
   Orca CLI, launchd registration, pause, and event state, and exits non-zero if
   anything required is missing.
 - **`orca` not found under launchd?** launchd runs with a minimal `PATH`. The
   watchdog resolves absolute paths to Node and Orca when you `start`, so start it
   from a shell where `orca` resolves, or set `ORCA_CLI` to an absolute path.
-- **Nothing happens on a stalled terminal?** Run `orca-limit-watchdog --dry-run`
+- **Nothing happens on a stalled terminal?** Run `orca-watchdog --dry-run`
   to see what the current tick observes, and check `watchdog.log`.
 
 ## How it works
@@ -173,7 +173,7 @@ your choice. **Wait 1h** delays the first retry by an hour, with the same
 24-hour cap from your choice; offline time counts toward that cap. **Stop**
 suppresses retries until the banner is confirmed gone, even if its wording or
 reset time changes. No click means no send. Choices are stored per terminal
-and episode under `~/.local/state/orca-limit-watchdog/choices/` and deleted
+and episode under `~/.local/state/orca-watchdog/choices/` and deleted
 after consumption. This alert is Codex-only; dry-run never opens it or consumes
 a choice.
 
