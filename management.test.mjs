@@ -537,3 +537,18 @@ test('doctor keeps the runtime-missing diagnosis (not a filesystem error) when t
     assert.doesNotMatch(r.stdout, /event state: error/, `${r.stdout}${r.stderr}`);
   } finally { h.cleanup(); }
 });
+
+test('doctor does not hang on a FIFO state.json and reports it as unreadable (DOG-30)', async () => {
+  if (process.platform === 'win32') return;
+  const h = harness('wd fifo doctor ');
+  try {
+    const { doctorText, installPaths } = await loadManagement();
+    const paths = installPaths(h.home);
+    fs.mkdirSync(paths.stateDir, { recursive: true });
+    assert.equal(spawnSync('mkfifo', [paths.stateFile]).status, 0);
+    const start = Date.now();   // a blocking read would hang this in-process call
+    const result = doctorText({ env: h.env });
+    assert.ok(Date.now() - start < 2000, 'doctor blocked on a FIFO state.json');
+    assert.match(result.text, /event state: error/);
+  } finally { h.cleanup(); }
+});

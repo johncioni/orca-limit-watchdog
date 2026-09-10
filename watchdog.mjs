@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { runObservedCheck, atomicWriteFile } from './lib/operations.mjs';
+import { runObservedCheck, atomicWriteFile, readRegularSync } from './lib/operations.mjs';
 import { appendActivity, maintainLogs } from './lib/logs.mjs';
 
 export const RESUME_TEXT = 'Session rate limit has reset. Resume where you left off.';
@@ -613,7 +613,7 @@ export async function orca(args, execImpl = pExecFile) {
 
 function loadState() {
   let text;
-  try { text = fs.readFileSync(STATE_FILE, 'utf8'); } catch (e) {
+  try { text = readRegularSync(STATE_FILE); } catch (e) {
     if (e.code === 'ENOENT') return {};
     log('warn', `state file unreadable (${e.message}); reset`);
     return {};
@@ -927,7 +927,7 @@ async function main() {
   if (parsed.action === 'help') { process.stdout.write(USAGE); return; }
   if (parsed.action === 'status') {
     let events;
-    try { events = parseStateFile(fs.readFileSync(STATE_FILE, 'utf8')); }
+    try { events = parseStateFile(readRegularSync(STATE_FILE)); }
     catch (e) {
       if (e.code === 'ENOENT') events = {};
       else { console.log('event state: unknown (unreadable; run orca-watchdog doctor)'); return; }
@@ -950,7 +950,7 @@ async function main() {
   const deadline = setTimeout(() => { tickLog('error', 'tick deadline (4 min) exceeded'); process.exit(1); }, 4 * MIN);
   try {
     await runObservedCheck({ stateDir: STATE_DIR, dryRun, tick, deps: { log: tickLog,
-      ...(dryRun ? { loadState: () => { try { return parseStateFile(fs.readFileSync(STATE_FILE, 'utf8')) ?? {}; } catch { return {}; } } } : {}) } });
+      ...(dryRun ? { loadState: () => { try { return parseStateFile(readRegularSync(STATE_FILE)) ?? {}; } catch { return {}; } } } : {}) } });
   } catch (e) {
     tickLog('error', `tick failed: ${sanitize(e.message)}`);
   } finally {

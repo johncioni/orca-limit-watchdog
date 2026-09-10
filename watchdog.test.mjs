@@ -1013,6 +1013,29 @@ test('watchdog --status degrades gracefully when state.json is unreadable (not E
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
+test('watchdog --status and a tick do not hang on a FIFO state.json (DOG-30)', () => {
+  if (process.platform === 'win32') return;
+  for (const arg of ['--status', '--once']) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-fifo-'));
+    try {
+      const stateDir = path.join(home, '.local', 'state', 'orca-watchdog');
+      fs.mkdirSync(stateDir, { recursive: true });
+      const mk = spawnSync('mkfifo', [path.join(stateDir, 'state.json')]);
+      assert.equal(mk.status, 0, `mkfifo failed: ${mk.stderr}`);
+      const env = { ...process.env, HOME: home };
+      if (arg === '--once') {   // a fake orca so the tick runs to completion
+        const orca = path.join(home, 'fake-orca');
+        fs.writeFileSync(orca, '#!/bin/sh\nprintf \'%s\\n\' \'{"ok":true,"result":{"terminals":[]}}\'\n', { mode: 0o755 });
+        env.ORCA_CLI = orca;
+      }
+      // A plain readFileSync(O_RDONLY) blocks on a reader-less FIFO; a hang shows as a kill signal.
+      const r = spawnSync(process.execPath, ['watchdog.mjs', arg], { env, encoding: 'utf8', timeout: 5000 });
+      assert.equal(r.signal, null, `${arg} blocked on a FIFO state.json (killed by timeout)`);
+      assert.equal(r.status, 0, `${arg} stderr: ${r.stderr}`);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  }
+});
+
 function alertHarness({ ev = LO(), choice = null, ...options } = {}) {
   const h = harness({ tail: OPEN_TAIL, terminals: [{ ...T, agentIdentity: 'codex' }], state: { [H]: ev }, now: NOW, ...options });
   const actions = [];
