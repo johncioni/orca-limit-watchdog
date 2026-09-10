@@ -17,7 +17,13 @@ class OrcaWatchdog < Formula
   depends_on "node"
 
   def install
-    libexec.install Dir["*"]
+    # Shell completions and the man page go to their standard locations.
+    bash_completion.install "completions/orca-watchdog.bash"
+    zsh_completion.install "completions/_orca-watchdog"
+    fish_completion.install "completions/orca-watchdog.fish"
+    man1.install "man/orca-watchdog.1"
+    # Everything else (the runtime) lives under libexec.
+    libexec.install Dir["*"] - ["completions", "man"]
     # Wrap the bundled launcher so it always runs on Homebrew's Node.
     (bin/"orca-watchdog").write_env_script libexec/"bin/orca-watchdog",
       ORCA_WATCHDOG_NODE: formula_opt_bin("node")/"node"
