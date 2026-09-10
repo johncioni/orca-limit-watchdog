@@ -47,6 +47,55 @@ test('retention bounds bytes and lines, handles Unicode and huge lines, preserve
     assert.equal(fs.statSync(file).mode & 0o777, 0o600);
   }
 });
+test('maintainLogs bounds only the named log; the finally pass spares launchd stdout/stderr until the next start pass (DOG-29 #11)', t => {
+  const dir = fixture(t);
+  const big = ('x\n').repeat(600_000);   // 1.2MB > THRESHOLD, many lines
+  for (const name of Object.values(logs.LOG_FILES)) fs.writeFileSync(path.join(dir, name), big, { mode: 0o600 });
+  // The per-tick finally pass targets only the activity log (the sole log a tick appends to).
+  logs.maintainLogs(dir, 'activity');
+  assert.ok(fs.statSync(path.join(dir, logs.LOG_FILES.activity)).size <= 500_000, 'activity is trimmed');
+  assert.equal(fs.statSync(path.join(dir, logs.LOG_FILES.stdout)).size, big.length, 'launchd stdout untouched');
+  assert.equal(fs.statSync(path.join(dir, logs.LOG_FILES.stderr)).size, big.length, 'launchd stderr untouched');
+  // The unfiltered start pass still bounds all three.
+  logs.maintainLogs(dir);
+  for (const name of Object.values(logs.LOG_FILES)) assert.ok(fs.statSync(path.join(dir, name)).size <= 500_000);
+});
+test('appendActivity creates a 0600 log, accumulates appends, and refuses symlink/hardlink targets (DOG-29 #10)', t => {
+  const dir = fixture(t), file = path.join(dir, logs.LOG_FILES.activity);
+  logs.appendActivity(dir, 'first\n');
+  logs.appendActivity(dir, 'second\n');
+  assert.equal(fs.readFileSync(file, 'utf8'), 'first\nsecond\n');
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  // Symlinked activity path: O_NOFOLLOW must refuse it and leave the target untouched.
+  const outside = path.join(dir, 'outside');
+  fs.writeFileSync(outside, 'untouched');
+  fs.rmSync(file);
+  fs.symlinkSync(outside, file);
+  assert.throws(() => logs.appendActivity(dir, 'evil\n'));
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'untouched');
+  // Hardlinked activity path (nlink > 1): must be rejected, target left untouched.
+  fs.rmSync(file);
+  fs.linkSync(outside, file);
+  assert.throws(() => logs.appendActivity(dir, 'evil\n'), /unsafe log|regular|unlinked/);
+  assert.equal(fs.readFileSync(outside, 'utf8'), 'untouched');
+});
+test('appendActivity rejects a FIFO activity log fast instead of blocking the tick on open (DOG-29 #10 round-2)', t => {
+  if (process.platform === 'win32') return;
+  const dir = fixture(t);
+  const file = path.join(dir, logs.LOG_FILES.activity);
+  const mk = spawnSync('mkfifo', [file]);
+  assert.equal(mk.status, 0, `mkfifo failed: ${mk.stderr}`);
+  // A plain O_WRONLY open on a reader-less FIFO blocks forever, hanging the tick
+  // (the block escapes both the try/catch and the tick deadline). Run in a
+  // subprocess with a hard timeout: a hang shows up as a kill signal.
+  const logsUrl = new URL('./lib/logs.mjs', import.meta.url).href;
+  const script = `import * as logs from ${JSON.stringify(logsUrl)};`
+    + `try { logs.appendActivity(${JSON.stringify(dir)}, 'x\\n'); console.log('NO_THROW'); }`
+    + `catch { console.log('REJECTED'); }`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { timeout: 3000, encoding: 'utf8' });
+  assert.equal(r.signal, null, 'appendActivity blocked on the FIFO (killed by timeout)');
+  assert.match(r.stdout, /REJECTED/, `expected FIFO rejection, got stdout=${JSON.stringify(r.stdout)}`);
+});
 test('log symlinks and hard links are rejected for reads and retention', t => {
   const dir = fixture(t), target = path.join(dir, 'target'), link = path.join(dir, 'log');
   fs.writeFileSync(target, 'untouched');

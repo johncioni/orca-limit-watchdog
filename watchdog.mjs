@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { runObservedCheck } from './lib/operations.mjs';
+import { runObservedCheck, atomicWriteFile } from './lib/operations.mjs';
 import { appendActivity, maintainLogs } from './lib/logs.mjs';
 
 export const RESUME_TEXT = 'Session rate limit has reset. Resume where you left off.';
@@ -282,6 +282,13 @@ export function validateEvent(key, ev) {
 export function parseStateFile(text) {
   let s;
   try { s = JSON.parse(text); } catch { return null; }
+  return validateParsedState(s);
+}
+
+// Validates an already-parsed state object (so callers that have parsed the JSON —
+// e.g. doctor, which also needs the raw value for diagnostics — need not parse
+// twice). Returns the upgraded/validated events map, or null for anything invalid.
+export function validateParsedState(s) {
   if (!s || typeof s !== 'object' || !s.events || typeof s.events !== 'object') return null;
   if (s.version !== 1 && s.version !== 2) return null;
   const events = {};
@@ -629,16 +636,19 @@ function loadState() {
 }
 
 export function saveState(events, stateDir = STATE_DIR) {
-  // Daemon state can name terminals and carry sanitized banner text: keep it
-  // owner-only. mkdir mode only affects a fresh dir, so chmod tightens an existing
-  // loose one too; the tmp is chmod'd in case a prior crash left it 0644 (DOG-24).
-  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(stateDir, 0o700); } catch { /* best effort: not owner / no POSIX modes */ }
-  const stateFile = path.join(stateDir, 'state.json');
-  const tmp = `${stateFile}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ version: 2, events }, null, 2), { mode: 0o600 });
-  try { fs.chmodSync(tmp, 0o600); } catch { /* best effort */ }
-  fs.renameSync(tmp, stateFile);
+  // Daemon state can name terminals and carry sanitized banner text, so it is kept
+  // owner-only. This send-critical write must never THROW on a tampered-but-valid
+  // state (that would skip the resume send persisted just before it in tick()), so it
+  // calls atomicWriteFile with BOTH destination and directory guards OFF:
+  //   checkTarget:false — the rename replaces the state.json entry atomically without
+  //     following a symlink or writing through a hardlink;
+  //   hardenDir:false  — pre-DOG-29 dir semantics (mkdir -p 0700 + best-effort chmod),
+  //     NO symlink/owner rejection. Do NOT "restore" a dir guard here: it would be a
+  //     silent send-blocking throw path and protects nothing (loadState reads through
+  //     the same dir unchecked).
+  // The unpredictable 'wx' temp + atomic rename still defeat a pre-planted temp
+  // symlink. See atomicWriteFile (DOG-29 #12 + N1).
+  atomicWriteFile(stateDir, 'state.json', JSON.stringify({ version: 2, events }, null, 2), { checkTarget: false, hardenDir: false });
 }
 
 export function acquireLock(lockFile = LOCK_FILE) {
@@ -945,7 +955,9 @@ async function main() {
     tickLog('error', `tick failed: ${sanitize(e.message)}`);
   } finally {
     clearTimeout(deadline);
-    if (!dryRun) { try { maintainLogs(STATE_DIR); } catch { /* best effort */ } }
+    // Only the activity log grew during the tick; the launchd stdout/stderr logs are
+    // bounded by the start pass above and by the next tick's start pass.
+    if (!dryRun) { try { maintainLogs(STATE_DIR, 'activity'); } catch { /* best effort */ } }
     if (!dryRun) fs.rmSync(LOCK_FILE, { force: true });
   }
 }
