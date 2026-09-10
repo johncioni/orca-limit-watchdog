@@ -476,3 +476,35 @@ test('doctor on an incomplete archive (no watchdog.mjs) diagnoses state.json wit
     assert.match(r.stdout, /event state:.*(runtime missing|cannot validate)/);
   } finally { h.cleanup(); }
 });
+
+test('doctor does not fabricate a saved/loaded mismatch when launchctl output is not scrapeable (DOG-29 #8)', async () => {
+  const h = harness('wd reword ');
+  try {
+    const { doctorText, installPaths, VERSION } = await loadManagement();
+    const paths = installPaths(h.home);
+    fs.mkdirSync(paths.launchAgentsDir, { recursive: true });
+    fs.mkdirSync(paths.stateDir, { recursive: true });
+    const stableNode = path.join(h.base, 'stable node'); fs.symlinkSync(process.execPath, stableNode);
+    const runtime = path.join(h.base, 'runtime'); fs.mkdirSync(runtime);
+    fs.writeFileSync(path.join(runtime, 'watchdog.mjs'), '// fixture');
+    fs.writeFileSync(path.join(runtime, 'version.mjs'), `export const VERSION = '${VERSION}';`);
+    const config = { ProgramArguments: [stableNode, path.join(runtime, 'watchdog.mjs')], EnvironmentVariables: { ORCA_CLI: h.orca } };
+    const plutil = path.join(h.base, 'plutil');
+    executable(plutil, '#!/bin/sh\n/bin/cat "$FAKE_PLIST_JSON"\n');
+    h.env.ORCA_WATCHDOG_PLUTIL = plutil;
+    h.env.FAKE_PLIST_JSON = path.join(h.base, 'config.json');
+    fs.writeFileSync(h.env.FAKE_PLIST_JSON, JSON.stringify(config));
+    fs.writeFileSync(paths.plistPath, 'saved fixture');
+    // A registered job whose output has NO scrapeable `arguments = { }` block
+    // (as a future macOS launchctl reword could produce).
+    executable(h.env.ORCA_WATCHDOG_LAUNCHCTL, '#!/bin/sh\n/bin/cat "$FAKE_LOADED_JOB"\n');
+    h.env.FAKE_LOADED_JOB = path.join(h.base, 'loaded.txt');
+    fs.writeFileSync(h.env.FAKE_LOADED_JOB,
+      `com.john.orca-watchdog = {\n state = not running\n inherited environment = {\n ORCA_CLI => ${h.orca}\n }\n}`);
+    const result = doctorText({ env: h.env });
+    assert.equal(result.failed, false, result.text);
+    assert.match(result.text, /saved\/loaded: not compared/);
+    assert.doesNotMatch(result.text, /disagree/);
+    assert.doesNotMatch(result.text, /loaded Node: error/);
+  } finally { h.cleanup(); }
+});

@@ -1892,6 +1892,23 @@ test('saveState writes 0600 state in a 0700 dir, tightening an existing loose di
   assert.equal(fs.statSync(path.join(dir, 'state.json')).mode & 0o777, 0o600, 'state file is 0600');
 });
 
+test('saveState uses an unpredictable temp + exclusive create, so a pre-planted temp symlink cannot clobber its target (DOG-29 #12)', (t) => {
+  if (process.platform === 'win32') return;   // no O_NOFOLLOW/symlink semantics
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-atomic-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const dir = path.join(base, 'state');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const victim = path.join(base, 'victim');
+  fs.writeFileSync(victim, 'do-not-touch');
+  // Attacker plants the OLD predictable temp path as a symlink to an outside file;
+  // a plain writeFileSync would follow it and overwrite the victim.
+  fs.symlinkSync(victim, path.join(dir, 'state.json.tmp'));
+  watchdog.saveState({ 'h:limit': { kind: 'limit' } }, dir);
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'do-not-touch', 'victim file must be untouched');
+  assert.equal(fs.lstatSync(path.join(dir, 'state.json')).isSymbolicLink(), false, 'state.json is a regular file');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8')).version, 2);
+});
+
 test('CLI entry runs when invoked through a symlinked path (DOG-6)', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-symlink-'));
   const link = path.join(tmp, 'repo');

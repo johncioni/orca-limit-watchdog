@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL, fileURLToPath } from 'node:url';
-import { runObservedCheck } from './lib/operations.mjs';
+import { runObservedCheck, atomicWriteFile } from './lib/operations.mjs';
 import { appendActivity, maintainLogs } from './lib/logs.mjs';
 
 export const RESUME_TEXT = 'Session rate limit has reset. Resume where you left off.';
@@ -629,16 +629,11 @@ function loadState() {
 }
 
 export function saveState(events, stateDir = STATE_DIR) {
-  // Daemon state can name terminals and carry sanitized banner text: keep it
-  // owner-only. mkdir mode only affects a fresh dir, so chmod tightens an existing
-  // loose one too; the tmp is chmod'd in case a prior crash left it 0644 (DOG-24).
-  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  try { fs.chmodSync(stateDir, 0o700); } catch { /* best effort: not owner / no POSIX modes */ }
-  const stateFile = path.join(stateDir, 'state.json');
-  const tmp = `${stateFile}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ version: 2, events }, null, 2), { mode: 0o600 });
-  try { fs.chmodSync(tmp, 0o600); } catch { /* best effort */ }
-  fs.renameSync(tmp, stateFile);
+  // Daemon state can name terminals and carry sanitized banner text, so it is kept
+  // owner-only. atomicWriteFile hardens this send-critical write: a symlink/owner-
+  // guarded 0700 dir (tightening a loose one), an unpredictable temp created with
+  // 'wx' (a pre-planted temp symlink cannot be followed), and an atomic rename.
+  atomicWriteFile(stateDir, 'state.json', JSON.stringify({ version: 2, events }, null, 2));
 }
 
 export function acquireLock(lockFile = LOCK_FILE) {
@@ -945,7 +940,9 @@ async function main() {
     tickLog('error', `tick failed: ${sanitize(e.message)}`);
   } finally {
     clearTimeout(deadline);
-    if (!dryRun) { try { maintainLogs(STATE_DIR); } catch { /* best effort */ } }
+    // Only the activity log grew during the tick; the launchd stdout/stderr logs are
+    // bounded by the start pass above and by the next tick's start pass.
+    if (!dryRun) { try { maintainLogs(STATE_DIR, 'activity'); } catch { /* best effort */ } }
     if (!dryRun) fs.rmSync(LOCK_FILE, { force: true });
   }
 }
