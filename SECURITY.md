@@ -2,7 +2,7 @@
 
 ## What this software does
 
-Orca Watchdog (the `orca-limit-watchdog` command) is a local macOS `launchd`
+Orca Watchdog (the `orca-watchdog` command) is a local macOS `launchd`
 daemon. Its only outward actions are:
 
 - reading the tail of your connected Orca terminals via the `orca` CLI, and
@@ -29,11 +29,11 @@ issue for a security problem.
 
 Use GitHub's private vulnerability reporting on this repository:
 **Security → Report a vulnerability**
-(<https://github.com/johncioni/orca-limit-watchdog/security/advisories/new>).
+(<https://github.com/johncioni/orca-watchdog/security/advisories/new>).
 
 Please include:
 
-- the version (`orca-limit-watchdog --version`) and your macOS and Node versions,
+- the version (`orca-watchdog --version`) and your macOS and Node versions,
 - a description of the issue and its impact,
 - steps to reproduce, and any relevant `watchdog.log` excerpts (redact anything
   sensitive first).

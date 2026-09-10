@@ -1159,7 +1159,7 @@ test('runAlert: allowed buttons write atomic episode-bound choice files, message
     await watchdog.runAlert({ ...env, WATCHDOG_ALERT_MESSAGE: message }, { execFileImpl: async (file, args) => {
       assert.equal(file, '/usr/bin/osascript');
       assert.deepEqual(args, ['-e', 'on run argv', '-e',
-        'return button returned of (display alert "orca-limit-watchdog" message (item 1 of argv) buttons {"Stop","Wait 1h","Continue"} default button "Continue")',
+        'return button returned of (display alert "orca-watchdog" message (item 1 of argv) buttons {"Stop","Wait 1h","Continue"} default button "Continue")',
         '-e', 'end run', '--', message]);
       return { stdout: button + '\n' };
     } });
@@ -1243,7 +1243,7 @@ test('choice deps: real per-episode reads/deletes are bounded and isolated (DOG-
 });
 test('loadState: v2 rejection names the normalized violation when alertedAt is omitted (DOG-21)', async (t) => {
   const { dir } = alertFiles(t);
-  const stateDir = path.join(dir, '.local', 'state', 'orca-limit-watchdog');
+  const stateDir = path.join(dir, '.local', 'state', 'orca-watchdog');
   fs.mkdirSync(stateDir, { recursive: true });
   const ev = LO({ detectedAt: 'invalid-time' });
   delete ev.alertedAt;
@@ -1731,7 +1731,7 @@ test('sanitize leaves ordinary text and short hashes alone', () => {
 });
 
 test('sanitize keeps filesystem paths but still redacts long opaque tokens (DOG-12)', () => {
-  const p = '/Users/example/orca-limit-watchdog/watchdog.mjs';
+  const p = '/Users/example/orca-watchdog/watchdog.mjs';
   assert.equal(sanitize(`see ${p} line 3`), `see ${p} line 3`);
   assert.equal(sanitize('token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abc'), 'token [redacted]');
 });

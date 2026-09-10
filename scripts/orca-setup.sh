@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Orca per-worktree setup hook for orca-limit-watchdog.
+# Orca per-worktree setup hook for orca-watchdog.
 #
 # Runs on `orca worktree create` (repo hookSettings: setupRunPolicy=run-by-default,
 # setupAgentStartupPolicy=wait-for-setup), so a spawned agent blocks until this
@@ -12,7 +12,7 @@
 # proves it can run the full local gate before an agent touches it.
 #
 # Idempotent, offline, and safe to run by hand. It NEVER touches
-# ~/Library/LaunchAgents or ~/.local/state/orca-limit-watchdog: deploying the
+# ~/Library/LaunchAgents or ~/.local/state/orca-watchdog: deploying the
 # live LaunchAgent is install.sh, run post-merge from the main checkout only.
 set -euo pipefail
 cd "$(dirname "$0")/.."

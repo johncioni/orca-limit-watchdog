@@ -12,7 +12,7 @@ import { validateReleaseRoot, VERSION } from './lib/management.mjs';
 
 const pExecFile = promisify(execFile);
 const ROOT = process.cwd();
-const NAME = 'orca-limit-watchdog';
+const NAME = 'orca-watchdog';
 
 function tmp(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -52,10 +52,10 @@ test('the extracted archive is exactly the release set and passes validateReleas
     const releaseRoot = await extract(tarball);
 
     // Runtime payload is present.
-    for (const rel of ['bin/orca-limit-watchdog', 'bin/orca-limit-watchdog.mjs',
+    for (const rel of ['bin/orca-watchdog', 'bin/orca-watchdog.mjs',
       'lib/management.mjs', 'watchdog.mjs', 'version.mjs', 'install.sh', 'uninstall.sh',
       'scripts/install-archive.mjs', 'scripts/uninstall-archive.mjs', 'README.md',
-      'LICENSE', 'CHANGELOG.md', 'com.john.orca-limit-watchdog.plist']) {
+      'LICENSE', 'CHANGELOG.md']) {
       assert.equal(fs.existsSync(path.join(releaseRoot, rel)), true, `missing ${rel}`);
     }
     // Development-only material is excluded.
@@ -79,7 +79,7 @@ test('archived install scripts keep their executable bit', async () => {
   try {
     const { tarball } = buildRelease({ sourceRoot: ROOT, version: VERSION, outDir });
     const releaseRoot = await extract(tarball);
-    for (const rel of ['install.sh', 'uninstall.sh', 'bin/orca-limit-watchdog', 'bin/orca-limit-watchdog.mjs']) {
+    for (const rel of ['install.sh', 'uninstall.sh', 'bin/orca-watchdog', 'bin/orca-watchdog.mjs']) {
       const mode = fs.statSync(path.join(releaseRoot, rel)).mode;
       assert.ok(mode & 0o111, `${rel} should be executable (mode ${mode.toString(8)})`);
     }
@@ -115,7 +115,7 @@ test('a version that disagrees with version.mjs is refused before writing anythi
 });
 
 test('the Homebrew formula pins the current version and a well-formed sha256', () => {
-  const formula = fs.readFileSync(path.join(ROOT, 'Formula', 'orca-limit-watchdog.rb'), 'utf8');
+  const formula = fs.readFileSync(path.join(ROOT, 'Formula', 'orca-watchdog.rb'), 'utf8');
   const escaped = VERSION.replace(/\./g, '\\.');
   // The URL pins the version (release tag and asset filename) that Homebrew infers.
   assert.match(formula, new RegExp(`download/v${escaped}/${NAME}-${escaped}\\.tar\\.gz`),

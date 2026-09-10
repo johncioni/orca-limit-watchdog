@@ -22,8 +22,8 @@ goal is to keep it that way: easy to read, easy to audit, and safe by default.
 Requires **macOS** and **Node.js 22 or newer**. No install step is needed.
 
 ```bash
-git clone https://github.com/johncioni/orca-limit-watchdog
-cd orca-limit-watchdog
+git clone https://github.com/johncioni/orca-watchdog
+cd orca-watchdog
 node --test                   # unit tests (patterns, time parsing, lifecycle, packaging)
 bash scripts/orca-setup.sh    # full local gate: Node floor + syntax checks + node --test
 node watchdog.mjs --dry-run   # observe one tick without sending anything
@@ -43,7 +43,7 @@ node watchdog.mjs --dry-run   # observe one tick without sending anything
 ## Building a release (maintainers)
 
 ```bash
-node scripts/build-release.mjs        # writes dist/orca-limit-watchdog-<version>.tar.gz + .sha256
+node scripts/build-release.mjs        # writes dist/orca-watchdog-<version>.tar.gz + .sha256
 ```
 
 The archive is deterministic: the same tree always produces the same bytes and

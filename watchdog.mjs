@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// orca-limit-watchdog — detects rate-limited Orca agent terminals and sends a
+// orca-watchdog — detects rate-limited Orca agent terminals and sends a
 // resume prompt after the limit resets. Zero dependencies. See README.md.
 
 import { execFile, spawn } from 'node:child_process';
@@ -12,7 +12,7 @@ import { pathToFileURL, fileURLToPath } from 'node:url';
 
 export const RESUME_TEXT = 'Session rate limit has reset. Resume where you left off.';
 
-const STATE_DIR = path.join(os.homedir(), '.local', 'state', 'orca-limit-watchdog');
+const STATE_DIR = path.join(os.homedir(), '.local', 'state', 'orca-watchdog');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
 const LOG_FILE = path.join(STATE_DIR, 'watchdog.log');
 const LOCK_FILE = path.join(STATE_DIR, 'lock');
@@ -559,7 +559,7 @@ export async function runAlert(env, { execFileImpl = pExecFile, logImpl = alertL
     const name = path.basename(file);
     if (!name.endsWith(suffix) || !PATH_COMPONENT_RE.test(name.slice(0, -suffix.length))) throw new Error('invalid alert choice path');
     const { stdout } = await execFileImpl('/usr/bin/osascript', ['-e', 'on run argv', '-e',
-      'return button returned of (display alert "orca-limit-watchdog" message (item 1 of argv) buttons {"Stop","Wait 1h","Continue"} default button "Continue")',
+      'return button returned of (display alert "orca-watchdog" message (item 1 of argv) buttons {"Stop","Wait 1h","Continue"} default button "Continue")',
       '-e', 'end run', '--', message]);
     const choice = stdout?.trim();
     if (!CHOICES.includes(choice)) { logImpl('warn', 'alert returned no valid choice'); return; }

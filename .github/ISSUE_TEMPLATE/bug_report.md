@@ -13,7 +13,7 @@ A clear description of the problem.
 What you thought would happen instead.
 
 **Environment**
-- orca-limit-watchdog version: <!-- `orca-limit-watchdog --version` -->
+- orca-watchdog version: <!-- `orca-watchdog --version` -->
 - macOS version:
 - Node version: <!-- `node --version` -->
 - Orca version:
@@ -21,12 +21,12 @@ What you thought would happen instead.
 
 **`doctor` output**
 ```
-<!-- paste `orca-limit-watchdog doctor` here -->
+<!-- paste `orca-watchdog doctor` here -->
 ```
 
 **Relevant logs**
 ```
-<!-- paste from ~/.local/state/orca-limit-watchdog/watchdog.log — redact anything sensitive -->
+<!-- paste from ~/.local/state/orca-watchdog/watchdog.log — redact anything sensitive -->
 ```
 
 **Steps to reproduce**
