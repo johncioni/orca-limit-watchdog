@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL, fileURLToPath } from 'node:url';
+import { runObservedCheck } from './lib/operations.mjs';
 
 export const RESUME_TEXT = 'Session rate limit has reset. Resume where you left off.';
 
@@ -676,12 +677,14 @@ const DEFAULT_DEPS = () => ({ orca, fetchImpl: globalThis.fetch, env: process.en
 
 export async function tick({ dryRun }, depsIn = {}) {
   const deps = { ...DEFAULT_DEPS(), ...depsIn };
+  const observe = (...args) => { try { deps.observe?.(...args); } catch { /* diagnostics cannot change eligibility */ } };
+  const waiting = (handle, reason) => observe('waiting', handle, reason);
   const log = deps.log;   // shadows the module logger so tests can silence it
   let terminals;
   try {
     terminals = (await deps.orca(['terminal', 'list'])).terminals ?? [];
   } catch (e) {
-    if (isUnavailableError(e)) { log('debug', `orca unavailable: ${e.message.split('\n')[0]}`); return; }
+    if (isUnavailableError(e)) { observe('unavailable'); log('debug', `orca unavailable: ${e.message.split('\n')[0]}`); return; }
     throw e;
   }
   const byHandle = new Map(terminals.map((t) => [t.handle, t]));
@@ -702,6 +705,7 @@ export async function tick({ dryRun }, depsIn = {}) {
         }
         observations.push({ handle: t.handle, banner, platform: inferPlatform(t, banner), window: tail.slice(-TAIL_LINES).join(' | ') });
       } catch (e) {
+        waiting(t.handle, 'failed read');
         log('warn', `read failed for ${t.handle}: ${sanitize(e.message)}`);
       }
     }
@@ -715,6 +719,12 @@ export async function tick({ dryRun }, depsIn = {}) {
   // terminal (delete) from one merely unread this tick (freeze).
   const liveHandles = terminals.map((t) => t.handle);
   const { events, sendCandidates } = reconcile(state, observations, now, liveHandles, deps.newEpisodeId);
+  for (const ev of Object.values(events)) {
+    if (observations.some(o => o.handle === ev.handle)) waiting(ev.handle,
+      ev.status === 'gave_up' ? 'exhausted retries' : ev.status === 'awaiting-user' ? 'user choice'
+      : ev.status === 'dismissed' ? 'user dismissed' : ev.clearedAt ? 'banner clearance confirmation'
+      : ev.status === 'resumed' ? 'resume confirmation' : ev.resetAt ? 'reset time or retry delay' : 'initial hold or retry delay');
+  }
 
   for (const key of Object.keys(events)) {
     const ev = events[key];
@@ -796,7 +806,7 @@ export async function tick({ dryRun }, depsIn = {}) {
       if (warn) log('warn', warn);
       online = await hasConnectivity(deps.fetchImpl, url);
     }
-    if (!online) { log('debug', `held ${ev.handle}: offline`); continue; }
+    if (!online) { waiting(ev.handle, 'offline'); log('debug', `held ${ev.handle}: offline`); continue; }
     if (ev.kind === 'outage') {   // 1. status gate (validateEvent guarantees a known platform)
       if (!indicators.has(ev.platform)) {
         const { url, warn } = statusUrlFor(ev.platform, deps.env);
@@ -807,18 +817,21 @@ export async function tick({ dryRun }, depsIn = {}) {
       // Fail closed: an unverifiable status (fetch failed/timed out/redirected/
       // bad JSON ⇒ null) must not authorize a resume during a possibly-continuing
       // outage. Only a confirmed-healthy indicator allows the send (DOG-24).
-      if (indicator === null) { log('warn', 'hold: provider health unverifiable'); continue; }
+      if (indicator === null) { waiting(ev.handle, 'provider health unknown'); log('warn', 'hold: provider health unverifiable'); continue; }
       if (suppressedByStatus(indicator)) {
+        waiting(ev.handle, 'provider health ' + indicator);
         log('debug', `skip ${ev.handle}: ${ev.platform} status is ${indicator}`); continue;
       }
     }
     try {                                                                            // 2. idle check
       await deps.orca(['terminal', 'wait', '--terminal', ev.handle, '--for', 'tui-idle', '--timeout-ms', '5000']);
     } catch (e) {
+      waiting(ev.handle, 'busy terminal');
       log('info', `skip ${ev.handle}: not idle (${sanitize(e.message)})`); continue;
     }
     let tail;                                                                        // 3. fresh re-read
     try { tail = await readTail(ev.handle, deps.orca); } catch (e) {
+      waiting(ev.handle, 'failed read');
       log('warn', `skip ${ev.handle}: re-read failed (${sanitize(e.message)}); event untouched`); continue;
     }
     const term = byHandle.get(ev.handle);
@@ -847,6 +860,7 @@ export async function tick({ dryRun }, depsIn = {}) {
       delete events[key]; deps.saveState(events); continue;
     }
     if (isInputOccupied(tail)) {                                                     // 4b. draft guard
+      waiting(ev.handle, 'draft input');
       log('info', `skip ${ev.handle}: input box holds a draft; event untouched`); continue;
     }
     ev.attempts += 1;                                                                // 5. persist, then send
@@ -855,13 +869,16 @@ export async function tick({ dryRun }, depsIn = {}) {
     deps.saveState(events);
     try {
       await deps.orca(['terminal', 'send', '--terminal', ev.handle, '--text', sch.resumeText, '--enter']);
+      observe('resumed', ev.handle);
       log('info', `resumed ${ev.handle} (${ev.kind}, attempt ${ev.attempts})`);
     } catch (e) {
       // The attempt is already persisted (no double-send on retry); the other
       // candidates and the GAVE UP pass must still run this tick.
+      waiting(ev.handle, 'failed send');
       log('warn', `send failed for ${ev.handle} (attempt ${ev.attempts}): ${sanitize(e.message)}`);
     }
     } catch (e) {   // untrusted-content or unexpected throw processing this candidate
+      waiting(ev.handle, 'failed send processing');
       log('warn', `skip ${ev.handle}: send processing failed (${sanitize(e.message)}); event untouched`);
     }
   }
@@ -919,7 +936,7 @@ async function main() {
   if (!dryRun) process.once('exit', () => { try { fs.rmSync(LOCK_FILE, { force: true }); } catch { /* best effort */ } });
   const deadline = setTimeout(() => { log('error', 'tick deadline (4 min) exceeded'); process.exit(1); }, 4 * MIN);
   try {
-    await tick({ dryRun });
+    await runObservedCheck({ stateDir: STATE_DIR, dryRun, tick });
   } catch (e) {
     log('error', `tick failed: ${sanitize(e.message)}`);
   } finally {

@@ -172,13 +172,32 @@ test('pause, resume, stop, and status keep service, pause, and events separate',
     await runCli(['start'], h.env);
     await runCli(['pause'], h.env);
     const paused = await runCli(['status'], h.env);
-    assert.match(paused.stdout, /service:\s+running/);
+    assert.match(paused.stdout, /service:\s+registered/);
     assert.match(paused.stdout, /pause:\s+paused/);
     assert.match(paused.stdout, /events:\s+none/);
     await runCli(['resume'], h.env);
     assert.match((await runCli(['status'], h.env)).stdout, /pause:\s+active/);
     await runCli(['stop'], h.env);
     assert.match((await runCli(['status'], h.env)).stdout, /service:\s+stopped/);
+  } finally { h.cleanup(); }
+});
+
+test('status labels registration, running process and health observations separately', async () => {
+  const h = harness();
+  try {
+    const { statusText, installPaths } = await loadManagement();
+    fs.writeFileSync(h.launchctlState, 'registered');
+    const paths = installPaths(h.home);
+    let output = statusText({ env: h.env });
+    assert.match(output, /service: registered.*periodic/);
+    assert.match(output, /process: unknown/);
+    assert.match(output, /installed version:/);
+    assert.match(output, /last completed check: unknown/);
+    const { beginCheck } = await import('./lib/operations.mjs');
+    beginCheck(paths.stateDir, new Date('2020-01-01T00:00:00Z'));
+    output = statusText({ env: h.env });
+    assert.match(output, /stale/);
+    assert.match(output, /in-progress.*interrupted/);
   } finally { h.cleanup(); }
 });
 

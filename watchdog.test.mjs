@@ -959,6 +959,30 @@ function harness({ tail, terminals, indicator = 'none', state = {}, now = at(10)
 const T = { handle: H, connected: true, writable: true, agentIdentity: 'claude' };
 const OUTAGE_TAIL = [CLAUDE_529, '', '> ', '? for shortcuts'];
 
+test('operational observations report guard reasons without changing resume decisions', async () => {
+  for (const [scenario, expected] of [['offline', 'offline'], ['provider', 'provider health major'],
+    ['busy', 'busy terminal'], ['read', 'failed read'], ['draft', 'draft input'], ['send', 'failed send'], ['success', null]]) {
+    const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed(), indicator: scenario === 'provider' ? 'major' : 'none' });
+    if (scenario === 'offline') h.deps.fetchImpl = async () => { throw new Error('offline'); };
+    const inner = h.deps.orca;
+    h.deps.orca = async args => {
+      if ((scenario === 'busy' && args[1] === 'wait') || (scenario === 'read' && args[1] === 'read') || (scenario === 'send' && args[1] === 'send')) throw new Error('fixture');
+      if (scenario === 'draft' && args[1] === 'read') return { terminal: { tail: [CLAUDE_529, '', '> draft text', '? for shortcuts'] } };
+      return inner(args);
+    };
+    const observations = [];
+    h.deps.observe = (...args) => observations.push(args);
+    await tick({ dryRun: false }, h.deps);
+    if (expected) assert.equal(observations.filter(x => x[0] === 'waiting').at(-1)[2], expected, scenario);
+    assert.equal(observations.some(x => x[0] === 'resumed'), scenario === 'success', scenario);
+    assert.equal(h.sent.length, scenario === 'success' ? 1 : 0);
+  }
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });
+  h.deps.observe = () => { throw new Error('diagnostics unavailable'); };
+  await tick({ dryRun: false }, h.deps);
+  assert.equal(h.sent.length, 1);
+});
+
 function alertHarness({ ev = LO(), choice = null, ...options } = {}) {
   const h = harness({ tail: OPEN_TAIL, terminals: [{ ...T, agentIdentity: 'codex' }], state: { [H]: ev }, now: NOW, ...options });
   const actions = [];
