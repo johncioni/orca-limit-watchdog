@@ -1933,6 +1933,37 @@ test('saveState atomically replaces a symlinked/hardlinked state.json without fo
   assert.equal(fs.statSync(stateFile).nlink, 1, 'state.json is a fresh, unlinked file');
 });
 
+test('tick with the REAL saveState still resumes when state.json OR its directory is a tampered-but-valid link (DOG-29 #12 N1, tick-level)', async () => {
+  if (process.platform === 'win32') return;
+  const original = JSON.stringify({ version: 2, events: {} });
+  for (const kind of ['symlink-file', 'hardlink-file', 'symlink-dir']) {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-tick-link-'));
+    try {
+      const realDir = path.join(base, 'real-state');
+      fs.mkdirSync(realDir, { recursive: true, mode: 0o700 });
+      const victim = path.join(base, 'victim');
+      let stateDir = realDir;
+      if (kind === 'symlink-dir') {
+        stateDir = path.join(base, 'state-link');
+        fs.symlinkSync(realDir, stateDir);               // the state DIRECTORY is a symlink (N1)
+      } else {
+        fs.writeFileSync(victim, original);
+        const sf = path.join(realDir, 'state.json');
+        if (kind === 'symlink-file') fs.symlinkSync(victim, sf);
+        else fs.linkSync(victim, sf);
+      }
+      const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed(), indicator: 'none' });
+      h.deps.saveState = (events) => watchdog.saveState(events, stateDir);   // the REAL writer
+      await tick({ dryRun: false }, h.deps);
+      assert.equal(h.sent.length, 1, `${kind}: a valid-state tamper must not block the resume send`);
+      const written = JSON.parse(fs.readFileSync(path.join(realDir, 'state.json'), 'utf8'));
+      assert.equal(written.events[H].status, 'resumed', `${kind}: the resume was persisted`);
+      if (kind === 'symlink-dir') assert.equal(fs.lstatSync(stateDir).isSymbolicLink(), true, 'dir symlink preserved');
+      else assert.equal(fs.readFileSync(victim, 'utf8'), original, `${kind}: link target untouched`);
+    } finally { fs.rmSync(base, { recursive: true, force: true }); }
+  }
+});
+
 test('CLI entry runs when invoked through a symlinked path (DOG-6)', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-symlink-'));
   const link = path.join(tmp, 'repo');

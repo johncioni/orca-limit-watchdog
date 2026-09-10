@@ -640,10 +640,12 @@ export function saveState(events, stateDir = STATE_DIR) {
   // owner-only. atomicWriteFile hardens this send-critical write: a symlink/owner-
   // guarded 0700 dir (tightening a loose one), an unpredictable temp created with
   // 'wx' (a pre-planted temp symlink cannot be followed), and an atomic rename.
-  // checkTarget:false — the rename replaces the state.json entry atomically without
-  // following it, and must not throw on a tampered-but-valid file (that would skip
-  // the resume send that persists just before it in tick()). See atomicWriteFile.
-  atomicWriteFile(stateDir, 'state.json', JSON.stringify({ version: 2, events }, null, 2), { checkTarget: false });
+  // checkTarget:false + hardenDir:false — the rename replaces the state.json entry
+  // atomically without following it, and neither the destination nor the directory may
+  // throw on a tampered-but-valid state (that would skip the resume send that persists
+  // just before it in tick()). This keeps saveState's pre-DOG-29 semantics: mkdir -p
+  // 0700 + best-effort chmod. See atomicWriteFile (DOG-29 #12 + N1).
+  atomicWriteFile(stateDir, 'state.json', JSON.stringify({ version: 2, events }, null, 2), { checkTarget: false, hardenDir: false });
 }
 
 export function acquireLock(lockFile = LOCK_FILE) {
