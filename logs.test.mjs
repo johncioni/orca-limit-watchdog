@@ -20,6 +20,18 @@ test('logs default to newest 100 lines, validate options, and tolerate missing f
   assert.deepEqual(logs.parseLogArgs([]), { lines: 100, source: 'activity', follow: false });
   for (const args of [['--lines', '0'], ['--lines', '-2'], ['--lines', '1.5'], ['--source', 'bad'], ['--follow', 'x']]) assert.throws(() => logs.parseLogArgs(args));
 });
+test('readLog honors --lines N beyond the 500KB retention tail (does not silently cap)', t => {
+  const dir = fixture(t), file = path.join(dir, 'launchd.err.log');
+  const count = 60000;
+  fs.writeFileSync(file, Array.from({ length: count }, (_, i) => `line ${i}`).join('\n') + '\n');
+  assert.ok(fs.statSync(file).size > 500_000, 'fixture must exceed the retention cap');
+  const all = logs.readLog(file, count).split('\n').filter(Boolean);
+  assert.equal(all.length, count);
+  assert.equal(all[0], 'line 0');
+  assert.equal(all.at(-1), `line ${count - 1}`);
+  // Asking for more lines than exist returns them all, not a byte-capped subset.
+  assert.equal(logs.readLog(file, count + 500).split('\n').filter(Boolean).length, count);
+});
 test('retention bounds bytes and lines, handles Unicode and huge lines, preserves inode', t => {
   const dir = fixture(t), file = path.join(dir, 'watchdog.log');
   for (const contents of ['😀'.repeat(300_000), ('a\n').repeat(600_000), 'a'.repeat(1_100_000) + '\nnewest\n']) {

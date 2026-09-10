@@ -94,10 +94,12 @@ or
 job output). A missing log file reads as empty, which is normal before the
 first tick.
 .SH INSTALLATION
-Homebrew (recommended). On newer Homebrew, trust the third\-party tap first:
+Homebrew (recommended). Add the tap, trust it (newer Homebrew requires trusting
+third\-party taps), then install:
 .PP
 .RS
 .EX
+brew tap johncioni/tap
 brew trust johncioni/tap
 brew install johncioni/tap/orca\-watchdog
 .EE

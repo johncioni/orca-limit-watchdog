@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { spawnSync } from 'node:child_process';
 import * as watchdog from './watchdog.mjs';
 import { fileURLToPath } from 'node:url';
 import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
@@ -981,6 +982,35 @@ test('operational observations report guard reasons without changing resume deci
   h.deps.observe = () => { throw new Error('diagnostics unavailable'); };
   await tick({ dryRun: false }, h.deps);
   assert.equal(h.sent.length, 1);
+});
+
+test('a mid-tick shell-prompt drop clears the waiting observation (no stale status)', async () => {
+  const now = at(0);
+  const tail = ['5-hour limit reached. Try again at 10:00 PM.', '> '];   // detects a limit AND is a shell prompt (codex)
+  const term = { handle: H, connected: true, writable: true, agentIdentity: 'codex' };
+  const state = { [H]: { handle: H, kind: 'limit', platform: 'codex', bannerText: 'x',
+    detectedAt: at(-120).toISOString(), resetAt: at(-30).toISOString(),
+    attempts: 0, lastAttemptAt: null, status: 'waiting', alertedAt: null } };
+  const h = harness({ tail, terminals: [term], state, now });
+  const observations = [];
+  h.deps.observe = (...a) => observations.push(a);
+  await tick({ dryRun: false }, h.deps);
+  assert.equal(h.saved()[H], undefined, 'the dropped event reached the shell-prompt guard');
+  assert.equal(h.sent.length, 0);
+  assert.ok(observations.some(a => a[0] === 'resolved' && a[1] === H), JSON.stringify(observations));
+});
+
+test('watchdog --status degrades gracefully when state.json is unreadable (not ENOENT)', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-status-'));
+  try {
+    const stateDir = path.join(home, '.local', 'state', 'orca-watchdog');
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.mkdirSync(path.join(stateDir, 'state.json'));   // directory at the file path ⇒ EISDIR, not ENOENT
+    const r = spawnSync(process.execPath, ['watchdog.mjs', '--status'], { env: { ...process.env, HOME: home }, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stderr, /EISDIR|Error:/);
+    assert.match(r.stdout, /unknown|unreadable/);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
 function alertHarness({ ev = LO(), choice = null, ...options } = {}) {

@@ -717,7 +717,7 @@ export async function tick({ dryRun }, depsIn = {}) {
     if (observations.some(o => o.handle === ev.handle)) waiting(ev.handle,
       ev.status === 'gave_up' ? 'exhausted retries' : ev.status === 'awaiting-user' ? 'user choice'
       : ev.status === 'dismissed' ? 'user dismissed' : ev.clearedAt ? 'banner clearance confirmation'
-      : ev.status === 'resumed' ? 'resume confirmation' : ev.resetAt ? 'reset time or retry delay' : 'initial hold or retry delay');
+      : ev.status === 'resumed' ? 'resume confirmation' : 'reset time or retry delay');
   }
 
   for (const key of Object.keys(events)) {
@@ -851,6 +851,7 @@ export async function tick({ dryRun }, depsIn = {}) {
     }
     if (isShellPrompt(tail, term?.agentIdentity)) {                                  // 4. prompt guard
       log('warn', `skip ${ev.handle}: shell prompt on last line, agent has exited; event dropped`);
+      observe('resolved', ev.handle);   // the event is gone: don't leave a stale waiting reason in status
       delete events[key]; deps.saveState(events); continue;
     }
     if (isInputOccupied(tail)) {                                                     // 4b. draft guard
@@ -917,7 +918,10 @@ async function main() {
   if (parsed.action === 'status') {
     let events;
     try { events = parseStateFile(fs.readFileSync(STATE_FILE, 'utf8')); }
-    catch (e) { if (e.code === 'ENOENT') events = {}; else throw e; }
+    catch (e) {
+      if (e.code === 'ENOENT') events = {};
+      else { console.log('event state: unknown (unreadable; run orca-watchdog doctor)'); return; }
+    }
     if (!events) { console.log('event state: unknown (malformed; run orca-watchdog doctor)'); return; }
     console.log(Object.keys(events).length === 0 ? 'no active events'
       : JSON.stringify({ version: 2, events }, null, 2));

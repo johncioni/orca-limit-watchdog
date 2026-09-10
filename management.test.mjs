@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -433,5 +433,46 @@ test('installer and uninstaller reject unknown arguments before mutation', async
       /unknown argument.*--wat/i,
     );
     assert.equal(fs.existsSync(path.join(h.home, '.local', 'share', 'orca-watchdog')), false);
+  } finally { h.cleanup(); }
+});
+
+test('serviceIsRunning throws on a signal-killed launchctl (fail closed like inspectService)', async () => {
+  const { serviceIsRunning } = await loadManagement();
+  const h = harness('wd signal ');
+  try {
+    executable(h.env.ORCA_WATCHDOG_LAUNCHCTL, '#!/bin/sh\nkill -KILL $$\n');
+    assert.throws(() => serviceIsRunning(h.env), /could not check service state/);
+  } finally { h.cleanup(); }
+});
+
+test('logs tolerates a reader that closes the pipe early (no EPIPE crash)', async () => {
+  const h = harness('wd epipe ');
+  try {
+    const dir = path.join(h.home, '.local', 'state', 'orca-watchdog');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'launchd.err.log'), ('x'.repeat(200) + '\n').repeat(20000), { mode: 0o600 });
+    const child = spawn(process.execPath, [CLI, 'logs', '--source', 'stderr', '--lines', '20000'], { env: h.env });
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d; });
+    const exit = new Promise((res, rej) => { child.once('error', rej); child.once('exit', (code, signal) => res({ code, signal })); });
+    await new Promise((res, rej) => { child.stdout.once('data', res); child.once('error', rej); });
+    child.stdout.destroy();   // mimic `| head`: reader closes the pipe early
+    const { code } = await exit;
+    assert.doesNotMatch(stderr, /EPIPE|Unhandled/, stderr);
+    assert.equal(code, 0);
+  } finally { h.cleanup(); }
+});
+
+test('doctor on an incomplete archive (no watchdog.mjs) diagnoses state.json without crashing on validateEvent', async () => {
+  const h = harness('wd incomplete ');
+  try {
+    const { VERSION, installPaths } = await loadManagement();
+    const release = releaseCopy(h.base, VERSION, (r) => fs.rmSync(path.join(r, 'watchdog.mjs')));
+    const paths = installPaths(h.home);
+    fs.mkdirSync(paths.stateDir, { recursive: true });
+    fs.writeFileSync(paths.stateFile, '{"version":2,"events":{"term_x":{"handle":"term_x"}}}');
+    const r = spawnSync(process.execPath, [path.join(release, 'bin', 'orca-watchdog.mjs'), 'doctor'], { env: h.env, encoding: 'utf8' });
+    assert.doesNotMatch(`${r.stdout}${r.stderr}`, /validateEvent is not a function/, `${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, /event state:.*(runtime missing|cannot validate)/);
   } finally { h.cleanup(); }
 });

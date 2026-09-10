@@ -65,3 +65,12 @@ test('unfinished check stays in-progress and dry run does not create metadata', 
   operations.beginCheck(dir, new Date('2020-01-01T00:00:00Z'));
   assert.equal(operations.readHealth(dir).value.check.outcome, 'in-progress');
 });
+
+test('observe(resolved) clears a waiting entry so a dropped event is not reported as waiting', async t => {
+  const dir = fixture(t);
+  await operations.runObservedCheck({
+    stateDir: dir, dryRun: false, deps: { now: () => new Date('2020-01-01T00:00:00Z') },
+    tick: async (_ctx, deps) => { deps.observe('waiting', 'term_x', 'reset time or retry delay'); deps.observe('resolved', 'term_x'); },
+  });
+  assert.deepEqual(operations.readHealth(dir).value.waiting, {});
+});

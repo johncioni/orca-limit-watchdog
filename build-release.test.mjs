@@ -162,6 +162,13 @@ test('a version that disagrees with version.mjs is refused before writing anythi
   }
 });
 
+test('the man page install block adds the brew tap step (matches the README sequence)', () => {
+  const man = fs.readFileSync(path.join(ROOT, 'man', 'orca-watchdog.1'), 'utf8');
+  assert.ok(man.includes('brew tap johncioni/tap'), 'man install block must include the brew tap step');
+  assert.ok(man.includes('brew trust johncioni/tap'), 'man install block must keep the brew trust step');
+  assert.match(man, /brew install johncioni\/tap\/orca\\?-watchdog/, 'man install block must keep the brew install step');
+});
+
 test('the Homebrew formula pins the current version and a well-formed sha256', () => {
   const formula = fs.readFileSync(path.join(ROOT, 'Formula', 'orca-watchdog.rb'), 'utf8');
   const escaped = VERSION.replace(/\./g, '\\.');
