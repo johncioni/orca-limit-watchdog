@@ -82,6 +82,27 @@ test('a real banner is still detected next to the footer, and the footer never e
   assert.doesNotMatch(b.bannerText, /3h 8m/);
 });
 
+test('generic limit rule requires the banner to be the final on-screen block (DOG-24)', () => {
+  const banner = 'Claude usage limit reached. Your limit will reset at 3am.';
+  // Genuinely stalled: banner followed only by chrome (borders, empty box, footer) still detects.
+  assert.ok(detectBanner([banner, '─'.repeat(20), '> ', FOOTER, '? for shortcuts'], 'claude'), 'stalled banner still detects');
+  // Agent already resumed past the banner and went idle at an empty box: ordinary
+  // output sits between the banner and the box, so it is stale — no detection.
+  assert.equal(detectBanner([banner, 'Edited foo.js', 'All tests pass.', '> ', FOOTER], 'claude'), null, 'worked-past banner is stale');
+});
+
+test('a pathological long-digit line is handled fast and is not a false limit (DOG-24)', () => {
+  const evil = `${'9'.repeat(50_000)}-hour`;   // unbounded \d+[- ]hour backtracks super-linearly
+  const start = performance.now();
+  assert.equal(detectBanner([evil, '> '], 'claude'), null);
+  const elapsed = performance.now() - start;
+  assert.ok(elapsed < 100, `pathological line took ${elapsed.toFixed(1)}ms`);
+  // Legitimate hour/word banners still match.
+  assert.ok(detectBanner(['5-hour limit reached. Try again at 3pm.', '> '], 'claude'));
+  assert.ok(detectBanner(['weekly limit reached, resets in 3 days', '> '], 'claude'));
+  assert.ok(detectBanner(['usage limit reached. resets at 3pm', '> '], 'claude'));
+});
+
 test('only scans the last 15 lines', () => {
   const lines = [...CLAUDE_BANNER, ...Array(20).fill('normal output')];
   assert.equal(detectBanner(lines), null);
@@ -157,6 +178,18 @@ test('non-outage API errors do not match', () => {
 
 test('the Claude pattern is not applied to codex terminals', () => {
   assert.equal(detectBanner(outageTail(CLAUDE_529), 'codex'), null);
+});
+
+test('the Claude usage footer below the outage banner does not hide it (DOG-24)', () => {
+  // Every real Claude terminal shows the FOOTER as its bottom line, after the
+  // input box. The footer is chrome, not the agent moving on, so a 529 above it
+  // must still detect as a final, stalled outage.
+  const b = detectBanner([CLAUDE_529, '', '> ', FOOTER, '? for shortcuts'], 'claude');
+  assert.ok(b, 'outage detected with the footer as the trailing line');
+  assert.equal(b.kind, 'outage');
+  assert.equal(b.patternId, 'claude-api-error');
+  // The Codex outage-with-footer path stays detected too.
+  assert.equal(detectBanner(CODEX_TAIL, 'codex').kind, 'outage');
 });
 
 test('prose, code and logs mentioning errors do not match', () => {
@@ -354,6 +387,40 @@ test('older past time rolls to tomorrow', () => {
 
 test('unparsable returns null', () => {
   assert.equal(parseResetTime('resets eventually', NOW), null);
+});
+
+test('out-of-range relative reset returns null, not an Invalid Date that throws (DOG-24)', () => {
+  // An unbounded digit run overflows the Date range → an Invalid Date object.
+  // It must come back as null so the `?? fallback` (and `?.toISOString()`) engage
+  // instead of a RangeError aborting the whole tick.
+  for (const text of ['resets in 9999999999 days', 'try again in 999999999999 hours',
+    'resets in 99999999999999 minutes', 'resets in 9999999999h 30m']) {
+    assert.equal(parseResetTime(text, NOW), null, text);
+  }
+  // A sane relative reset still parses.
+  assert.equal(parseResetTime('resets in 3 days', NOW).getTime(), NOW.getTime() + 3 * 24 * 60 * 60_000);
+});
+
+test('parseResetTime is DST-safe across a spring-forward boundary and year rollover (DOG-24, regression)', async () => {
+  // Runs under a fixed DST timezone in a child so the assertion is deterministic
+  // regardless of the host zone. Locks the wall-clock-preserving behavior of the
+  // local-setter math: finding 1.6's described "hour off / past time" defect was
+  // not reproducible (JS setHours/setDate/setMonth/setFullYear keep wall-clock).
+  const wdUrl = new URL('./watchdog.mjs', import.meta.url).href;
+  const script = `
+    const { parseResetTime } = await import(${JSON.stringify(wdUrl)});
+    const sf = parseResetTime('try again at 3:00', new Date(2026, 2, 7, 23, 0, 0)); // Mar 7 eve, NY spring-forward is Mar 8
+    const my = parseResetTime('resets Jan 3 at 3pm', new Date(2026, 8, 7, 10, 0, 0)); // Sep 7 -> Jan 3 next year
+    process.stdout.write(JSON.stringify({
+      springForward: { h: sf.getHours(), m: sf.getMinutes(), day: sf.getDate(), month: sf.getMonth() },
+      monthDay: { h: my.getHours(), year: my.getFullYear(), month: my.getMonth(), day: my.getDate() },
+    }));
+  `;
+  const { stdout } = await pExecFile(process.execPath, ['--input-type=module', '-e', script],
+    { env: { ...process.env, TZ: 'America/New_York' } });
+  const out = JSON.parse(stdout);
+  assert.deepEqual(out.springForward, { h: 3, m: 0, day: 8, month: 2 });   // next 3:00 wall-clock on the SF day, not an hour off
+  assert.deepEqual(out.monthDay, { h: 15, year: 2027, month: 0, day: 3 }); // just-past month-day rolls to next year at 3pm
 });
 
 // --- reconcile lifecycle ---
@@ -886,7 +953,7 @@ function harness({ tail, terminals, indicator = 'none', state = {}, now = at(10)
     throw new Error(`unexpected orca call ${args.join(' ')}`);
   };
   const fetchImpl = fakeFetch(() => okJson({ status: { indicator } }));
-  const deps = { orca, fetchImpl, env: {}, now: () => now, loadState: () => structuredClone(state), saveState: (e) => { saved = structuredClone(e); }, log: () => {}, reapChoices: () => 0 };
+  const deps = { orca, fetchImpl, env: {}, now: () => now, loadState: () => structuredClone(state), saveState: (e) => { saved = structuredClone(e); }, log: () => {}, reapChoices: () => 0, isDisabled: () => false };
   return { deps, sent, orcaCalls, fetchImpl, saved: () => saved };
 }
 const T = { handle: H, connected: true, writable: true, agentIdentity: 'claude' };
@@ -951,17 +1018,40 @@ test('tick: dry-run never spawns, persists, reads or clears choices (DOG-20)', a
     assert.deepEqual(effects, []); assert.deepEqual(h.sent, []); assert.equal(h.saved(), null);
   }
 });
-test('tick: spawn throws or emits error, claim persists and warning is logged (DOG-20)', async () => {
+test('tick: a failed alert spawn (sync throw or async error) re-arms by clearing alertedAt (DOG-24)', async () => {
+  // A spawn failure means no dialog was ever shown, so the claim must be released
+  // (alertedAt=null) for the next tick to re-arm the alert — otherwise the reset-
+  // less limit is wedged forever waiting on a choice file that never appears.
   for (const asyncError of [false, true]) {
     const h = alertHarness(); const warnings = []; const child = new EventEmitter();
     h.deps.log = (level, message) => { if (level === 'warn') warnings.push(message); };
     h.deps.spawn = () => { if (!asyncError) throw new Error('spawn failed'); return child; };
     await tick({ dryRun: false }, h.deps);
     if (asyncError) child.emit('error', new Error('spawn failed'));
-    assert.equal(h.saved()[H].alertedAt, NOW.toISOString()); assert.equal(h.saved()[H].status, 'awaiting-user');
+    assert.equal(h.saved()[H].alertedAt, null, `re-armed (asyncError=${asyncError})`);
+    assert.equal(h.saved()[H].status, 'awaiting-user');
     assert.deepEqual(h.sent, []); assert.ok(warnings.some((m) => /spawn failed/.test(m)));
   }
 });
+test('tick: a limit-open event with an unsafe handle is skipped with a warn, never spawned (DOG-24)', async () => {
+  // A handle from `orca terminal list` that is not a safe path component (e.g. it
+  // contains ".") would make choicePath throw and churn the alert path every tick.
+  // It must be skipped gracefully instead: no claim, no spawn.
+  const badH = 'term.with.dots';
+  const ev = { handle: badH, kind: 'limit-open', platform: 'codex', bannerText: 'x', detectedAt: NOW.toISOString(),
+    resetAt: NOW.toISOString(), attempts: 0, lastAttemptAt: null, status: 'awaiting-user', alertedAt: null, episodeId: 'ep-1' };
+  const term = { ...T, handle: badH, agentIdentity: 'codex' };
+  const h = harness({ tail: OPEN_TAIL, terminals: [term], state: { [badH]: ev }, now: NOW });
+  const logs = [];
+  h.deps.log = (lvl, msg) => logs.push(`${lvl} ${msg}`);
+  let spawned = false;
+  h.deps.spawn = () => { spawned = true; };
+  await tick({ dryRun: false }, h.deps);   // must not throw
+  assert.equal(spawned, false, 'must not spawn an alert for an unsafe handle');
+  assert.equal(h.saved()[badH].alertedAt, null, 'must not claim');
+  assert.ok(logs.some((l) => l.startsWith('warn') && /handle/.test(l)), logs.join(' | '));
+});
+
 test('tick: choices stay bound to two terminals and read/unlink failures are bounded (DOG-20)', async () => {
   for (const failure of [null, 'read', 'clear']) {
     const ev = LO({ alertedAt: NOW.toISOString() });
@@ -1230,10 +1320,26 @@ test('tick: status major suppresses without consuming an attempt', async () => {
   assert.equal(h.saved()[H].status, 'waiting');
 });
 
+test('tick: an unverifiable (null) status holds the outage send fail-closed and logs it (DOG-24)', async () => {
+  // indicator null ⇒ fetchIndicator returns null (unverifiable). Connectivity is
+  // still ok, but an unverifiable provider health must NOT authorize an outage
+  // resume during a possibly-continuing outage. (null, not undefined: the harness
+  // default only replaces undefined.)
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed(), indicator: null });
+  const logs = [];
+  h.deps.log = (level, msg) => logs.push(msg);
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.saved()[H].attempts, 0);
+  assert.equal(h.saved()[H].status, 'waiting');
+  assert.ok(logs.some((m) => m === 'hold: provider health unverifiable'), logs.join(' | '));
+});
+
 test('tick: limit events probe connectivity once, then send the limit text (DOG-19)', async () => {
   const st = { [H]: { ...LIMIT_EV, platform: 'claude', bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
     attempts: 0, lastAttemptAt: null, status: 'waiting' } };
-  const h = harness({ tail: [...CLAUDE_BANNER, '? for shortcuts'], terminals: [T], state: st, indicator: 'major' });
+  // Banner reset ("11pm") re-parses to the stored due time, so no reset-shift hold (DOG-24).
+  const h = harness({ tail: ['Claude usage limit reached. Your limit will reset at 11pm.', '> ', '? for shortcuts'], terminals: [T], state: st, indicator: 'major' });
   await tick({ dryRun: false }, h.deps);
   assert.deepEqual(h.sent, [RESUME_TEXT]);
   assert.equal(h.fetchImpl.calls.length, 1);
@@ -1277,6 +1383,31 @@ test('tick: online probe runs once and permits the send (DOG-19)', async () => {
   assert.equal(h.fetchImpl.calls[0].url, CONNECTIVITY_URL);   // probe first
 });
 
+test('tick: a limit whose reset shifts materially later is refreshed and held, not sent early (DOG-24)', async () => {
+  // Stored reset is due (NOW), but the still-present banner now shows a later
+  // reset (1am tomorrow). The pre-send re-read must honour the new time and hold
+  // rather than resume early and burn a retry.
+  const st = { [H]: { ...LIMIT_EV, platform: 'claude', bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
+    attempts: 0, lastAttemptAt: null, status: 'waiting' } };
+  const laterBanner = 'Claude usage limit reached. Your limit will reset at 1am.';
+  const h = harness({ tail: [laterBanner, '> ', '? for shortcuts'], terminals: [T], state: st });   // now = at(10)
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, []);
+  assert.equal(h.saved()[H].resetAt, parseResetTime(laterBanner, at(10)).toISOString());
+  assert.equal(h.saved()[H].attempts, 0);
+  assert.equal(h.saved()[H].status, 'waiting');
+});
+
+test('tick: an out-of-range reset banner creates an event with a fallback reset and does not throw (DOG-24)', async () => {
+  const huge = 'Claude usage limit reached. Your limit will reset in 9999999999 days.';
+  const h = harness({ tail: [huge, '> ', '? for shortcuts'], terminals: [T], state: {}, now: NOW });
+  await tick({ dryRun: false }, h.deps);   // must not throw a RangeError
+  const ev = h.saved()[H];
+  assert.equal(ev.kind, 'limit');
+  assert.equal(ev.resetAt, new Date(NOW.getTime() + 60 * 60_000).toISOString());   // 60-min fallback
+  assert.deepEqual(h.sent, []);
+});
+
 test('isInputOccupied: a ">" line with text after it is a user draft', () => {
   assert.equal(isInputOccupied(['API Error: 529', '> my half typed draft', '? for shortcuts']), true);
   assert.equal(isInputOccupied(['API Error: 529', '> ', '? for shortcuts']), false);
@@ -1288,6 +1419,27 @@ test('isInputOccupied: Codex draft counts, the placeholder does not', () => {
   assert.equal(isInputOccupied([CODEX_ERR, '› fix the flaky test', CODEX_FOOTER]), true);
   assert.equal(isInputOccupied([CODEX_ERR, '› Ask Codex to do anything', CODEX_FOOTER]), false);
   assert.equal(isInputOccupied([CODEX_ERR, '›', CODEX_FOOTER]), false);
+});
+
+test('isInputOccupied: a shell prompt carrying an unsubmitted command is occupied (DOG-24)', () => {
+  // Belt-and-suspenders behind the final-block detection guard: a populated shell
+  // line ends in ordinary text, so a naive send would append+submit the command.
+  assert.equal(isInputOccupied(['API Error: 529', '', 'john@mac ~ % echo do-not-submit']), true);
+  assert.equal(isInputOccupied(['$ npm test']), true);
+  assert.equal(isInputOccupied(['repo git:(main) ➜ rm -rf build']), true);
+  // The EMPTY shell prompt is the exited-to-shell case (isShellPrompt drops it);
+  // it must NOT read as occupied, or that drop path would be masked.
+  assert.equal(isInputOccupied(['john@mac ~ %']), false);
+  assert.equal(isInputOccupied(['Done. 50% coverage; costs $5 total.']), false);   // not a prompt+command
+});
+
+test('isInputOccupied: an indented draft still counts as occupied (DOG-24)', () => {
+  // Detection uses .trim(); the draft guard must too, or an indented draft is
+  // missed and a send could append+submit the user's text. Strictly adds skips.
+  assert.equal(isInputOccupied(['  > half-typed']), true);
+  assert.equal(isInputOccupied(['\t› indented codex draft', CODEX_FOOTER]), true);
+  assert.equal(isInputOccupied(['   > ']), false);                       // indented empty box is not a draft
+  assert.equal(isInputOccupied(['  › Ask Codex to do anything']), false); // indented placeholder is not a draft
 });
 
 test('tick: an occupied input box skips the send and leaves the event untouched (DOG-7)', async () => {
@@ -1323,6 +1475,35 @@ test('tick: a throwing send is logged and the remaining candidates still send (D
   assert.deepEqual(sent, [H2]);
   assert.equal(saved[H].attempts, 1, 'attempt was persisted before the failed send');
   assert.ok(logged.some((l) => l.startsWith('warn send failed for term_') && l.includes('agent_prompt_stalled')), logged.join('\n'));
+});
+
+test('tick: a throw while processing one send candidate does not abort the others (DOG-24)', async () => {
+  const H2 = 'term_two';
+  const T2 = { ...T, handle: H2 };
+  const sent = [];
+  const logged = [];
+  const reads = {};
+  const orca = async (args) => {
+    const [scope, verb] = args;
+    if (verb === 'list') return { terminals: [T, T2] };
+    if (verb === 'read') {
+      const handle = args[args.indexOf('--terminal') + 1];
+      reads[handle] = (reads[handle] || 0) + 1;
+      // observation read is fine; the FRESH re-read for H returns a malformed
+      // (non-array) tail so detectBanner throws inside the send loop.
+      if (handle === H && reads[handle] === 2) return { terminal: { tail: 42 } };
+      return { terminal: { tail: OUTAGE_TAIL } };
+    }
+    if (verb === 'wait') return {};
+    if (verb === 'send') { sent.push(args[args.indexOf('--terminal') + 1]); return {}; }
+    throw new Error(`unexpected orca call ${args.join(' ')}`);
+  };
+  const state = { ...seed(), [H2]: { ...seed()[H], handle: H2 } };
+  const deps = { orca, fetchImpl: fakeFetch(() => okJson({ status: { indicator: 'none' } })), env: {}, now: () => at(10),
+    loadState: () => structuredClone(state), saveState: () => {}, log: (lvl, msg) => logged.push(`${lvl} ${msg}`), reapChoices: () => 0, isDisabled: () => false };
+  await tick({ dryRun: false }, deps);   // must NOT throw/abort
+  assert.deepEqual(sent, [H2]);          // the healthy candidate still sends
+  assert.ok(logged.some((l) => l.startsWith('warn') && l.includes(H)), logged.join('\n'));
 });
 
 test('tick: multi-line orca errors are logged on one line (DOG-13)', async () => {
@@ -1399,17 +1580,47 @@ test('tick: banner cleared on fresh re-read holds one tick then deletes; kind ch
   assert.equal(changed.saved()[H].kind, 'limit'); assert.equal(changed.saved()[H].attempts, 0);
 });
 
-test('tick: shell prompt on the fresh tail deletes the event and sends nothing', async () => {
-  // A limit banner still detects with a trailing shell prompt (no final-block
-  // requirement), so the fresh re-read reaches the prompt guard: the agent has
-  // exited to a shell, the event is dropped and nothing is sent.
+test('tick: a limit banner trailing a shell prompt is stale on the fresh re-read; held then deleted, never sent (DOG-24)', async () => {
+  // With the generic-limit final-block guard (1.2), a banner the agent scrolled
+  // past to a shell prompt no longer detects on the fresh re-read: it is held as
+  // a first miss (clearedAt) this tick and deleted on the next absent tick. Both
+  // ticks send nothing — the exited-to-shell case stays no-send.
   const st = { [H]: { ...LIMIT_EV, platform: 'claude', bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
     attempts: 0, lastAttemptAt: null, status: 'waiting' } };
+  const shellTail = ['Claude usage limit reached. Your limit will reset at 3am.', 'john@mac ~ %'];
   const h = harness({ tail: [...CLAUDE_BANNER, '? for shortcuts'], terminals: [T], state: st });
   let reads = 0; const inner = h.deps.orca;
-  h.deps.orca = async (args) => (args[1] === 'read' && ++reads === 2) ? { terminal: { tail: ['Claude usage limit reached. Your limit will reset at 3am.', 'john@mac ~ %'] } } : inner(args);
+  h.deps.orca = async (args) => (args[1] === 'read' && ++reads === 2) ? { terminal: { tail: shellTail } } : inner(args);
+  await tick({ dryRun: false }, h.deps);
+  assert.deepEqual(h.sent, []);
+  assert.ok(h.saved()[H].clearedAt, 'first miss holds with clearedAt');
+  assert.equal(h.saved()[H].attempts, 0);
+  const next = harness({ tail: shellTail, terminals: [T], state: h.saved() });
+  await tick({ dryRun: false }, next.deps);
+  assert.deepEqual(next.sent, []); assert.deepEqual(next.saved(), {});
+});
+
+test('tick: shell-prompt guard still drops a detecting banner ending in a bare ">" (DOG-24)', async () => {
+  // The banner ends in a bare ">" — chrome, so it still detects on the fresh
+  // re-read — but on a non-Claude terminal that ">" is a shell prompt, so the
+  // prompt guard drops the event and sends nothing. Keeps the guard reachable.
+  const st = { [H]: { ...LIMIT_EV, platform: 'unknown', bannerText: BANNER, detectedAt: NOW.toISOString(), resetAt: NOW.toISOString(),
+    attempts: 0, lastAttemptAt: null, status: 'waiting' } };
+  const term = { ...T, agentIdentity: undefined };
+  // "11pm" re-parses to the stored due time so the reset-shift hold (DOG-24) does not fire first.
+  const h = harness({ tail: ['Claude usage limit reached. Your limit will reset at 11pm.', '> '], terminals: [term], state: st });
   await tick({ dryRun: false }, h.deps);
   assert.deepEqual(h.sent, []); assert.deepEqual(h.saved(), {});
+});
+
+test('tick: pause appearing mid-tick halts the remaining sends in the same tick (DOG-24)', async () => {
+  const H2 = 'term_two';
+  const T2 = { ...T, handle: H2 };
+  const state = { ...seed(), [H2]: { ...seed()[H], handle: H2 } };
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T, T2], state });
+  h.deps.isDisabled = () => h.sent.length >= 1;   // becomes paused right after the first send
+  await tick({ dryRun: false }, h.deps);
+  assert.equal(h.sent.length, 1, 'second candidate must not send once paused');
 });
 
 test('tick: two due Claude outages share one status fetch and both send when status is none', async () => {
@@ -1470,6 +1681,18 @@ test('debug lines are suppressed unless WATCHDOG_DEBUG is set', () => {
   for (const lvl of ['info', 'warn', 'error']) assert.equal(shouldLog(lvl, {}), true);
 });
 
+test('orca(): malformed JSON stdout becomes an unavailable error, not an unhandled throw (DOG-24)', async () => {
+  const badExec = async () => ({ stdout: 'not json at all' });
+  await assert.rejects(watchdog.orca(['terminal', 'list'], badExec), (e) => {
+    assert.equal(isUnavailableError(e), true);   // the tick's list-catch treats it as "nothing to observe"
+    return true;
+  });
+  const structured = async () => ({ stdout: JSON.stringify({ ok: false, error: { code: 'runtime_unavailable', message: 'down' } }) });
+  await assert.rejects(watchdog.orca(['terminal', 'list'], structured), (e) => { assert.equal(e.code, 'runtime_unavailable'); return true; });
+  const good = async () => ({ stdout: JSON.stringify({ ok: true, result: { terminals: [] } }) });
+  assert.deepEqual(await watchdog.orca(['terminal', 'list'], good), { terminals: [] });
+});
+
 test('runtime_unavailable and CLI command failure both count as orca unavailable', () => {
   assert.equal(isUnavailableError(Object.assign(new Error('x'), { code: 'runtime_unavailable' })), true);
   assert.equal(isUnavailableError(new Error('Command failed: /usr/local/bin/orca terminal list --json')), true);
@@ -1513,6 +1736,16 @@ test('sanitize keeps filesystem paths but still redacts long opaque tokens (DOG-
   assert.equal(sanitize('token eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9abc'), 'token [redacted]');
 });
 
+test('sanitize redacts secret-shaped name=value pairs incl. slash-bearing values; keeps paths (DOG-24)', () => {
+  assert.equal(sanitize('api_key=sk-abc/def123ghi'), 'api_key=[redacted]');
+  assert.equal(sanitize('secret: aa/bb/cc/dd112233'), 'secret: [redacted]');
+  assert.equal(sanitize('password=hunter2/xyz'), 'password=[redacted]');
+  assert.equal(sanitize('X-Api-Token=abc123def'), 'X-Api-Token=[redacted]');
+  // ordinary filesystem paths are never redacted
+  assert.equal(sanitize('/Users/example/Projects/x'), '/Users/example/Projects/x');
+  assert.equal(sanitize('see /var/log/app.log now'), 'see /var/log/app.log now');
+});
+
 test('sanitize strips ANSI, collapses whitespace and truncates', () => {
   assert.equal(sanitize('\x1b[2m  a \n\t b  \x1b[0m'), 'a b');
   assert.equal(sanitize('x'.repeat(10), 4), 'xxxx…');
@@ -1538,6 +1771,70 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 const pExecFile = promisify(execFile);
+
+import { parseArgv } from './watchdog.mjs';
+
+test('parseArgv: no-args ticks, known flags dispatch, unknown tokens fail closed (DOG-24)', () => {
+  assert.deepEqual(parseArgv([]), { action: 'tick', dryRun: false });
+  assert.deepEqual(parseArgv(['--once']), { action: 'tick', dryRun: false });
+  assert.deepEqual(parseArgv(['--dry-run']), { action: 'tick', dryRun: true });
+  assert.deepEqual(parseArgv(['--status']), { action: 'status' });
+  assert.deepEqual(parseArgv(['--help']), { action: 'help' });
+  assert.deepEqual(parseArgv(['-h']), { action: 'help' });
+  assert.deepEqual(parseArgv(['--bogus']), { action: 'error', unknown: ['--bogus'] });
+  assert.deepEqual(parseArgv(['--dr-run']), { action: 'error', unknown: ['--dr-run'] });   // typo'd --dry-run
+  assert.deepEqual(parseArgv(['--status', '--bogus']), { action: 'error', unknown: ['--bogus'] });
+});
+
+test('watchdog.mjs entry: no-args ticks; --bogus fails closed without ticking; --help does not tick (DOG-24)', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-argv-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const orcaLog = path.join(dir, 'orca.log');
+  const fakeOrca = path.join(dir, 'orca');
+  fs.writeFileSync(fakeOrca, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${orcaLog}"\nprintf '{"ok":true,"result":{"terminals":[]}}'\n`, { mode: 0o755 });
+  const run = (args) => pExecFile(process.execPath, [path.join(process.cwd(), 'watchdog.mjs'), ...args],
+    { env: { ...process.env, HOME: dir, ORCA_CLI: fakeOrca } });
+  // no-args: a real tick runs and lists terminals via orca
+  await run([]);
+  assert.match(fs.readFileSync(orcaLog, 'utf8'), /terminal list/);
+  fs.rmSync(orcaLog, { force: true });
+  // --bogus: usage to stderr, exit non-zero, and NO tick (orca never called)
+  await assert.rejects(run(['--bogus']), (e) => {
+    assert.notEqual(e.code, 0); assert.match(e.stderr, /Usage: watchdog\.mjs/); return true;
+  });
+  assert.equal(fs.existsSync(orcaLog), false);
+  // --help: usage to stdout, exit 0, still no tick
+  const help = await run(['--help']);
+  assert.match(help.stdout, /Usage: watchdog\.mjs/);
+  assert.equal(fs.existsSync(orcaLog), false);
+});
+
+test('acquireLock: a stale lock is reclaimed exactly once; a fresh lock is never stolen (DOG-24)', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-lock-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const lock = path.join(dir, 'lock');
+  // stale lock: backdate its mtime past the 10-min TTL
+  fs.writeFileSync(lock, '99999');
+  const old = new Date(Date.now() - 11 * 60_000);
+  fs.utimesSync(lock, old, old);
+  assert.equal(watchdog.acquireLock(lock), true, 'first attempt reclaims the stale lock');
+  assert.equal(watchdog.acquireLock(lock), false, 'second attempt sees the fresh lock and skips');
+  assert.equal(watchdog.acquireLock(lock), false, 'a fresh lock is never reclaimed');
+  // no stale steal-temp files are left behind
+  assert.deepEqual(fs.readdirSync(dir), ['lock']);
+});
+
+test('saveState writes 0600 state in a 0700 dir, tightening an existing loose dir (DOG-24)', (t) => {
+  if (process.platform === 'win32') return;   // POSIX modes not represented
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-perm-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const dir = path.join(base, 'state');
+  fs.mkdirSync(dir);
+  fs.chmodSync(dir, 0o755);   // start world-readable
+  watchdog.saveState({}, dir);
+  assert.equal(fs.statSync(dir).mode & 0o777, 0o700, 'dir tightened to 0700');
+  assert.equal(fs.statSync(path.join(dir, 'state.json')).mode & 0o777, 0o600, 'state file is 0600');
+});
 
 test('CLI entry runs when invoked through a symlinked path (DOG-6)', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-symlink-'));
