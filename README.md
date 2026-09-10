@@ -3,11 +3,11 @@
 **Orca Watchdog** is a local [launchd](https://www.launchd.info/) daemon for
 macOS that watches your connected [Orca](https://orca.dev) terminals for a
 stalled agent TUI and sends a one-line resume prompt when — and only when — it
-is safe to. Zero AI, zero tokens: it does its job precisely when the agent
-subscriptions it watches are exhausted. (The installed command is
-`orca-watchdog`.)
+is safe to. Zero AI, zero tokens: it acts precisely when the agent subscriptions
+it watches are exhausted or a provider is down, and does nothing the rest of the
+time. (The installed command is `orca-watchdog`.)
 
-It handles these conditions:
+It handles three conditions:
 
 - **Rate limit** — a terminal shows a limit banner with a stated reset time. The
   watchdog waits until that time has passed and the terminal is still idle on the
@@ -18,17 +18,24 @@ It handles these conditions:
   (`status.claude.com` / `status.openai.com`), and resumes once the incident
   clears.
 - **Codex limit with no reset time** — asks you what to do in a native macOS
-  alert; nothing is sent until you choose Continue or Wait 1h.
+  alert; nothing is sent until you choose **Continue** or **Wait 1h**.
 
-It is plain Node with no dependencies and no network access beyond a
+It is plain Node with no dependencies, and its only network access is a
 lightweight connectivity probe (before any resume) and the two status pages
 (contacted only when an outage resume is actually due).
+
+> [!IMPORTANT]
+> The watchdog's entire blast radius is `orca terminal send` into your live
+> agent terminals. Every design choice errs toward **not** sending: it installs
+> stopped, holds instead of guessing whenever a check is inconclusive, and never
+> touches a terminal that is busy, holds a draft, or has dropped to a shell
+> prompt.
 
 ## Requirements
 
 - **macOS** (uses `launchd` and `plutil`).
 - **Node.js 22 or newer.** Homebrew installs this for you; the archive install
-  expects `node` on your `PATH` (or set `ORCA_WATCHDOG_NODE`).
+  expects `node` on your `PATH` (or set `ORCA_WATCHDOG_NODE` to an absolute path).
 - **[Orca](https://orca.dev)** with its `orca` CLI available (or set `ORCA_CLI`
   to its absolute path). The watchdog needs `orca terminal list/read/wait/send`.
 
@@ -40,7 +47,7 @@ terminal is ever touched until you explicitly `start` it.
 ### Homebrew (recommended)
 
 On newer Homebrew, first trust the third-party tap with `brew trust johncioni/tap`
-(or approve interactively) before installing:
+(or approve interactively), then install:
 
 ```bash
 brew install johncioni/tap/orca-watchdog
@@ -49,14 +56,15 @@ brew install johncioni/tap/orca-watchdog
 ### Archive
 
 Download the release archive and its checksum from the
-[releases page](https://github.com/johncioni/orca-watchdog/releases),
-verify it, then run the bundled installer:
+[releases page](https://github.com/johncioni/orca-watchdog/releases), verify it,
+then run the bundled installer (substitute the version you downloaded for
+`<version>`):
 
 ```bash
 # from the download directory, with the .tar.gz and .sha256 side by side:
-shasum -a 256 -c orca-watchdog-0.1.0.tar.gz.sha256   # verify the download
-tar xzf orca-watchdog-0.1.0.tar.gz
-cd orca-watchdog-0.1.0
+shasum -a 256 -c orca-watchdog-<version>.tar.gz.sha256   # verify the download
+tar xzf orca-watchdog-<version>.tar.gz
+cd orca-watchdog-<version>
 ./install.sh
 ```
 
@@ -84,9 +92,13 @@ orca-watchdog --dry-run  # run one observation-only tick; never sends input
 orca-watchdog stop       # unregister the LaunchAgent (state is retained)
 ```
 
-Logs and state live under `~/.local/state/orca-watchdog/`:
-`watchdog.log` (activity), `launchd.out.log` / `launchd.err.log` (service
-output), `state.json` (tracked events), and `disabled` (present while paused).
+`pause` takes effect immediately — it also halts the remaining sends of a tick
+that is already running, not just future ticks.
+
+Logs and state live under `~/.local/state/orca-watchdog/`: `watchdog.log`
+(activity), `launchd.out.log` / `launchd.err.log` (service output), `state.json`
+(tracked events), and `disabled` (present while paused). State and log files are
+created owner-only (`0600`).
 
 ## Update
 
@@ -115,73 +127,108 @@ orca-watchdog stop
 orca-watchdog start
 ```
 
-Your pause state and tracked events are preserved across updates.
-Downgrading to a version from before the reset-less alert feature causes that
-version to back up and reset a state file containing the new event kind.
+Your pause state and tracked events are preserved across updates. Downgrading to
+a version from before the reset-less alert feature causes that version to back up
+and reset a state file that contains the newer event kind.
 
 ## Remove
 
 ```bash
 orca-watchdog stop
 brew uninstall johncioni/tap/orca-watchdog   # Homebrew
-./uninstall.sh                                      # archive
+./uninstall.sh                               # archive
 ```
 
-Removal unregisters the service and deletes the installed copy but **retains
-your state** at `~/.local/state/orca-watchdog/`. Delete that directory by
-hand if you want a clean slate.
+Removal unregisters the service and deletes the installed copy but **retains your
+state** at `~/.local/state/orca-watchdog/`. Delete that directory by hand if you
+want a clean slate.
 
 ## Troubleshooting
 
-- **`orca-watchdog doctor`** is the first stop: it reports macOS, Node,
-  Orca CLI, launchd registration, pause, and event state, and exits non-zero if
-  anything required is missing.
+- **`orca-watchdog doctor`** is the first stop: it reports macOS, Node, Orca CLI,
+  launchd registration, pause, and event state, and exits non-zero if anything
+  required is missing.
 - **`orca` not found under launchd?** launchd runs with a minimal `PATH`. The
   watchdog resolves absolute paths to Node and Orca when you `start`, so start it
   from a shell where `orca` resolves, or set `ORCA_CLI` to an absolute path.
-- **Nothing happens on a stalled terminal?** Run `orca-watchdog --dry-run`
-  to see what the current tick observes, and check `watchdog.log`.
+- **Nothing happens on a stalled terminal?** Run `orca-watchdog --dry-run` to see
+  what the current tick observes, and check `watchdog.log`.
 
 ## How it works
 
 `launchd` runs `watchdog.mjs` every 5 minutes. Each tick reads every connected
-Orca terminal's tail and looks for a rate-limit or outage banner in the last few
-lines:
+Orca terminal's tail, looks for a banner in the last 15 lines, reconciles what it
+finds against the events it is already tracking, and then — for any event whose
+resume is due — walks a fixed sequence of safety gates before it will send. If
+any gate is inconclusive, it holds and tries again on a later tick.
 
-- **Rate limit:** parses the stated reset time; once it has passed and the
-  terminal is still idle on the banner, sends one resume prompt. Normally one
-  send per event, with up to two retries 30 minutes apart before it gives up
-  loudly in the log.
-- **API outage:** waits 10 minutes, then before each send checks the relevant
+```mermaid
+flowchart TD
+    A["launchd timer — every 5 min"] --> P{"Paused, or another<br/>tick already running?"}
+    P -->|yes| Z(["Do nothing"])
+    P -->|no| R["Read every connected<br/>Orca terminal's tail"]
+    R --> D["Detect a banner in the last 15 lines:<br/>rate limit, outage, or Codex reset-less limit"]
+    D --> RC["Reconcile events<br/>(new, cleared, replaced, re-armed, gave up)"]
+    RC --> Q{"Any event due<br/>to resume?"}
+    Q -->|no| Z
+    Q -->|yes, each| G0{"Paused now?"}
+    G0 -->|yes| Z
+    G0 -->|no| G1{"Online?<br/>probe captive.apple.com"}
+    G1 -->|offline| HOLD["Hold — no attempt spent,<br/>retry next tick"]
+    G1 -->|online| G2{"Outage? re-check<br/>the status page"}
+    G2 -->|incident or unverifiable| HOLD
+    G2 -->|healthy / not an outage| G3{"Terminal idle?<br/>orca wait tui-idle"}
+    G3 -->|busy| SKIP["Skip this tick"]
+    G3 -->|idle| G4["Re-read the tail<br/>and re-detect the banner"]
+    G4 --> G5{"Still the same banner,<br/>still due?"}
+    G5 -->|no| SKIP
+    G5 -->|yes| G6{"Last line a shell prompt?<br/>(agent has exited)"}
+    G6 -->|yes| DROP["Drop the event"]
+    G6 -->|no| G7{"Input box holds<br/>a draft?"}
+    G7 -->|yes| SKIP
+    G7 -->|no| SEND(["Send ONE resume prompt<br/>orca terminal send"])
+```
+
+The details behind the diagram:
+
+- **Rate limit.** Parses the stated reset time; once it has passed and the
+  terminal is still idle on the banner, sends one resume prompt. Normally one send
+  per event, with up to two retries 30 minutes apart before it gives up loudly in
+  the log. If the banner is still on screen but its reset time moves materially
+  later, the watchdog honours the new time and keeps waiting.
+- **API outage.** Waits 10 minutes, then before each send re-checks the relevant
   status page. A `major`/`critical` incident holds the send without consuming an
-  attempt; any other status-page trouble fails open. Up to 6 sends 30 minutes
-  apart, with a hard stop 24 hours after detection. Codex terminals are held
-  additionally while `Reconnecting... N/5` or `esc to interrupt` is on screen.
+  attempt — and so does a status page that can't be reached or returns an
+  unexpected response: the gate is **fail-closed**, so only a confirmed-healthy
+  status lets the resume proceed (`hold: provider health unverifiable` is logged
+  otherwise). Up to 6 sends 30 minutes apart, with a hard stop 24 hours after
+  detection. Codex terminals are additionally held while `Reconnecting... N/5` or
+  `esc to interrupt` is on screen.
+- **Connectivity probe.** Before sending **any** resume, the watchdog confirms the
+  machine is online with a single HTTPS reachability probe to
+  `https://captive.apple.com/hotspot-detect.html`. While offline it holds without
+  spending an attempt and retries once connectivity returns, so a resume is never
+  fired into the void during a local network drop. The probe host is overridable
+  via `WATCHDOG_CONNECTIVITY_URL` (loopback hosts only, for testing); anything
+  else is ignored with a warning.
+- **Codex reset-less limit.** For a Codex `■` limit banner with no derivable reset
+  time, the watchdog shows one native macOS alert per episode. **Continue** enables
+  retries starting on the next tick, spaced 30 minutes apart, capped at 6 sends and
+  24 hours from your choice. **Wait 1h** delays the first retry by an hour, with the
+  same 24-hour cap (offline time counts toward it). **Stop** suppresses retries
+  until the banner is confirmed gone, even if its wording or reset time changes. No
+  click means no send. Choices are stored per terminal and episode under
+  `~/.local/state/orca-watchdog/choices/` and deleted after consumption. This alert
+  is Codex-only, and `--dry-run` never opens it or consumes a choice.
 
-Before sending **any** resume (limit or outage), the watchdog confirms the
-machine is actually online with a single HTTPS reachability probe to
-`https://captive.apple.com/hotspot-detect.html`. While offline it holds the send
-without spending an attempt and retries on a later tick once connectivity
-returns, so a resume prompt is never fired into the void during a local network
-drop. The probe host is overridable via `WATCHDOG_CONNECTIVITY_URL` (loopback
-hosts only, for testing); anything else is ignored with a warning.
-
-For a Codex `■` limit banner with no derivable reset time, the watchdog shows
-one native macOS alert per episode. **Continue** enables retries starting on
-the next tick, spaced 30 minutes apart, capped at 6 sends and 24 hours from
-your choice. **Wait 1h** delays the first retry by an hour, with the same
-24-hour cap from your choice; offline time counts toward that cap. **Stop**
-suppresses retries until the banner is confirmed gone, even if its wording or
-reset time changes. No click means no send. Choices are stored per terminal
-and episode under `~/.local/state/orca-watchdog/choices/` and deleted
-after consumption. This alert is Codex-only; dry-run never opens it or consumes
-a choice.
-
-All kinds **refuse to send when the terminal's last line is a shell prompt**
-(the agent has exited). Outage detection is scoped to terminals Orca identifies
-as Claude Code or Codex; rate-limit detection is generic. Network access is
-limited to the connectivity probe (once per tick that has a send due) and the two
-status pages (only when an outage send is due).
+A few invariants worth stating plainly: every kind **refuses to send when the
+terminal's last line is a shell prompt** (the agent has exited) or when the input
+box already holds a draft. Outage detection is scoped to terminals Orca identifies
+as Claude Code or Codex; rate-limit detection is generic. Untrusted terminal text
+is length-capped and sanitized (secrets redacted) before it is matched or logged,
+and a malformed read or parse on one terminal can never abort the tick for the
+others. Network access is limited to the connectivity probe (once per tick that
+has a send due) and the two status pages (only when an outage send is due).
 
 ## Contributing & security
 
