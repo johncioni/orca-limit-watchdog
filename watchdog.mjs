@@ -637,14 +637,17 @@ function loadState() {
 
 export function saveState(events, stateDir = STATE_DIR) {
   // Daemon state can name terminals and carry sanitized banner text, so it is kept
-  // owner-only. atomicWriteFile hardens this send-critical write: a symlink/owner-
-  // guarded 0700 dir (tightening a loose one), an unpredictable temp created with
-  // 'wx' (a pre-planted temp symlink cannot be followed), and an atomic rename.
-  // checkTarget:false + hardenDir:false — the rename replaces the state.json entry
-  // atomically without following it, and neither the destination nor the directory may
-  // throw on a tampered-but-valid state (that would skip the resume send that persists
-  // just before it in tick()). This keeps saveState's pre-DOG-29 semantics: mkdir -p
-  // 0700 + best-effort chmod. See atomicWriteFile (DOG-29 #12 + N1).
+  // owner-only. This send-critical write must never THROW on a tampered-but-valid
+  // state (that would skip the resume send persisted just before it in tick()), so it
+  // calls atomicWriteFile with BOTH destination and directory guards OFF:
+  //   checkTarget:false — the rename replaces the state.json entry atomically without
+  //     following a symlink or writing through a hardlink;
+  //   hardenDir:false  — pre-DOG-29 dir semantics (mkdir -p 0700 + best-effort chmod),
+  //     NO symlink/owner rejection. Do NOT "restore" a dir guard here: it would be a
+  //     silent send-blocking throw path and protects nothing (loadState reads through
+  //     the same dir unchecked).
+  // The unpredictable 'wx' temp + atomic rename still defeat a pre-planted temp
+  // symlink. See atomicWriteFile (DOG-29 #12 + N1).
   atomicWriteFile(stateDir, 'state.json', JSON.stringify({ version: 2, events }, null, 2), { checkTarget: false, hardenDir: false });
 }
 
