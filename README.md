@@ -46,12 +46,17 @@ terminal is ever touched until you explicitly `start` it.
 
 ### Homebrew (recommended)
 
-On newer Homebrew, first trust the third-party tap with `brew trust johncioni/tap`
-(or approve interactively), then install:
+Add the tap, trust it (newer Homebrew requires trusting third-party taps), then
+install:
 
 ```bash
+brew tap johncioni/tap
+brew trust johncioni/tap
 brew install johncioni/tap/orca-watchdog
 ```
+
+Homebrew installs Node for you and manages upgrades (see [Update](#update)). It
+also installs the shell completions and the `man orca-watchdog` page.
 
 ### Archive
 
@@ -72,6 +77,21 @@ The archive installs a versioned copy under
 `~/.local/share/orca-watchdog/<version>/` and links the command into
 `~/.local/bin/orca-watchdog` (make sure `~/.local/bin` is on your `PATH`).
 
+The archive also ships shell completions and a man page under `completions/` and
+`man/`, but `install.sh` does not wire them into your shell — set them up by hand
+if you want them (Homebrew does this for you). From the extracted directory:
+
+```bash
+# Bash (with bash-completion): source it, or copy into a completions dir
+source completions/orca-watchdog.bash
+# Zsh: place _orca-watchdog on your $fpath, e.g.
+cp completions/_orca-watchdog ~/.zsh/completions/   # then: fpath+=~/.zsh/completions; autoload -Uz compinit; compinit
+# Fish
+cp completions/orca-watchdog.fish ~/.config/fish/completions/
+# Man page: copy into a directory on your $MANPATH, e.g.
+cp man/orca-watchdog.1 ~/.local/share/man/man1/       # then: man orca-watchdog
+```
+
 ## First run
 
 ```bash
@@ -86,6 +106,7 @@ Once started, `launchd` runs the watchdog every 5 minutes.
 
 ```bash
 orca-watchdog status     # service / pause / events, reported separately
+orca-watchdog logs       # latest activity (read-only); --follow, --lines, --source
 orca-watchdog pause      # stop acting without unregistering or losing state
 orca-watchdog resume     # re-enable
 orca-watchdog --dry-run  # run one observation-only tick; never sends input
@@ -152,7 +173,12 @@ want a clean slate.
   watchdog resolves absolute paths to Node and Orca when you `start`, so start it
   from a shell where `orca` resolves, or set `ORCA_CLI` to an absolute path.
 - **Nothing happens on a stalled terminal?** Run `orca-watchdog --dry-run` to see
-  what the current tick observes, and check `watchdog.log`.
+  what the current tick observes, and read the activity log with
+  `orca-watchdog logs`.
+- **Inspecting logs.** `orca-watchdog logs` prints the latest activity (read-only);
+  add `--follow` to watch it live, `--lines N` for more history, or
+  `--source stdout|stderr` to see the launchd job's own output — the first place to
+  look if the service is registered but ticks never run.
 
 ## How it works
 

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawn, spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -172,13 +172,81 @@ test('pause, resume, stop, and status keep service, pause, and events separate',
     await runCli(['start'], h.env);
     await runCli(['pause'], h.env);
     const paused = await runCli(['status'], h.env);
-    assert.match(paused.stdout, /service:\s+running/);
+    assert.match(paused.stdout, /service:\s+registered/);
     assert.match(paused.stdout, /pause:\s+paused/);
     assert.match(paused.stdout, /events:\s+none/);
     await runCli(['resume'], h.env);
     assert.match((await runCli(['status'], h.env)).stdout, /pause:\s+active/);
     await runCli(['stop'], h.env);
     assert.match((await runCli(['status'], h.env)).stdout, /service:\s+stopped/);
+  } finally { h.cleanup(); }
+});
+
+test('status labels registration, running process and health observations separately', async () => {
+  const h = harness();
+  try {
+    const { statusText, installPaths } = await loadManagement();
+    fs.writeFileSync(h.launchctlState, 'registered');
+    const paths = installPaths(h.home);
+    let output = statusText({ env: h.env });
+    assert.match(output, /service: registered.*periodic/);
+    assert.match(output, /process: unknown/);
+    assert.match(output, /installed version:/);
+    assert.match(output, /last completed check: unknown/);
+    const { beginCheck } = await import('./lib/operations.mjs');
+    beginCheck(paths.stateDir, new Date('2020-01-01T00:00:00Z'));
+    output = statusText({ env: h.env });
+    assert.match(output, /stale/);
+    assert.match(output, /in-progress.*interrupted/);
+  } finally { h.cleanup(); }
+});
+
+test('doctor inspects saved and loaded paths, stable symlinks, stale versions and malformed metadata read-only', async () => {
+  const h = harness();
+  try {
+    const { doctorText, installPaths, VERSION } = await loadManagement();
+    const paths = installPaths(h.home);
+    fs.mkdirSync(paths.launchAgentsDir, { recursive: true });
+    fs.mkdirSync(paths.stateDir, { recursive: true });
+    const stableNode = path.join(h.base, 'stable node'); fs.symlinkSync(process.execPath, stableNode);
+    const runtime = path.join(h.base, 'runtime'); fs.mkdirSync(runtime);
+    fs.writeFileSync(path.join(runtime, 'watchdog.mjs'), '// fixture');
+    fs.writeFileSync(path.join(runtime, 'version.mjs'), `export const VERSION = '${VERSION}';`);
+    const config = { ProgramArguments: [stableNode, path.join(runtime, 'watchdog.mjs')], EnvironmentVariables: { ORCA_CLI: h.orca } };
+    const plutil = path.join(h.base, 'plutil');
+    executable(plutil, '#!/bin/sh\n/bin/cat "$FAKE_PLIST_JSON"\n');
+    h.env.ORCA_WATCHDOG_PLUTIL = plutil;
+    h.env.FAKE_PLIST_JSON = path.join(h.base, 'config.json');
+    fs.writeFileSync(h.env.FAKE_PLIST_JSON, JSON.stringify(config));
+    fs.writeFileSync(paths.plistPath, 'saved fixture');
+    let result = doctorText({ env: h.env });
+    assert.equal(result.failed, false, result.text);
+    assert.match(result.text, /saved Node: ok/);
+    assert.match(result.text, /saved runtime: ok/);
+    assert.match(result.text, /stopped/);
+    executable(h.env.ORCA_WATCHDOG_LAUNCHCTL, '#!/bin/sh\n/bin/cat "$FAKE_LOADED_JOB"\n');
+    h.env.FAKE_LOADED_JOB = path.join(h.base, 'loaded.txt');
+    const loaded = `job = {\n state = not running\n arguments = {\n ${stableNode}\n ${config.ProgramArguments[1]}\n }\n environment = {\n ORCA_CLI => ${h.orca}\n }\n}`;
+    fs.writeFileSync(h.env.FAKE_LOADED_JOB, loaded);
+    result = doctorText({ env: h.env });
+    assert.equal(result.failed, false, result.text);
+    assert.match(result.text, /saved\/loaded: agree/);
+    fs.writeFileSync(path.join(runtime, 'version.mjs'), "export const VERSION = '0.0.0';");
+    result = doctorText({ env: h.env });
+    assert.equal(result.failed, true); assert.match(result.text, /stale.*0\.0\.0/);
+    fs.writeFileSync(h.env.FAKE_LOADED_JOB, loaded.replace(stableNode, '/missing/node'));
+    result = doctorText({ env: h.env });
+    assert.equal(result.failed, true); assert.match(result.text, /saved\/loaded:.*disagree/);
+    assert.match(result.text, /loaded Node: error/);
+    assert.match(result.text, /orca-watchdog stop/);
+    fs.writeFileSync(paths.stateFile, '{"version":2,"events":{"bad":{}}}');
+    fs.writeFileSync(paths.healthFile, '{broken');
+    result = doctorText({ env: h.env });
+    assert.match(result.text, /event state: error/); assert.match(result.text, /health:.*unknown/);
+    assert.equal(fs.readFileSync(paths.healthFile, 'utf8'), '{broken');
+    assert.equal(fs.readFileSync(paths.stateFile, 'utf8'), '{"version":2,"events":{"bad":{}}}');
+    assert.equal(fs.readFileSync(paths.plistPath, 'utf8'), 'saved fixture');
+    assert.doesNotMatch(fs.readFileSync(h.launchctlLog, 'utf8'), /bootstrap|bootout/);
   } finally { h.cleanup(); }
 });
 
@@ -365,5 +433,46 @@ test('installer and uninstaller reject unknown arguments before mutation', async
       /unknown argument.*--wat/i,
     );
     assert.equal(fs.existsSync(path.join(h.home, '.local', 'share', 'orca-watchdog')), false);
+  } finally { h.cleanup(); }
+});
+
+test('serviceIsRunning throws on a signal-killed launchctl (fail closed like inspectService)', async () => {
+  const { serviceIsRunning } = await loadManagement();
+  const h = harness('wd signal ');
+  try {
+    executable(h.env.ORCA_WATCHDOG_LAUNCHCTL, '#!/bin/sh\nkill -KILL $$\n');
+    assert.throws(() => serviceIsRunning(h.env), /could not check service state/);
+  } finally { h.cleanup(); }
+});
+
+test('logs tolerates a reader that closes the pipe early (no EPIPE crash)', async () => {
+  const h = harness('wd epipe ');
+  try {
+    const dir = path.join(h.home, '.local', 'state', 'orca-watchdog');
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'launchd.err.log'), ('x'.repeat(200) + '\n').repeat(20000), { mode: 0o600 });
+    const child = spawn(process.execPath, [CLI, 'logs', '--source', 'stderr', '--lines', '20000'], { env: h.env });
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d; });
+    const exit = new Promise((res, rej) => { child.once('error', rej); child.once('exit', (code, signal) => res({ code, signal })); });
+    await new Promise((res, rej) => { child.stdout.once('data', res); child.once('error', rej); });
+    child.stdout.destroy();   // mimic `| head`: reader closes the pipe early
+    const { code } = await exit;
+    assert.doesNotMatch(stderr, /EPIPE|Unhandled/, stderr);
+    assert.equal(code, 0);
+  } finally { h.cleanup(); }
+});
+
+test('doctor on an incomplete archive (no watchdog.mjs) diagnoses state.json without crashing on validateEvent', async () => {
+  const h = harness('wd incomplete ');
+  try {
+    const { VERSION, installPaths } = await loadManagement();
+    const release = releaseCopy(h.base, VERSION, (r) => fs.rmSync(path.join(r, 'watchdog.mjs')));
+    const paths = installPaths(h.home);
+    fs.mkdirSync(paths.stateDir, { recursive: true });
+    fs.writeFileSync(paths.stateFile, '{"version":2,"events":{"term_x":{"handle":"term_x"}}}');
+    const r = spawnSync(process.execPath, [path.join(release, 'bin', 'orca-watchdog.mjs'), 'doctor'], { env: h.env, encoding: 'utf8' });
+    assert.doesNotMatch(`${r.stdout}${r.stderr}`, /validateEvent is not a function/, `${r.stdout}${r.stderr}`);
+    assert.match(r.stdout, /event state:.*(runtime missing|cannot validate)/);
   } finally { h.cleanup(); }
 });

@@ -1,0 +1,43 @@
+#compdef orca-watchdog
+# zsh completion for orca-watchdog
+
+_orca-watchdog() {
+  local curcontext="$curcontext" state line
+  typeset -A opt_args
+
+  local -a commands
+  commands=(
+    'doctor:Check macOS, Node, Orca, launchd, pause, and event state'
+    'start:Validate and register the LaunchAgent'
+    'stop:Unregister the LaunchAgent'
+    'pause:Disable all watchdog activity without deleting state'
+    'resume:Re-enable watchdog activity'
+    'status:Show service health, pause state, and active events'
+    'logs:Show recent activity or launchd output (read-only)'
+  )
+
+  _arguments -C \
+    '(- *)--help[Show help]' \
+    '(- *)--version[Show the installed version]' \
+    '(- *)--dry-run[Run one observation-only tick]' \
+    '1: :->command' \
+    '*:: :->args'
+
+  case $state in
+    command)
+      _describe -t commands 'orca-watchdog command' commands
+      ;;
+    args)
+      case $line[1] in
+        logs)
+          _arguments \
+            '--follow[Follow the log as it grows]' \
+            '--lines[Number of trailing lines to show]:lines:' \
+            '--source[Which log stream to read]:source:(activity stdout stderr)'
+          ;;
+      esac
+      ;;
+  esac
+}
+
+_orca-watchdog "$@"

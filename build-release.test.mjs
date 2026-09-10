@@ -55,7 +55,9 @@ test('the extracted archive is exactly the release set and passes validateReleas
     for (const rel of ['bin/orca-watchdog', 'bin/orca-watchdog.mjs',
       'lib/management.mjs', 'watchdog.mjs', 'version.mjs', 'install.sh', 'uninstall.sh',
       'scripts/install-archive.mjs', 'scripts/uninstall-archive.mjs', 'README.md',
-      'LICENSE', 'CHANGELOG.md']) {
+      'LICENSE', 'CHANGELOG.md', 'lib/operations.mjs', 'lib/logs.mjs',
+      'completions/orca-watchdog.bash', 'completions/_orca-watchdog',
+      'completions/orca-watchdog.fish', 'man/orca-watchdog.1']) {
       assert.equal(fs.existsSync(path.join(releaseRoot, rel)), true, `missing ${rel}`);
     }
     // Development-only material is excluded.
@@ -72,6 +74,52 @@ test('the extracted archive is exactly the release set and passes validateReleas
   } finally {
     fs.rmSync(outDir, { recursive: true, force: true });
   }
+});
+
+test('formula installs completions and man page into standard directories', async () => {
+  const base = tmp('wd-formula-');
+  try {
+    const { tarball } = buildRelease({ sourceRoot: ROOT, version: VERSION, outDir: base });
+    const release = await extract(tarball);
+    const prefix = path.join(base, 'prefix');
+    const ruby = `require 'pathname'
+require 'fileutils'
+class Pathname
+  def install(*sources)
+    FileUtils.mkdir_p(self.to_s)
+    sources.flatten.each { |s| FileUtils.cp_r(s.to_s, self.to_s) }
+  end
+  def write_env_script(*args, **kwargs)
+    FileUtils.mkdir_p(dirname.to_s)
+    write('fixture wrapper')
+  end
+end
+class Formula
+  def self.desc(*); end
+  def self.homepage(*); end
+  def self.url(*); end
+  def self.sha256(*); end
+  def self.license(*); end
+  def self.depends_on(*); end
+  def self.test; end
+  def libexec; Pathname.new(ENV.fetch('PREFIX'))/'libexec'; end
+  def bin; Pathname.new(ENV.fetch('PREFIX'))/'bin'; end
+  def bash_completion; Pathname.new(ENV.fetch('PREFIX'))/'etc/bash_completion.d'; end
+  def zsh_completion; Pathname.new(ENV.fetch('PREFIX'))/'share/zsh/site-functions'; end
+  def fish_completion; Pathname.new(ENV.fetch('PREFIX'))/'share/fish/vendor_completions.d'; end
+  def man1; Pathname.new(ENV.fetch('PREFIX'))/'share/man/man1'; end
+  def formula_opt_bin(*); Pathname.new('/fixture/node/bin'); end
+end
+load ARGV.fetch(0)
+OrcaWatchdog.new.install
+`;
+    await pExecFile('ruby', ['-e', ruby, path.join(ROOT, 'Formula/orca-watchdog.rb')], { cwd: release, env: { ...process.env, PREFIX: prefix } });
+    for (const rel of ['etc/bash_completion.d/orca-watchdog.bash', 'share/zsh/site-functions/_orca-watchdog',
+      'share/fish/vendor_completions.d/orca-watchdog.fish', 'share/man/man1/orca-watchdog.1']) {
+      assert.ok(fs.existsSync(path.join(prefix, rel)), `formula did not install ${rel}`);
+    }
+    fs.rmSync(path.dirname(release), { recursive: true, force: true });
+  } finally { fs.rmSync(base, { recursive: true, force: true }); }
 });
 
 test('archived install scripts keep their executable bit', async () => {
@@ -112,6 +160,13 @@ test('a version that disagrees with version.mjs is refused before writing anythi
   } finally {
     fs.rmSync(outDir, { recursive: true, force: true });
   }
+});
+
+test('the man page install block adds the brew tap step (matches the README sequence)', () => {
+  const man = fs.readFileSync(path.join(ROOT, 'man', 'orca-watchdog.1'), 'utf8');
+  assert.ok(man.includes('brew tap johncioni/tap'), 'man install block must include the brew tap step');
+  assert.ok(man.includes('brew trust johncioni/tap'), 'man install block must keep the brew trust step');
+  assert.match(man, /brew install johncioni\/tap\/orca\\?-watchdog/, 'man install block must keep the brew install step');
 });
 
 test('the Homebrew formula pins the current version and a well-formed sha256', () => {

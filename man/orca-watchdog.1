@@ -1,0 +1,201 @@
+.TH ORCA\-WATCHDOG 1 "2026-09-10" "orca-watchdog 1.0.0" "User Commands"
+.SH NAME
+orca\-watchdog \- auto\-resume rate\-limited or stalled Orca terminals
+.SH SYNOPSIS
+.B orca\-watchdog
+.I command
+.RI [ options ]
+.SH DESCRIPTION
+.B orca\-watchdog
+is a macOS
+.BR launchd (8)
+user agent that watches every connected Orca terminal for a stalled agent TUI
+and sends a resume prompt only when it is safe to. It resumes after a stated
+rate\-limit reset, and after an API outage once the relevant status page reports
+recovery. It never touches a terminal that is busy, that is waiting on user
+input, or that was deliberately stopped, and it holds instead of guessing
+whenever a check is inconclusive.
+.PP
+The watchdog installs
+.BR stopped .
+Nothing is registered with
+.BR launchd (8)
+and no terminal is ever touched until you explicitly run
+.BR "orca\-watchdog start" .
+Once started,
+.BR launchd (8)
+runs one observation tick every 5 minutes.
+.SH COMMANDS
+.TP
+.B doctor
+Check macOS, Node, the Orca CLI, the
+.BR launchd (8)
+job, pause flag, and event state, and print specific recovery commands.
+Read\-only: it never repairs, restarts, registers, or sends.
+.TP
+.B start
+Validate the environment, then register the LaunchAgent. Resolves absolute paths
+to Node and the Orca CLI at this point.
+.TP
+.B stop
+Unregister the LaunchAgent. Stored state is retained.
+.TP
+.B pause
+Disable all watchdog activity without unregistering or deleting state.
+.TP
+.B resume
+Re\-enable watchdog activity after a
+.BR pause .
+.TP
+.B status
+Show service health, pause state, the installed version, the last completed
+check, the last successful resume, and any pending events with the latest
+waiting reason.
+.TP
+.B logs
+Print the most recent activity, read\-only. See
+.B LOGS
+below for options.
+.TP
+.B \-\-dry\-run
+Run one observation\-only tick and report what it would do. Never sends terminal
+input and never writes state.
+.TP
+.B \-\-help
+Show a usage summary.
+.TP
+.B \-\-version
+Show the installed version.
+.SH LOGS
+.B orca\-watchdog logs
+prints the latest 100 activity lines by default. It is read\-only and never
+rotates or truncates a log.
+.TP
+.B \-\-follow
+Follow the log as it grows, reprinting from the tail across truncation or
+replacement. Interrupt with Ctrl\-C.
+.TP
+.BI \-\-lines " N"
+Show the last
+.I N
+lines instead of 100.
+.I N
+must be a positive integer.
+.TP
+.BI \-\-source " activity|stdout|stderr"
+Choose the stream:
+.B activity
+(the watchdog's own log, the default),
+.B stdout
+or
+.B stderr
+(the
+.BR launchd (8)
+job output). A missing log file reads as empty, which is normal before the
+first tick.
+.SH INSTALLATION
+Homebrew (recommended). Add the tap, trust it (newer Homebrew requires trusting
+third\-party taps), then install:
+.PP
+.RS
+.EX
+brew tap johncioni/tap
+brew trust johncioni/tap
+brew install johncioni/tap/orca\-watchdog
+.EE
+.RE
+.PP
+Homebrew installs Node for you. The archive install requires Node.js 22 or newer
+already on
+.BR PATH ;
+extract the release and run
+.B ./install.sh
+from the extracted directory, which stages the version under
+.I ~/.local/share/orca\-watchdog/<version>/
+and links the command into
+.IR ~/.local/bin/orca\-watchdog .
+.PP
+After installing, start the service explicitly:
+.PP
+.RS
+.EX
+orca\-watchdog doctor
+orca\-watchdog start
+.EE
+.RE
+.SH UPGRADES
+Always stop before upgrading, then verify and start again. Homebrew:
+.PP
+.RS
+.EX
+orca\-watchdog stop
+brew upgrade johncioni/tap/orca\-watchdog
+orca\-watchdog doctor && orca\-watchdog start
+.EE
+.RE
+.PP
+Archive: stop, run the new archive's
+.BR ./install.sh " (it keeps the previous version for rollback), then"
+.BR doctor " and " start "."
+If a new version misbehaves, roll back with
+.B ./install.sh \-\-rollback
+and start again.
+.SH DIAGNOSTICS
+.B orca\-watchdog doctor
+is the first stop for any problem: it reports macOS, Node, Orca CLI, and
+.BR launchd (8)
+state, flags missing targets, stale runtime versions, and disagreement between
+the saved plist and the loaded job, and prints the exact recovery commands.
+A deliberately stopped service is reported as a valid state, not an error.
+Malformed event or health metadata is diagnosed read\-only and never rewritten.
+.SH FILES
+.TP
+.I ~/.local/state/orca\-watchdog/
+State and logs (owner\-only):
+.I state.json
+(event state),
+.I health.json
+(operational health),
+.I disabled
+(pause flag),
+.I watchdog.log
+(activity),
+.I launchd.out.log
+and
+.I launchd.err.log
+.RB ( launchd (8)
+output).
+.TP
+.I ~/Library/LaunchAgents/com.john.orca\-watchdog.plist
+The LaunchAgent definition written by
+.BR start .
+.TP
+.I ~/.local/share/orca\-watchdog/
+Archive install root, with
+.I current
+and
+.I previous
+version symlinks.
+.SH ENVIRONMENT
+.TP
+.B ORCA_CLI
+Path to the Orca CLI when
+.B orca
+is not on
+.BR PATH .
+.TP
+.B ORCA_WATCHDOG_NODE
+Explicit Node binary for the launcher. The Homebrew wrapper sets this to
+Homebrew's Node.
+.SH EXIT STATUS
+.B 0
+on success;
+.B 1
+on a runtime error or a failing
+.BR doctor " check;"
+.B 2
+for an unknown command or invalid option.
+.SH SEE ALSO
+.BR launchd (8),
+.BR launchctl (1).
+The project README documents detection, sends, and troubleshooting in full.

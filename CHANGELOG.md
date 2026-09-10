@@ -2,6 +2,26 @@
 
 All notable changes to Orca Watchdog are documented here.
 
+## Unreleased
+
+- **Richer `status`**: reports service registration (distinct from a running
+  periodic process), the installed version, the last completed check, the last
+  successful resume, and pending events with the latest waiting reason. Backed by
+  a separate owner-only `health.json`; the event-state format is unchanged, and
+  missing or corrupt metadata reads as unknown without ever resetting events.
+- **New `logs` command**: prints the latest 100 activity lines, with `--follow`,
+  `--lines N`, and `--source activity|stdout|stderr`. Read-only — it never
+  rotates or truncates a log. During normal locked ticks the launchd stdout/stderr
+  logs are bounded (newest 500KB) without renaming the open files.
+- **Deeper `doctor`**: inspects the saved plist and the loaded launchd job for
+  Node/runtime/Orca paths, flagging missing targets, stale runtime versions, and
+  saved-vs-loaded disagreement. A deliberately stopped service is a valid state;
+  malformed event/health metadata is diagnosed read-only and never repaired.
+- **Shell completions and a man page**: Bash, Zsh, and Fish completions for every
+  command and the `logs` options, plus `man orca-watchdog`. Homebrew installs both
+  into the standard directories; the release archive ships `completions/` and
+  `man/` for manual setup.
+
 ## 1.0.0 - 2026-09-10
 
 - **Renamed the project to `orca-watchdog`** (command, install paths, launchd

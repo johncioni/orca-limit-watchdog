@@ -9,12 +9,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL, fileURLToPath } from 'node:url';
+import { runObservedCheck } from './lib/operations.mjs';
+import { appendActivity, maintainLogs } from './lib/logs.mjs';
 
 export const RESUME_TEXT = 'Session rate limit has reset. Resume where you left off.';
 
 const STATE_DIR = path.join(os.homedir(), '.local', 'state', 'orca-watchdog');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
-const LOG_FILE = path.join(STATE_DIR, 'watchdog.log');
 const LOCK_FILE = path.join(STATE_DIR, 'lock');
 const DISABLED_FILE = path.join(STATE_DIR, 'disabled');
 
@@ -577,14 +578,8 @@ export async function runAlert(env, { execFileImpl = pExecFile, logImpl = alertL
 
 function log(level, msg) {
   if (!shouldLog(level)) return;
-  fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-  fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${level} ${msg}\n`, { mode: 0o600 });
-  try {
-    if (fs.statSync(LOG_FILE).size > 1_000_000) {
-      const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n');
-      fs.writeFileSync(LOG_FILE, lines.slice(-500).join('\n'), { mode: 0o600 });
-    }
-  } catch { /* best effort */ }
+  try { appendActivity(STATE_DIR, `${new Date().toISOString()} ${level} ${msg}\n`); }
+  catch { /* diagnostic IO must not affect sends */ }
 }
 
 export async function orca(args, execImpl = pExecFile) {
@@ -676,12 +671,14 @@ const DEFAULT_DEPS = () => ({ orca, fetchImpl: globalThis.fetch, env: process.en
 
 export async function tick({ dryRun }, depsIn = {}) {
   const deps = { ...DEFAULT_DEPS(), ...depsIn };
+  const observe = (...args) => { try { deps.observe?.(...args); } catch { /* diagnostics cannot change eligibility */ } };
+  const waiting = (handle, reason) => observe('waiting', handle, reason);
   const log = deps.log;   // shadows the module logger so tests can silence it
   let terminals;
   try {
     terminals = (await deps.orca(['terminal', 'list'])).terminals ?? [];
   } catch (e) {
-    if (isUnavailableError(e)) { log('debug', `orca unavailable: ${e.message.split('\n')[0]}`); return; }
+    if (isUnavailableError(e)) { observe('unavailable'); log('debug', `orca unavailable: ${e.message.split('\n')[0]}`); return; }
     throw e;
   }
   const byHandle = new Map(terminals.map((t) => [t.handle, t]));
@@ -702,6 +699,7 @@ export async function tick({ dryRun }, depsIn = {}) {
         }
         observations.push({ handle: t.handle, banner, platform: inferPlatform(t, banner), window: tail.slice(-TAIL_LINES).join(' | ') });
       } catch (e) {
+        waiting(t.handle, 'failed read');
         log('warn', `read failed for ${t.handle}: ${sanitize(e.message)}`);
       }
     }
@@ -715,6 +713,12 @@ export async function tick({ dryRun }, depsIn = {}) {
   // terminal (delete) from one merely unread this tick (freeze).
   const liveHandles = terminals.map((t) => t.handle);
   const { events, sendCandidates } = reconcile(state, observations, now, liveHandles, deps.newEpisodeId);
+  for (const ev of Object.values(events)) {
+    if (observations.some(o => o.handle === ev.handle)) waiting(ev.handle,
+      ev.status === 'gave_up' ? 'exhausted retries' : ev.status === 'awaiting-user' ? 'user choice'
+      : ev.status === 'dismissed' ? 'user dismissed' : ev.clearedAt ? 'banner clearance confirmation'
+      : ev.status === 'resumed' ? 'resume confirmation' : 'reset time or retry delay');
+  }
 
   for (const key of Object.keys(events)) {
     const ev = events[key];
@@ -796,7 +800,7 @@ export async function tick({ dryRun }, depsIn = {}) {
       if (warn) log('warn', warn);
       online = await hasConnectivity(deps.fetchImpl, url);
     }
-    if (!online) { log('debug', `held ${ev.handle}: offline`); continue; }
+    if (!online) { waiting(ev.handle, 'offline'); log('debug', `held ${ev.handle}: offline`); continue; }
     if (ev.kind === 'outage') {   // 1. status gate (validateEvent guarantees a known platform)
       if (!indicators.has(ev.platform)) {
         const { url, warn } = statusUrlFor(ev.platform, deps.env);
@@ -807,18 +811,21 @@ export async function tick({ dryRun }, depsIn = {}) {
       // Fail closed: an unverifiable status (fetch failed/timed out/redirected/
       // bad JSON ⇒ null) must not authorize a resume during a possibly-continuing
       // outage. Only a confirmed-healthy indicator allows the send (DOG-24).
-      if (indicator === null) { log('warn', 'hold: provider health unverifiable'); continue; }
+      if (indicator === null) { waiting(ev.handle, 'provider health unknown'); log('warn', 'hold: provider health unverifiable'); continue; }
       if (suppressedByStatus(indicator)) {
+        waiting(ev.handle, 'provider health ' + indicator);
         log('debug', `skip ${ev.handle}: ${ev.platform} status is ${indicator}`); continue;
       }
     }
     try {                                                                            // 2. idle check
       await deps.orca(['terminal', 'wait', '--terminal', ev.handle, '--for', 'tui-idle', '--timeout-ms', '5000']);
     } catch (e) {
+      waiting(ev.handle, 'busy terminal');
       log('info', `skip ${ev.handle}: not idle (${sanitize(e.message)})`); continue;
     }
     let tail;                                                                        // 3. fresh re-read
     try { tail = await readTail(ev.handle, deps.orca); } catch (e) {
+      waiting(ev.handle, 'failed read');
       log('warn', `skip ${ev.handle}: re-read failed (${sanitize(e.message)}); event untouched`); continue;
     }
     const term = byHandle.get(ev.handle);
@@ -844,9 +851,11 @@ export async function tick({ dryRun }, depsIn = {}) {
     }
     if (isShellPrompt(tail, term?.agentIdentity)) {                                  // 4. prompt guard
       log('warn', `skip ${ev.handle}: shell prompt on last line, agent has exited; event dropped`);
+      observe('resolved', ev.handle);   // the event is gone: don't leave a stale waiting reason in status
       delete events[key]; deps.saveState(events); continue;
     }
     if (isInputOccupied(tail)) {                                                     // 4b. draft guard
+      waiting(ev.handle, 'draft input');
       log('info', `skip ${ev.handle}: input box holds a draft; event untouched`); continue;
     }
     ev.attempts += 1;                                                                // 5. persist, then send
@@ -855,13 +864,16 @@ export async function tick({ dryRun }, depsIn = {}) {
     deps.saveState(events);
     try {
       await deps.orca(['terminal', 'send', '--terminal', ev.handle, '--text', sch.resumeText, '--enter']);
+      observe('resumed', ev.handle);
       log('info', `resumed ${ev.handle} (${ev.kind}, attempt ${ev.attempts})`);
     } catch (e) {
       // The attempt is already persisted (no double-send on retry); the other
       // candidates and the GAVE UP pass must still run this tick.
+      waiting(ev.handle, 'failed send');
       log('warn', `send failed for ${ev.handle} (attempt ${ev.attempts}): ${sanitize(e.message)}`);
     }
     } catch (e) {   // untrusted-content or unexpected throw processing this candidate
+      waiting(ev.handle, 'failed send processing');
       log('warn', `skip ${ev.handle}: send processing failed (${sanitize(e.message)}); event untouched`);
     }
   }
@@ -904,26 +916,36 @@ async function main() {
   }
   if (parsed.action === 'help') { process.stdout.write(USAGE); return; }
   if (parsed.action === 'status') {
-    const events = loadState();
+    let events;
+    try { events = parseStateFile(fs.readFileSync(STATE_FILE, 'utf8')); }
+    catch (e) {
+      if (e.code === 'ENOENT') events = {};
+      else { console.log('event state: unknown (unreadable; run orca-watchdog doctor)'); return; }
+    }
+    if (!events) { console.log('event state: unknown (malformed; run orca-watchdog doctor)'); return; }
     console.log(Object.keys(events).length === 0 ? 'no active events'
       : JSON.stringify({ version: 2, events }, null, 2));
     return;
   }
   if (fs.existsSync(DISABLED_FILE)) return;
   const dryRun = parsed.dryRun;
-  if (!dryRun && !acquireLock()) { log('debug', 'another tick holds the lock'); return; }
+  if (!dryRun && !acquireLock()) return;
+  const tickLog = dryRun ? (level, msg) => { if (shouldLog(level)) console.log(`${level} ${msg}`); } : log;
+  if (!dryRun) { try { maintainLogs(STATE_DIR); } catch (e) { console.error(`log maintenance: ${e.message}`); } }
   // Release the lock on ANY exit, including the deadline's process.exit(1),
   // which bypasses the finally below. Without this, a hard-killed tick leaves a
   // stale lock that makes the next 1-2 scheduled ticks skip (age < 10-min TTL),
   // blinding the watchdog for ~5-15 min exactly when ticks are running slow.
   if (!dryRun) process.once('exit', () => { try { fs.rmSync(LOCK_FILE, { force: true }); } catch { /* best effort */ } });
-  const deadline = setTimeout(() => { log('error', 'tick deadline (4 min) exceeded'); process.exit(1); }, 4 * MIN);
+  const deadline = setTimeout(() => { tickLog('error', 'tick deadline (4 min) exceeded'); process.exit(1); }, 4 * MIN);
   try {
-    await tick({ dryRun });
+    await runObservedCheck({ stateDir: STATE_DIR, dryRun, tick, deps: { log: tickLog,
+      ...(dryRun ? { loadState: () => { try { return parseStateFile(fs.readFileSync(STATE_FILE, 'utf8')) ?? {}; } catch { return {}; } } } : {}) } });
   } catch (e) {
-    log('error', `tick failed: ${sanitize(e.message)}`);
+    tickLog('error', `tick failed: ${sanitize(e.message)}`);
   } finally {
     clearTimeout(deadline);
+    if (!dryRun) { try { maintainLogs(STATE_DIR); } catch { /* best effort */ } }
     if (!dryRun) fs.rmSync(LOCK_FILE, { force: true });
   }
 }

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
+import { spawnSync } from 'node:child_process';
 import * as watchdog from './watchdog.mjs';
 import { fileURLToPath } from 'node:url';
 import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
@@ -959,6 +960,59 @@ function harness({ tail, terminals, indicator = 'none', state = {}, now = at(10)
 const T = { handle: H, connected: true, writable: true, agentIdentity: 'claude' };
 const OUTAGE_TAIL = [CLAUDE_529, '', '> ', '? for shortcuts'];
 
+test('operational observations report guard reasons without changing resume decisions', async () => {
+  for (const [scenario, expected] of [['offline', 'offline'], ['provider', 'provider health major'],
+    ['busy', 'busy terminal'], ['read', 'failed read'], ['draft', 'draft input'], ['send', 'failed send'], ['success', null]]) {
+    const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed(), indicator: scenario === 'provider' ? 'major' : 'none' });
+    if (scenario === 'offline') h.deps.fetchImpl = async () => { throw new Error('offline'); };
+    const inner = h.deps.orca;
+    h.deps.orca = async args => {
+      if ((scenario === 'busy' && args[1] === 'wait') || (scenario === 'read' && args[1] === 'read') || (scenario === 'send' && args[1] === 'send')) throw new Error('fixture');
+      if (scenario === 'draft' && args[1] === 'read') return { terminal: { tail: [CLAUDE_529, '', '> draft text', '? for shortcuts'] } };
+      return inner(args);
+    };
+    const observations = [];
+    h.deps.observe = (...args) => observations.push(args);
+    await tick({ dryRun: false }, h.deps);
+    if (expected) assert.equal(observations.filter(x => x[0] === 'waiting').at(-1)[2], expected, scenario);
+    assert.equal(observations.some(x => x[0] === 'resumed'), scenario === 'success', scenario);
+    assert.equal(h.sent.length, scenario === 'success' ? 1 : 0);
+  }
+  const h = harness({ tail: OUTAGE_TAIL, terminals: [T], state: seed() });
+  h.deps.observe = () => { throw new Error('diagnostics unavailable'); };
+  await tick({ dryRun: false }, h.deps);
+  assert.equal(h.sent.length, 1);
+});
+
+test('a mid-tick shell-prompt drop clears the waiting observation (no stale status)', async () => {
+  const now = at(0);
+  const tail = ['5-hour limit reached. Try again at 10:00 PM.', '> '];   // detects a limit AND is a shell prompt (codex)
+  const term = { handle: H, connected: true, writable: true, agentIdentity: 'codex' };
+  const state = { [H]: { handle: H, kind: 'limit', platform: 'codex', bannerText: 'x',
+    detectedAt: at(-120).toISOString(), resetAt: at(-30).toISOString(),
+    attempts: 0, lastAttemptAt: null, status: 'waiting', alertedAt: null } };
+  const h = harness({ tail, terminals: [term], state, now });
+  const observations = [];
+  h.deps.observe = (...a) => observations.push(a);
+  await tick({ dryRun: false }, h.deps);
+  assert.equal(h.saved()[H], undefined, 'the dropped event reached the shell-prompt guard');
+  assert.equal(h.sent.length, 0);
+  assert.ok(observations.some(a => a[0] === 'resolved' && a[1] === H), JSON.stringify(observations));
+});
+
+test('watchdog --status degrades gracefully when state.json is unreadable (not ENOENT)', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-status-'));
+  try {
+    const stateDir = path.join(home, '.local', 'state', 'orca-watchdog');
+    fs.mkdirSync(stateDir, { recursive: true });
+    fs.mkdirSync(path.join(stateDir, 'state.json'));   // directory at the file path ⇒ EISDIR, not ENOENT
+    const r = spawnSync(process.execPath, ['watchdog.mjs', '--status'], { env: { ...process.env, HOME: home }, encoding: 'utf8' });
+    assert.equal(r.status, 0, r.stderr);
+    assert.doesNotMatch(r.stderr, /EISDIR|Error:/);
+    assert.match(r.stdout, /unknown|unreadable/);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});
+
 function alertHarness({ ev = LO(), choice = null, ...options } = {}) {
   const h = harness({ tail: OPEN_TAIL, terminals: [{ ...T, agentIdentity: 'codex' }], state: { [H]: ev }, now: NOW, ...options });
   const actions = [];
@@ -1250,17 +1304,19 @@ test('loadState: v2 rejection names the normalized violation when alertedAt is o
   const text = JSON.stringify({ version: 2, events: { [H]: ev } });
   assert.equal(parseStateFile(text), null);
   fs.writeFileSync(path.join(stateDir, 'state.json'), text);
+  const fakeOrca = path.join(dir, 'fake-orca');
+  fs.writeFileSync(fakeOrca, '#!/bin/sh\nprintf \'{"ok":true,"result":{"terminals":[]}}\\n\'\n', { mode: 0o755 });
   const { stdout } = await pExecFile(process.execPath,
-    [fileURLToPath(new URL('./watchdog.mjs', import.meta.url)), '--status'],
-    { env: { ...process.env, HOME: dir }, timeout: 2000 });
+    [fileURLToPath(new URL('./watchdog.mjs', import.meta.url)), '--once'],
+    { env: { ...process.env, HOME: dir, ORCA_CLI: fakeOrca }, timeout: 2000 });
   const logged = fs.readFileSync(path.join(stateDir, 'watchdog.log'), 'utf8');
   assert.ok(logged.includes(`state file rejected (${H}: detectedAt: not a timestamp)`), logged);
   assert.doesNotMatch(logged, /alertedAt:/);
-  assert.equal(fs.existsSync(path.join(stateDir, 'state.json')), false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(stateDir, 'state.json'), 'utf8')), { version: 2, events: {} });
   const backups = fs.readdirSync(stateDir).filter((name) => name.startsWith('state.json.bad-'));
   assert.equal(backups.length, 1);
   assert.equal(fs.readFileSync(path.join(stateDir, backups[0]), 'utf8'), text);
-  assert.equal(stdout.trim(), 'no active events');
+  assert.equal(stdout.trim(), '');
 });
 
 test('--alert: missing env and mixed invocations exit without tick/lock/state/send (DOG-20)', async (t) => {
