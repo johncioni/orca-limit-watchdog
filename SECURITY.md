@@ -9,8 +9,18 @@ daemon. Its only outward actions are:
 - sending a fixed one-line resume prompt into a terminal when a rate limit or API
   outage clears (never when the terminal shows a shell prompt).
 
-Its only network access is to `status.claude.com` / `status.openai.com`, and only
-when an outage resume is due. It stores no secrets and ships no dependencies.
+Its only network access is:
+
+- `captive.apple.com` (a reachability probe) before **any** due resume — rate-limit
+  or outage — so it never resumes while the machine is offline; and
+- `status.claude.com` / `status.openai.com` (Statuspage JSON) only when an **outage**
+  resume is due, to hold the resume if the provider still reports a major/critical
+  incident.
+
+Both the connectivity probe and the status URLs accept a loopback
+(`127.0.0.1` / `localhost` / `[::1]`) override, honoured only for the end-to-end test
+stubs; any non-loopback override is ignored. It stores no secrets and ships no
+dependencies.
 
 ## Reporting a vulnerability
 

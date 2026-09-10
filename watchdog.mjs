@@ -39,13 +39,21 @@ const KINDS = Object.keys(SCHEDULE);
 const PLATFORMS = ['claude', 'codex', 'unknown'];
 const STATUSES = ['waiting', 'resumed', 'gave_up', 'awaiting-user', 'dismissed'];
 const GRACE_PAST_MS = 2 * 60 * MIN; // absolute time this recently past = already reset
+// A still-present limit banner whose parsed reset jumps at least this much LATER
+// than the stored one is honoured before a due send (DOG-24). Above any sub-tick
+// reparse jitter of a counting-down relative banner; only a real shift trips it.
+const RESET_REFRESH_MIN_MS = 5 * MIN;
 const TAIL_LINES = 15;
 const READ_BUDGET_MS = 3 * MIN;    // stop reading terminals before the 4-min tick deadline
 const READ_CONCURRENCY = 4;        // parallel `terminal read`s per tick; orca serialises beyond a few
 
 // --- pure logic (unit-tested) ---
 
-const LIMIT_RE = /((usage|rate|session|weekly|daily|\d+[- ]hour)\s+limit|quota)/i;
+// `\d{1,4}` (not `\d+`) so a pathological long-digit line cannot backtrack
+// super-linearly against `[- ]hour` and stall the shared event loop (DOG-24);
+// no real banner states a five-digit hour count. Window lines are also length-
+// capped before any regex runs (see WINDOW_LINE_MAX / toWindow).
+const LIMIT_RE = /((usage|rate|session|weekly|daily|\d{1,4}[- ]hour)\s+limit|quota)/i;
 const REACHED_RE = /(reached|hit|exceeded)/i;
 const RESET_RE = /(resets?\b|try again|available|come back)/i;
 const VETO_RE = /approaching[^\n]*limit/i;
@@ -72,9 +80,15 @@ const SECRET_RES = [
   /\bAKIA[0-9A-Z]{16}\b/g,
   /(?<![/\w])[A-Za-z0-9+=_-]{32,}(?![/\w])/g,
 ];
+// A secret-shaped field name (key/token/secret/password/…) followed by = or :
+// and a value. Redacts the VALUE only (keeping the name), which catches opaque,
+// slash-bearing tokens the length/prefix rules above deliberately skip to spare
+// filesystem paths — a path has no such field name before it (DOG-24).
+const SECRET_ASSIGN_RE = /\b([\w.-]*(?:key|token|secret|password|passwd|pwd|credential)[\w.-]*)(\s*[=:]\s*)(\S+)/gi;
 export function sanitize(text, limit = 200) {
   let s = stripAnsi(text).replace(/\s+/g, ' ').trim();
   for (const re of SECRET_RES) s = s.replace(re, '[redacted]');
+  s = s.replace(SECRET_ASSIGN_RE, (_m, name, sep) => `${name}${sep}[redacted]`);
   return s.length > limit ? `${s.slice(0, limit)}…` : s;
 }
 
@@ -103,6 +117,11 @@ const CHROME_RES = [
   /^(\? for shortcuts|Press |Esc |esc |Retry|⏵|⏸|✗|✓)/,
 ];
 const isChrome = (l) => CHROME_RES.some((re) => re.test(l));
+// The Claude usage footer ("Context … │ Usage … (resets in …)") is the bottom
+// line of every Claude terminal, printed below the input box. It is chrome, not
+// the agent moving on, so the final-block checks that decide whether a banner is
+// still the stalled last thing on screen must tolerate it (DOG-24).
+const isTrailingChrome = (l) => isChrome(l) || FOOTER_RE.test(l);
 const lastIndex = (arr, pred) => { let i = -1; arr.forEach((x, j) => { if (pred(x)) i = j; }); return i; };
 
 export function shouldLog(level, env = process.env) {
@@ -120,8 +139,14 @@ export function readBudgetExceeded(startedAt, now) {
   return now - startedAt > READ_BUDGET_MS;
 }
 
+// Untrusted terminal content: cap each line before any regex runs so a single
+// enormous line cannot make a scan super-linear. Banners are short (bannerText
+// is capped at 600); this bound is far above any legitimate one (DOG-24).
+const WINDOW_LINE_MAX = 2000;
+const toWindow = (lines) => lines.slice(-TAIL_LINES).map((l) => stripAnsi(l).trim().slice(0, WINDOW_LINE_MAX));
+
 export function hasOutageLine(lines) {
-  const window = lines.slice(-TAIL_LINES).map((l) => stripAnsi(l).trim());
+  const window = toWindow(lines);
   return OUTAGE_PATTERNS.some((p) => window.some((l) => p.re.test(l)));
 }
 
@@ -137,7 +162,7 @@ const CODEX_LIMIT_FORMS = [
 ];
 
 export function detectBanner(lines, platform = 'unknown', now = new Date()) {
-  const window = lines.slice(-TAIL_LINES).map((l) => stripAnsi(l).trim());
+  const window = toWindow(lines);
   const codexCandidate = (l) => platform === 'codex' && /^■\s*/.test(l)
     && (CODEX_429_RE.test(l) || (LIMIT_RE.test(l) && REACHED_RE.test(l)));
   const c = lastIndex(window, codexCandidate);
@@ -168,8 +193,13 @@ export function detectBanner(lines, platform = 'unknown', now = new Date()) {
   if (c < 0 && kept.some(reachedLine) && RESET_RE.test(text)) {
     const isRelevant = (l) => !VETO_RE.test(l) && !FOOTER_RE.test(l) && (LIMIT_RE.test(l) || RESET_RE.test(l));
     const l = lastIndex(window, isRelevant);
-    limit = { kind: 'limit', bannerText: sanitize(window.filter(isRelevant).join(' | '), 600),
-      matchedLine: window[l], patternId: 'limit', index: l };
+    // Same final-block guard the Codex limit and outage rules use: a banner the
+    // agent already scrolled past (ordinary output between it and an idle empty
+    // box) is stale and must not re-fire a resume send (DOG-24).
+    if (window.slice(l + 1).every(isTrailingChrome)) {
+      limit = { kind: 'limit', bannerText: sanitize(window.filter(isRelevant).join(' | '), 600),
+        matchedLine: window[l], patternId: 'limit', index: l };
+    }
   }
 
   if (codexLimit) limit = codexLimit;
@@ -181,7 +211,7 @@ export function detectBanner(lines, platform = 'unknown', now = new Date()) {
     const e = lastIndex(window, (l) => p.re.test(l));
     if (e < 0) continue;
     if (lastIndex(window, (l) => RETRY_RE.test(l)) >= e) continue;   // still retrying
-    if (!window.slice(e + 1).every(isChrome)) continue;               // stale: agent moved on
+    if (!window.slice(e + 1).every(isTrailingChrome)) continue;       // stale: agent moved on
     outage = { kind: 'outage', bannerText: sanitize(window[e], 200),
       matchedLine: window[e], patternId: p.id, index: e };
     break;
@@ -275,19 +305,25 @@ function parseClock(text) {
   return null;
 }
 
+// An unbounded digit run in a relative reset can overflow the Date range and
+// yield an Invalid Date (getTime() === NaN). Return null for any non-finite
+// instant so callers' `?? fallback` / `?.toISOString()` engage instead of a
+// RangeError propagating up and aborting the whole tick (DOG-24).
+const validDate = (d) => Number.isFinite(d.getTime()) ? d : null;
+
 export function parseResetTime(text, now) {
   // "in 3 days" (weekly limits) — a day count, never a clock time.
   const relD = text.match(/\bin\s+(\d+)\s+days?\b/i);
-  if (relD) return new Date(now.getTime() + Number(relD[1]) * 24 * 60 * MIN);
+  if (relD) return validDate(new Date(now.getTime() + Number(relD[1]) * 24 * 60 * MIN));
 
   // "in 2 hours 15 minutes", "in 2h 30m", "in 3h", "in 1hr 5m"
   const relHM = text.match(/\bin\s+(\d+)\s*h(?:(?:ou)?rs?)?\b(?:\s*(?:and\s+)?(\d+)\s*m(?:in(?:ute)?s?)?)?/i);
   if (relHM) {
     const mins = Number(relHM[1]) * 60 + Number(relHM[2] || 0);
-    return new Date(now.getTime() + mins * MIN);
+    return validDate(new Date(now.getTime() + mins * MIN));
   }
   const relM = text.match(/\bin\s+(\d+)\s*m(?:in(?:ute)?s?)?\b/i);
-  if (relM) return new Date(now.getTime() + Number(relM[1]) * MIN);
+  if (relM) return validDate(new Date(now.getTime() + Number(relM[1]) * MIN));
 
   const clock = parseClock(text);
 
@@ -375,12 +411,23 @@ export function isShellPrompt(tail, agentIdentity) {
   return SHELL_PROMPT_RE.test(last);
 }
 
-// True when an agent input box already holds text. A send would be appended to
-// that draft and --enter would submit both, so the tick skips and the event
-// stays as it is (spec §6.4 spirit).
+// True when the input area already holds unsubmitted text — an agent input box
+// draft, or a shell prompt carrying a typed command. A send would be appended to
+// it and --enter would submit both, so the tick skips and the event stays as it
+// is (spec §6.4 spirit).
 const INPUT_DRAFT_RE = /^[>›]\s+(?!Ask Codex to do anything\s*$)\S/;
+// A shell prompt glyph (deliberately excluding ">", which is the agent box and a
+// shell redirect) preceded by start/space and FOLLOWED by whitespace + a command.
+// The empty prompt ("~ %") has nothing after the glyph, so it does not match and
+// is left to isShellPrompt's exited-to-shell drop (DOG-24).
+const SHELL_CMD_RE = /(?:^|\s)[$%#❯➜λ❱]\s+\S/;
 export function isInputOccupied(tail) {
-  return tail.map((l) => stripAnsi(l).trimEnd()).some((l) => INPUT_DRAFT_RE.test(l));
+  // .trim() (both ends) mirrors detection, so an indented draft ("  > text") is
+  // not missed. Strictly safer: it can only add skips, never a send (DOG-24).
+  const lines = tail.map((l) => stripAnsi(l).trim());
+  if (lines.some((l) => INPUT_DRAFT_RE.test(l))) return true;
+  const last = lines.filter(Boolean).at(-1);
+  return last !== undefined && SHELL_CMD_RE.test(last);
 }
 
 const STATUS_URLS = Object.freeze({
@@ -516,9 +563,9 @@ export async function runAlert(env, { execFileImpl = pExecFile, logImpl = alertL
       '-e', 'end run', '--', message]);
     const choice = stdout?.trim();
     if (!CHOICES.includes(choice)) { logImpl('warn', 'alert returned no valid choice'); return; }
-    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
     tmp = `${file}.${randomUUID()}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify({ choice, episodeId, at: new Date().toISOString() }), { flag: 'wx' });
+    fs.writeFileSync(tmp, JSON.stringify({ choice, episodeId, at: new Date().toISOString() }), { flag: 'wx', mode: 0o600 });
     fs.renameSync(tmp, file);
     tmp = undefined;
   } catch (e) {
@@ -530,26 +577,34 @@ export async function runAlert(env, { execFileImpl = pExecFile, logImpl = alertL
 
 function log(level, msg) {
   if (!shouldLog(level)) return;
-  fs.mkdirSync(STATE_DIR, { recursive: true });
-  fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${level} ${msg}\n`);
+  fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
+  fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${level} ${msg}\n`, { mode: 0o600 });
   try {
     if (fs.statSync(LOG_FILE).size > 1_000_000) {
       const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n');
-      fs.writeFileSync(LOG_FILE, lines.slice(-500).join('\n'));
+      fs.writeFileSync(LOG_FILE, lines.slice(-500).join('\n'), { mode: 0o600 });
     }
   } catch { /* best effort */ }
 }
 
-async function orca(args) {
+export async function orca(args, execImpl = pExecFile) {
   let stdout;
   try {
-    ({ stdout } = await pExecFile(ORCA, [...args, '--json'], { timeout: 15_000 }));
+    ({ stdout } = await execImpl(ORCA, [...args, '--json'], { timeout: 15_000 }));
   } catch (e) {
     // orca exits non-zero for structured errors but still prints JSON to stdout
     if (!e.stdout) throw e;
     stdout = e.stdout;
   }
-  const parsed = JSON.parse(stdout);
+  let parsed;
+  try { parsed = JSON.parse(stdout); }
+  catch {
+    // Malformed stdout (orca socket churn / a partial write during an update) is
+    // "nothing to observe this tick", not a watchdog fault: classify as unavailable
+    // so callers handle it gracefully instead of an unhandled SyntaxError aborting
+    // the whole tick (DOG-24).
+    const e = new Error('orca returned malformed JSON'); e.code = 'runtime_unavailable'; throw e;
+  }
   if (!parsed.ok) { const e = new Error(parsed.error?.message || 'orca error'); e.code = parsed.error?.code; throw e; }
   return parsed.result;
 }
@@ -578,23 +633,36 @@ function loadState() {
   return {};
 }
 
-function saveState(events) {
-  fs.mkdirSync(STATE_DIR, { recursive: true });
-  const tmp = `${STATE_FILE}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify({ version: 2, events }, null, 2));
-  fs.renameSync(tmp, STATE_FILE);
+export function saveState(events, stateDir = STATE_DIR) {
+  // Daemon state can name terminals and carry sanitized banner text: keep it
+  // owner-only. mkdir mode only affects a fresh dir, so chmod tightens an existing
+  // loose one too; the tmp is chmod'd in case a prior crash left it 0644 (DOG-24).
+  fs.mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(stateDir, 0o700); } catch { /* best effort: not owner / no POSIX modes */ }
+  const stateFile = path.join(stateDir, 'state.json');
+  const tmp = `${stateFile}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify({ version: 2, events }, null, 2), { mode: 0o600 });
+  try { fs.chmodSync(tmp, 0o600); } catch { /* best effort */ }
+  fs.renameSync(tmp, stateFile);
 }
 
-function acquireLock() {
-  fs.mkdirSync(STATE_DIR, { recursive: true });
-  try {
-    const age = Date.now() - fs.statSync(LOCK_FILE).mtimeMs;
-    if (age >= 10 * MIN) fs.rmSync(LOCK_FILE, { force: true });
-  } catch { /* no lock */ }
-  try {
-    fs.writeFileSync(LOCK_FILE, String(process.pid), { flag: 'wx' });
-    return true;
-  } catch { return false; }
+export function acquireLock(lockFile = LOCK_FILE) {
+  fs.mkdirSync(path.dirname(lockFile), { recursive: true });
+  // The exclusive create (wx) is the sole arbiter: in the common no-lock case it
+  // wins in one syscall; when it loses, only a *stale* lock is reclaimed and the
+  // reclaim is arbitrated by an atomic rename so two racing ticks can never both
+  // win (the old rm-then-create could) — a lost race simply skips (DOG-24).
+  const create = () => { try { fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' }); return true; } catch { return false; } };
+  if (create()) return true;
+  let age;
+  try { age = Date.now() - fs.statSync(lockFile).mtimeMs; }
+  catch { return create(); }                 // vanished between create and stat
+  if (age < 10 * MIN) return false;          // a live tick holds a fresh lock
+  const stolen = `${lockFile}.stale-${process.pid}-${Date.now()}`;
+  try { fs.renameSync(lockFile, stolen); }   // only one racer can rename it away
+  catch { return false; }                    // lost the reclaim race → skip this tick
+  try { fs.rmSync(stolen, { force: true }); } catch { /* best effort */ }
+  return create();                           // may still lose to a fresh create in the gap
 }
 
 async function readTail(handle, orcaFn = orca) {
@@ -603,7 +671,8 @@ async function readTail(handle, orcaFn = orca) {
 }
 
 const DEFAULT_DEPS = () => ({ orca, fetchImpl: globalThis.fetch, env: process.env, now: () => new Date(), loadState, saveState, log,
-  newEpisodeId: randomUUID, spawn: spawnAlert, readChoice, clearChoice, reapChoices });
+  newEpisodeId: randomUUID, spawn: spawnAlert, readChoice, clearChoice, reapChoices,
+  isDisabled: () => fs.existsSync(DISABLED_FILE) });
 
 export async function tick({ dryRun }, depsIn = {}) {
   const deps = { ...DEFAULT_DEPS(), ...depsIn };
@@ -660,13 +729,26 @@ export async function tick({ dryRun }, depsIn = {}) {
   for (const ev of Object.values(events)) {
     if (ev.kind !== 'limit-open' || ev.status !== 'awaiting-user') continue;
     if (!observations.some((o) => o.handle === ev.handle && o.banner) || ev.clearedAt) continue;
+    // The handle comes straight from `orca terminal list`; a value that is not a
+    // safe path component would make choicePath throw and churn the alert every
+    // tick. Skip it gracefully (DOG-24) instead of claiming and spawning.
+    if (!PATH_COMPONENT_RE.test(ev.handle) || !PATH_COMPONENT_RE.test(ev.episodeId ?? '')) {
+      log('warn', `skip alert for ${sanitize(ev.handle)}: handle/episode is not a safe path component`); continue;
+    }
     if (dryRun) { log('info', `[dry-run] would await alert choice for ${ev.handle}`); continue; }
     try {
       if (ev.alertedAt === null) {
         ev.alertedAt = now.toISOString();
         deps.saveState(events); // claim before spawn: a crash cannot duplicate the dialog
-        const child = deps.spawn(ev);
-        child?.on('error', (e) => log('warn', `alert spawn failed for ${ev.handle}: ${sanitize(e.message)}`));
+        // A spawn failure (sync throw or async 'error') means no dialog was shown,
+        // so release the claim to re-arm next tick rather than wedge the episode
+        // forever on a choice file that will never appear (DOG-24). A real crash
+        // dies before this runs, so the claim persists and cannot double-alert.
+        const rearm = (e) => { log('warn', `alert spawn failed for ${ev.handle}: ${sanitize(e.message)}`); ev.alertedAt = null; deps.saveState(events); };
+        try {
+          const child = deps.spawn(ev);
+          child?.on('error', rearm);
+        } catch (e) { rearm(e); }
         continue;
       }
       const result = await deps.readChoice(ev.handle, ev.episodeId);
@@ -705,6 +787,10 @@ export async function tick({ dryRun }, depsIn = {}) {
       console.log(`would resume ${ev.handle} (${ev.kind}/${ev.platform}, attempt ${ev.attempts + 1})`);
       continue;
     }
+    // Re-check the kill switch before every real send: a `pause` that lands mid-
+    // tick must stop the remaining candidates, not only future ticks (DOG-24).
+    if (deps.isDisabled()) { log('info', `paused mid-tick; halting remaining sends`); break; }
+    try {   // fault-isolate per-candidate work: a throw on one must not abort the rest (DOG-24)
     if (online === null) {   // 0. connectivity gate: never resume while offline; probe once per real tick
       const { url, warn } = connectivityUrl(deps.env);
       if (warn) log('warn', warn);
@@ -717,8 +803,13 @@ export async function tick({ dryRun }, depsIn = {}) {
         if (warn) log('warn', warn);
         indicators.set(ev.platform, await fetchIndicator(url, deps.fetchImpl));
       }
-      if (suppressedByStatus(indicators.get(ev.platform))) {
-        log('debug', `skip ${ev.handle}: ${ev.platform} status is ${indicators.get(ev.platform)}`); continue;
+      const indicator = indicators.get(ev.platform);
+      // Fail closed: an unverifiable status (fetch failed/timed out/redirected/
+      // bad JSON ⇒ null) must not authorize a resume during a possibly-continuing
+      // outage. Only a confirmed-healthy indicator allows the send (DOG-24).
+      if (indicator === null) { log('warn', 'hold: provider health unverifiable'); continue; }
+      if (suppressedByStatus(indicator)) {
+        log('debug', `skip ${ev.handle}: ${ev.platform} status is ${indicator}`); continue;
       }
     }
     try {                                                                            // 2. idle check
@@ -741,6 +832,16 @@ export async function tick({ dryRun }, depsIn = {}) {
       log('info', `skip ${ev.handle}: banner changed to ${fresh.kind}/${platform} before send; fresh event`);
       events[key] = newEvent({ handle: ev.handle, banner: fresh, platform }, now, deps.newEpisodeId); deps.saveState(events); continue;
     }
+    if (ev.kind === 'limit') {                                                       // 3b. reset moved later
+      const freshReset = fresh.resetAt ? new Date(fresh.resetAt) : parseResetTime(fresh.bannerText, now);
+      if (freshReset && freshReset.getTime() - new Date(ev.resetAt).getTime() >= RESET_REFRESH_MIN_MS) {
+        ev.resetAt = freshReset.toISOString();
+        if (now - new Date(ev.resetAt) < SCHEDULE.limit.bufferMs) {
+          log('info', `skip ${ev.handle}: reset moved later to ${ev.resetAt}; holding`);
+          deps.saveState(events); continue;
+        }
+      }
+    }
     if (isShellPrompt(tail, term?.agentIdentity)) {                                  // 4. prompt guard
       log('warn', `skip ${ev.handle}: shell prompt on last line, agent has exited; event dropped`);
       delete events[key]; deps.saveState(events); continue;
@@ -760,6 +861,9 @@ export async function tick({ dryRun }, depsIn = {}) {
       // candidates and the GAVE UP pass must still run this tick.
       log('warn', `send failed for ${ev.handle} (attempt ${ev.attempts}): ${sanitize(e.message)}`);
     }
+    } catch (e) {   // untrusted-content or unexpected throw processing this candidate
+      log('warn', `skip ${ev.handle}: send processing failed (${sanitize(e.message)}); event untouched`);
+    }
   }
 
   for (const [key, ev] of Object.entries(events)) {
@@ -772,18 +876,41 @@ export async function tick({ dryRun }, depsIn = {}) {
   if (dryRun) console.log(`${Object.keys(events).length} active event(s), ${sendCandidates.length} send candidate(s)`);
 }
 
+export const USAGE = `Usage: watchdog.mjs [--dry-run | --status | --once | --help]
+  (no args)   run one daemon tick (launchd invokes it this way)
+  --dry-run   observe only; print intended actions, send nothing
+  --status    print active events and exit
+  --once      alias for a normal one-tick run
+  --help, -h  show this help
+`;
+
+// Classify the daemon invocation. Unknown tokens fail closed (never a live tick):
+// launchd calls with no args, which MUST still tick (DOG-24). `--alert` is handled
+// at the entry before main and is not a valid main() token.
+const KNOWN_ARGS = new Set(['--once', '--dry-run', '--status', '--help', '-h']);
+export function parseArgv(argv) {
+  const unknown = argv.filter((a) => !KNOWN_ARGS.has(a));
+  if (unknown.length > 0) return { action: 'error', unknown };
+  if (argv.includes('--help') || argv.includes('-h')) return { action: 'help' };
+  if (argv.includes('--status')) return { action: 'status' };
+  return { action: 'tick', dryRun: argv.includes('--dry-run') };
+}
+
 async function main() {
-  const args = new Set(process.argv.slice(2));
-  // `--once` is a readability alias for the normal one-tick invocation.
-  args.delete('--once');
-  if (args.has('--status')) {
+  const parsed = parseArgv(process.argv.slice(2));
+  if (parsed.action === 'error') {
+    process.stderr.write(`unknown argument: ${parsed.unknown.join(' ')}\n${USAGE}`);
+    process.exitCode = 2; return;
+  }
+  if (parsed.action === 'help') { process.stdout.write(USAGE); return; }
+  if (parsed.action === 'status') {
     const events = loadState();
     console.log(Object.keys(events).length === 0 ? 'no active events'
       : JSON.stringify({ version: 2, events }, null, 2));
     return;
   }
   if (fs.existsSync(DISABLED_FILE)) return;
-  const dryRun = args.has('--dry-run');
+  const dryRun = parsed.dryRun;
   if (!dryRun && !acquireLock()) { log('debug', 'another tick holds the lock'); return; }
   // Release the lock on ANY exit, including the deadline's process.exit(1),
   // which bypasses the finally below. Without this, a hard-killed tick leaves a

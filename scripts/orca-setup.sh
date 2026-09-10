@@ -17,11 +17,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# Same floor install.sh enforces, so a worktree that passes here can be deployed.
+# Same floor install.sh enforces (MIN_NODE_MAJOR=22), so a worktree that passes
+# here can be deployed.
 NODE_BIN="$(command -v node || true)"
 [ -n "$NODE_BIN" ] || { echo "error: node not found in PATH" >&2; exit 1; }
 NODE_MAJOR="$("$NODE_BIN" -p 'process.versions.node.split(".")[0]')"
-[ "$NODE_MAJOR" -ge 20 ] || { echo "error: node >= 20 required (found $NODE_MAJOR)" >&2; exit 1; }
+[ "$NODE_MAJOR" -ge 22 ] || { echo "error: node >= 22 required (found $NODE_MAJOR)" >&2; exit 1; }
 
 echo "==> syntax: watchdog.mjs, install.sh, uninstall.sh, scripts/orca-setup.sh"
 node --check watchdog.mjs

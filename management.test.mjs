@@ -269,6 +269,49 @@ test('archive install is stopped and repeatable; upgrade requires stop and faile
   } finally { h.cleanup(); }
 });
 
+test('status counts v1 state events correctly (empty ⇒ none, not the wrapper keys) (DOG-24)', async () => {
+  const h = harness('wd v1count ');
+  try {
+    const { statusText, installPaths } = await loadManagement();
+    const paths = installPaths(h.home);
+    fs.mkdirSync(path.dirname(paths.stateFile), { recursive: true });
+    fs.writeFileSync(paths.stateFile, JSON.stringify({ version: 1, events: {} }));
+    assert.match(statusText({ env: h.env }), /events:\s+none/);
+    fs.writeFileSync(paths.stateFile, JSON.stringify({ version: 1, events: { a: {}, b: {} } }));
+    assert.match(statusText({ env: h.env }), /events:\s+2/);
+  } finally { h.cleanup(); }
+});
+
+test('serviceIsRunning throws on a launchctl spawn error rather than reporting "stopped" (DOG-24)', async () => {
+  const h = harness('wd svc ');
+  try {
+    const { serviceIsRunning } = await loadManagement();
+    // launchctl resolves as executable but cannot exec (bad interpreter) ⇒ spawnSync
+    // returns {error, status:null}. An unknown state must NOT read as "not running".
+    executable(h.env.ORCA_WATCHDOG_LAUNCHCTL, '#!/nonexistent-interp-xyz-123\n');
+    assert.throws(() => serviceIsRunning(h.env), /launchctl|spawn|ENOENT/i);
+  } finally { h.cleanup(); }
+});
+
+test('install that throws at the command-link step leaves current unchanged (DOG-24)', async () => {
+  const h = harness('wd cmdlink ');
+  try {
+    const { installRelease } = await loadManagement();
+    const v1 = releaseCopy(h.base, '0.1.0');
+    installRelease({ sourceRoot: v1, version: '0.1.0', env: h.env });
+    const share = path.join(h.home, '.local', 'share', 'orca-limit-watchdog');
+    const current = path.join(share, 'current');
+    assert.equal(fs.readlinkSync(current), '0.1.0');
+    // Put a regular file where the command symlink lives so the command-link step throws.
+    const commandLink = path.join(h.home, '.local', 'bin', 'orca-limit-watchdog');
+    fs.rmSync(commandLink);
+    fs.writeFileSync(commandLink, 'not a symlink');
+    const v2 = releaseCopy(h.base, '0.2.0');
+    assert.throws(() => installRelease({ sourceRoot: v2, version: '0.2.0', env: h.env }), /non-symlink/);
+    assert.equal(fs.readlinkSync(current), '0.1.0', 'current must not switch when the install fails');
+  } finally { h.cleanup(); }
+});
+
 test('stopped legacy registration migrates on start without duplicate registration', async () => {
   const h = harness('wd migrate ');
   try {
