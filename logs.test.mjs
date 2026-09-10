@@ -1,0 +1,103 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import * as logs from './lib/logs.mjs';
+import { spawnSync, spawn } from 'node:child_process';
+
+function fixture(t) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-logs-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
+test('logs default to newest 100 lines, validate options, and tolerate missing files', t => {
+  const dir = fixture(t), file = path.join(dir, 'watchdog.log');
+  assert.equal(logs.readLog(file, 100), '');
+  fs.writeFileSync(file, Array.from({ length: 120 }, (_, i) => `line ${i}\n`).join(''));
+  assert.equal(logs.readLog(file, 100).split('\n')[0], 'line 20');
+  assert.equal(logs.readLog(file, 2), 'line 118\nline 119\n');
+  assert.deepEqual(logs.parseLogArgs([]), { lines: 100, source: 'activity', follow: false });
+  for (const args of [['--lines', '0'], ['--lines', '-2'], ['--lines', '1.5'], ['--source', 'bad'], ['--follow', 'x']]) assert.throws(() => logs.parseLogArgs(args));
+});
+test('retention bounds bytes and lines, handles Unicode and huge lines, preserves inode', t => {
+  const dir = fixture(t), file = path.join(dir, 'watchdog.log');
+  for (const contents of ['😀'.repeat(300_000), ('a\n').repeat(600_000), 'a'.repeat(1_100_000) + '\nnewest\n']) {
+    fs.writeFileSync(file, contents, { mode: 0o644 });
+    fs.chmodSync(file, 0o644);
+    const ino = fs.statSync(file).ino;
+    logs.maintainLog(file, 500);
+    const value = fs.readFileSync(file, 'utf8');
+    assert.ok(Buffer.byteLength(value) <= 500_000);
+    assert.ok(value.trimEnd().split('\n').length <= 500);
+    assert.ok(!value.includes('\ufffd'));
+    assert.equal(fs.statSync(file).ino, ino);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  }
+});
+test('log symlinks and hard links are rejected for reads and retention', t => {
+  const dir = fixture(t), target = path.join(dir, 'target'), link = path.join(dir, 'log');
+  fs.writeFileSync(target, 'untouched');
+  fs.symlinkSync(target, link);
+  assert.throws(() => logs.readLog(link, 100), /symlink|regular/);
+  assert.throws(() => logs.maintainLog(link), /symlink|regular/);
+  fs.unlinkSync(link); fs.linkSync(target, link);
+  assert.throws(() => logs.maintainLog(link), /regular/);
+  assert.equal(fs.readFileSync(target, 'utf8'), 'untouched');
+});
+test('follow observes creation, append, truncate and replace and aborts cleanly', async t => {
+  const dir = fixture(t), file = path.join(dir, 'watchdog.log');
+  const abort = new AbortController();
+  let output = '';
+  const following = logs.followLog(file, { lines: 100, signal: abort.signal, write: text => { output += text; }, interval: 10 });
+  const until = async text => {
+    for (let i = 0; i < 100 && !output.includes(text); i++) await new Promise(r => setTimeout(r, 10));
+    assert.ok(output.includes(text), JSON.stringify(output));
+  };
+  try {
+    fs.writeFileSync(file, 'first\n'); await until('first');
+    fs.appendFileSync(file, '😀 appended\n'); await until('😀 appended');
+    fs.writeFileSync(file, 'short\n'); await until('short');
+    fs.renameSync(file, file + '.old'); fs.writeFileSync(file, 'replacement\n'); await until('replacement');
+  } finally { abort.abort(); await following; }
+});
+
+test('CLI logs is read-only and follow exits cleanly on SIGINT', async t => {
+  const home = fixture(t), dir = path.join(home, '.local/state/orca-watchdog');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, 'launchd.err.log');
+  fs.writeFileSync(file, 'one\ntwo\n', { mode: 0o644 });
+  const env = { ...process.env, HOME: home };
+  const result = spawnSync(process.execPath, ['bin/orca-watchdog.mjs', 'logs', '--source', 'stderr', '--lines', '1'], { env, encoding: 'utf8' });
+  assert.equal(result.status, 0); assert.equal(result.stdout, 'two\n');
+  assert.equal(fs.statSync(file).mode & 0o777, 0o644);
+  const child = spawn(process.execPath, ['bin/orca-watchdog.mjs', 'logs', '--source', 'stderr', '--follow'], { env });
+  const exit = new Promise((resolve, reject) => { child.once('error', reject); child.once('exit', (code, signal) => resolve({ code, signal })); });
+  await new Promise((resolve, reject) => { child.stdout.once('data', resolve); child.once('error', reject); });
+  child.kill('SIGINT');
+  assert.deepEqual(await exit, { code: 0, signal: null });
+});
+
+test('dry-run and lock contention do not retain logs or write health; locked ticks retain all logs', t => {
+  const home = fixture(t), dir = path.join(home, '.local/state/orca-watchdog');
+  fs.mkdirSync(dir, { recursive: true });
+  const orca = path.join(home, 'fake-orca');
+  fs.writeFileSync(orca, '#!/bin/sh\nprintf \'%s\\n\' \'{"ok":true,"result":{"terminals":[]}}\'\n', { mode: 0o755 });
+  const env = { ...process.env, HOME: home, ORCA_CLI: orca };
+  const file = path.join(dir, 'watchdog.log');
+  for (const name of Object.values(logs.LOG_FILES)) fs.writeFileSync(path.join(dir, name), 'a'.repeat(1_100_000));
+  fs.writeFileSync(path.join(dir, 'state.json'), '{broken');
+  const run = arg => { const r = spawnSync(process.execPath, ['watchdog.mjs', arg], { env, encoding: 'utf8' }); assert.equal(r.status, 0, r.stderr); };
+  run('--dry-run');
+  assert.equal(fs.statSync(file).size, 1_100_000);
+  assert.equal(fs.existsSync(path.join(dir, 'health.json')), false);
+  assert.equal(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'), '{broken');
+  fs.writeFileSync(path.join(dir, 'lock'), 'fixture'); run('--once');
+  assert.equal(fs.statSync(file).size, 1_100_000);
+  assert.equal(fs.existsSync(path.join(dir, 'health.json')), false);
+  fs.unlinkSync(path.join(dir, 'lock'));
+  fs.writeFileSync(path.join(dir, 'state.json'), '{"version":2,"events":{}}');
+  run('--once');
+  for (const name of Object.values(logs.LOG_FILES)) assert.ok(fs.statSync(path.join(dir, name)).size <= 500_000);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'health.json'))).check.outcome, 'success');
+});

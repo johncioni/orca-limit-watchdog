@@ -1274,17 +1274,19 @@ test('loadState: v2 rejection names the normalized violation when alertedAt is o
   const text = JSON.stringify({ version: 2, events: { [H]: ev } });
   assert.equal(parseStateFile(text), null);
   fs.writeFileSync(path.join(stateDir, 'state.json'), text);
+  const fakeOrca = path.join(dir, 'fake-orca');
+  fs.writeFileSync(fakeOrca, '#!/bin/sh\nprintf \'{"ok":true,"result":{"terminals":[]}}\\n\'\n', { mode: 0o755 });
   const { stdout } = await pExecFile(process.execPath,
-    [fileURLToPath(new URL('./watchdog.mjs', import.meta.url)), '--status'],
-    { env: { ...process.env, HOME: dir }, timeout: 2000 });
+    [fileURLToPath(new URL('./watchdog.mjs', import.meta.url)), '--once'],
+    { env: { ...process.env, HOME: dir, ORCA_CLI: fakeOrca }, timeout: 2000 });
   const logged = fs.readFileSync(path.join(stateDir, 'watchdog.log'), 'utf8');
   assert.ok(logged.includes(`state file rejected (${H}: detectedAt: not a timestamp)`), logged);
   assert.doesNotMatch(logged, /alertedAt:/);
-  assert.equal(fs.existsSync(path.join(stateDir, 'state.json')), false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(stateDir, 'state.json'), 'utf8')), { version: 2, events: {} });
   const backups = fs.readdirSync(stateDir).filter((name) => name.startsWith('state.json.bad-'));
   assert.equal(backups.length, 1);
   assert.equal(fs.readFileSync(path.join(stateDir, backups[0]), 'utf8'), text);
-  assert.equal(stdout.trim(), 'no active events');
+  assert.equal(stdout.trim(), '');
 });
 
 test('--alert: missing env and mixed invocations exit without tick/lock/state/send (DOG-20)', async (t) => {

@@ -10,12 +10,12 @@ import path from 'node:path';
 import os from 'node:os';
 import { pathToFileURL, fileURLToPath } from 'node:url';
 import { runObservedCheck } from './lib/operations.mjs';
+import { appendActivity, maintainLogs } from './lib/logs.mjs';
 
 export const RESUME_TEXT = 'Session rate limit has reset. Resume where you left off.';
 
 const STATE_DIR = path.join(os.homedir(), '.local', 'state', 'orca-watchdog');
 const STATE_FILE = path.join(STATE_DIR, 'state.json');
-const LOG_FILE = path.join(STATE_DIR, 'watchdog.log');
 const LOCK_FILE = path.join(STATE_DIR, 'lock');
 const DISABLED_FILE = path.join(STATE_DIR, 'disabled');
 
@@ -578,14 +578,8 @@ export async function runAlert(env, { execFileImpl = pExecFile, logImpl = alertL
 
 function log(level, msg) {
   if (!shouldLog(level)) return;
-  fs.mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 });
-  fs.appendFileSync(LOG_FILE, `${new Date().toISOString()} ${level} ${msg}\n`, { mode: 0o600 });
-  try {
-    if (fs.statSync(LOG_FILE).size > 1_000_000) {
-      const lines = fs.readFileSync(LOG_FILE, 'utf8').split('\n');
-      fs.writeFileSync(LOG_FILE, lines.slice(-500).join('\n'), { mode: 0o600 });
-    }
-  } catch { /* best effort */ }
+  try { appendActivity(STATE_DIR, `${new Date().toISOString()} ${level} ${msg}\n`); }
+  catch { /* diagnostic IO must not affect sends */ }
 }
 
 export async function orca(args, execImpl = pExecFile) {
@@ -921,26 +915,33 @@ async function main() {
   }
   if (parsed.action === 'help') { process.stdout.write(USAGE); return; }
   if (parsed.action === 'status') {
-    const events = loadState();
+    let events;
+    try { events = parseStateFile(fs.readFileSync(STATE_FILE, 'utf8')); }
+    catch (e) { if (e.code === 'ENOENT') events = {}; else throw e; }
+    if (!events) { console.log('event state: unknown (malformed; run orca-watchdog doctor)'); return; }
     console.log(Object.keys(events).length === 0 ? 'no active events'
       : JSON.stringify({ version: 2, events }, null, 2));
     return;
   }
   if (fs.existsSync(DISABLED_FILE)) return;
   const dryRun = parsed.dryRun;
-  if (!dryRun && !acquireLock()) { log('debug', 'another tick holds the lock'); return; }
+  if (!dryRun && !acquireLock()) return;
+  const tickLog = dryRun ? (level, msg) => { if (shouldLog(level)) console.log(`${level} ${msg}`); } : log;
+  if (!dryRun) { try { maintainLogs(STATE_DIR); } catch (e) { console.error(`log maintenance: ${e.message}`); } }
   // Release the lock on ANY exit, including the deadline's process.exit(1),
   // which bypasses the finally below. Without this, a hard-killed tick leaves a
   // stale lock that makes the next 1-2 scheduled ticks skip (age < 10-min TTL),
   // blinding the watchdog for ~5-15 min exactly when ticks are running slow.
   if (!dryRun) process.once('exit', () => { try { fs.rmSync(LOCK_FILE, { force: true }); } catch { /* best effort */ } });
-  const deadline = setTimeout(() => { log('error', 'tick deadline (4 min) exceeded'); process.exit(1); }, 4 * MIN);
+  const deadline = setTimeout(() => { tickLog('error', 'tick deadline (4 min) exceeded'); process.exit(1); }, 4 * MIN);
   try {
-    await runObservedCheck({ stateDir: STATE_DIR, dryRun, tick });
+    await runObservedCheck({ stateDir: STATE_DIR, dryRun, tick, deps: { log: tickLog,
+      ...(dryRun ? { loadState: () => { try { return parseStateFile(fs.readFileSync(STATE_FILE, 'utf8')) ?? {}; } catch { return {}; } } } : {}) } });
   } catch (e) {
-    log('error', `tick failed: ${sanitize(e.message)}`);
+    tickLog('error', `tick failed: ${sanitize(e.message)}`);
   } finally {
     clearTimeout(deadline);
+    if (!dryRun) { try { maintainLogs(STATE_DIR); } catch { /* best effort */ } }
     if (!dryRun) fs.rmSync(LOCK_FILE, { force: true });
   }
 }
