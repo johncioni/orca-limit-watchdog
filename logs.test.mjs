@@ -79,6 +79,23 @@ test('appendActivity creates a 0600 log, accumulates appends, and refuses symlin
   assert.throws(() => logs.appendActivity(dir, 'evil\n'), /unsafe log|regular|unlinked/);
   assert.equal(fs.readFileSync(outside, 'utf8'), 'untouched');
 });
+test('appendActivity rejects a FIFO activity log fast instead of blocking the tick on open (DOG-29 #10 round-2)', t => {
+  if (process.platform === 'win32') return;
+  const dir = fixture(t);
+  const file = path.join(dir, logs.LOG_FILES.activity);
+  const mk = spawnSync('mkfifo', [file]);
+  assert.equal(mk.status, 0, `mkfifo failed: ${mk.stderr}`);
+  // A plain O_WRONLY open on a reader-less FIFO blocks forever, hanging the tick
+  // (the block escapes both the try/catch and the tick deadline). Run in a
+  // subprocess with a hard timeout: a hang shows up as a kill signal.
+  const logsUrl = new URL('./lib/logs.mjs', import.meta.url).href;
+  const script = `import * as logs from ${JSON.stringify(logsUrl)};`
+    + `try { logs.appendActivity(${JSON.stringify(dir)}, 'x\\n'); console.log('NO_THROW'); }`
+    + `catch { console.log('REJECTED'); }`;
+  const r = spawnSync(process.execPath, ['--input-type=module', '-e', script], { timeout: 3000, encoding: 'utf8' });
+  assert.equal(r.signal, null, 'appendActivity blocked on the FIFO (killed by timeout)');
+  assert.match(r.stdout, /REJECTED/, `expected FIFO rejection, got stdout=${JSON.stringify(r.stdout)}`);
+});
 test('log symlinks and hard links are rejected for reads and retention', t => {
   const dir = fixture(t), target = path.join(dir, 'target'), link = path.join(dir, 'log');
   fs.writeFileSync(target, 'untouched');

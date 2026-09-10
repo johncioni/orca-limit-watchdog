@@ -282,6 +282,13 @@ export function validateEvent(key, ev) {
 export function parseStateFile(text) {
   let s;
   try { s = JSON.parse(text); } catch { return null; }
+  return validateParsedState(s);
+}
+
+// Validates an already-parsed state object (so callers that have parsed the JSON —
+// e.g. doctor, which also needs the raw value for diagnostics — need not parse
+// twice). Returns the upgraded/validated events map, or null for anything invalid.
+export function validateParsedState(s) {
   if (!s || typeof s !== 'object' || !s.events || typeof s.events !== 'object') return null;
   if (s.version !== 1 && s.version !== 2) return null;
   const events = {};
@@ -633,7 +640,10 @@ export function saveState(events, stateDir = STATE_DIR) {
   // owner-only. atomicWriteFile hardens this send-critical write: a symlink/owner-
   // guarded 0700 dir (tightening a loose one), an unpredictable temp created with
   // 'wx' (a pre-planted temp symlink cannot be followed), and an atomic rename.
-  atomicWriteFile(stateDir, 'state.json', JSON.stringify({ version: 2, events }, null, 2));
+  // checkTarget:false — the rename replaces the state.json entry atomically without
+  // following it, and must not throw on a tampered-but-valid file (that would skip
+  // the resume send that persists just before it in tick()). See atomicWriteFile.
+  atomicWriteFile(stateDir, 'state.json', JSON.stringify({ version: 2, events }, null, 2), { checkTarget: false });
 }
 
 export function acquireLock(lockFile = LOCK_FILE) {

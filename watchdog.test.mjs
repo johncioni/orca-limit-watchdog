@@ -1909,6 +1909,30 @@ test('saveState uses an unpredictable temp + exclusive create, so a pre-planted 
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8')).version, 2);
 });
 
+test('saveState atomically replaces a symlinked/hardlinked state.json without following it or throwing (so a valid-state tamper cannot block a send) (DOG-29 #12 round-2)', (t) => {
+  if (process.platform === 'win32') return;
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-dest-'));
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }));
+  const dir = path.join(base, 'state');
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const stateFile = path.join(dir, 'state.json');
+  const victim = path.join(base, 'victim');
+  // Symlinked destination that holds valid state: the old writer replaced the
+  // dirent in place; saveState must not throw (a throw skips the send in tick()).
+  fs.writeFileSync(victim, 'do-not-touch');
+  fs.symlinkSync(victim, stateFile);
+  watchdog.saveState({ 'h:limit': { kind: 'limit' } }, dir);   // must NOT throw
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'do-not-touch', 'symlink target untouched');
+  assert.equal(fs.lstatSync(stateFile).isSymbolicLink(), false, 'state.json replaced with a regular file');
+  assert.equal(JSON.parse(fs.readFileSync(stateFile, 'utf8')).version, 2);
+  // Hardlinked destination: replace the name, leave the other link untouched.
+  fs.rmSync(stateFile);
+  fs.linkSync(victim, stateFile);
+  watchdog.saveState({ 'h:l2': { kind: 'limit' } }, dir);      // must NOT throw
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'do-not-touch', 'hardlink target untouched');
+  assert.equal(fs.statSync(stateFile).nlink, 1, 'state.json is a fresh, unlinked file');
+});
+
 test('CLI entry runs when invoked through a symlinked path (DOG-6)', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-symlink-'));
   const link = path.join(tmp, 'repo');

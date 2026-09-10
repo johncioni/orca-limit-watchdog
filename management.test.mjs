@@ -508,3 +508,32 @@ test('doctor does not fabricate a saved/loaded mismatch when launchctl output is
     assert.doesNotMatch(result.text, /loaded Node: error/);
   } finally { h.cleanup(); }
 });
+
+test('doctor preserves the native JSON parse error for a malformed state file (DOG-29 #9 round-2)', async () => {
+  const h = harness('wd badjson ');
+  try {
+    const { doctorText, installPaths } = await loadManagement();
+    const paths = installPaths(h.home);
+    fs.mkdirSync(paths.stateDir, { recursive: true });
+    fs.writeFileSync(paths.stateFile, '{');
+    let expected; try { JSON.parse('{'); } catch (e) { expected = e.message; }
+    const result = doctorText({ env: h.env });
+    assert.match(result.text, /event state: error/, result.text);
+    assert.ok(result.text.includes(expected), `expected native parse message ${JSON.stringify(expected)} in:\n${result.text}`);
+    assert.doesNotMatch(result.text, /invalid JSON/, result.text);
+  } finally { h.cleanup(); }
+});
+
+test('doctor keeps the runtime-missing diagnosis (not a filesystem error) when the state file is also unreadable (DOG-29 #9 round-2)', async () => {
+  const h = harness('wd rt-missing ');
+  try {
+    const { VERSION, installPaths } = await loadManagement();
+    const release = releaseCopy(h.base, VERSION, (r) => fs.rmSync(path.join(r, 'watchdog.mjs')));
+    const paths = installPaths(h.home);
+    fs.mkdirSync(paths.stateDir, { recursive: true });
+    fs.mkdirSync(paths.stateFile);   // state.json is a directory → readFileSync EISDIR (unreadable)
+    const r = spawnSync(process.execPath, [path.join(release, 'bin', 'orca-watchdog.mjs'), 'doctor'], { env: h.env, encoding: 'utf8' });
+    assert.match(r.stdout, /event state:.*(runtime missing|cannot validate)/, `${r.stdout}${r.stderr}`);
+    assert.doesNotMatch(r.stdout, /event state: error/, `${r.stdout}${r.stderr}`);
+  } finally { h.cleanup(); }
+});
