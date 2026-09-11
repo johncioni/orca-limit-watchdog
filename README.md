@@ -45,8 +45,9 @@ lightweight connectivity probe (before any resume) and the two status pages
 
 ## Install
 
-The watchdog installs **stopped**. Nothing is registered with `launchd` and no
-terminal is ever touched until you explicitly `start` it.
+The watchdog installs **stopped** — it does nothing until you start it. Nothing
+is registered with `launchd` and no terminal is ever touched until then.
+Installing is only step one; **[First run](#first-run) is what turns it on.**
 
 ### Homebrew (recommended)
 
@@ -116,6 +117,12 @@ orca-watchdog resume     # re-enable
 orca-watchdog --dry-run  # run one observation-only tick; never sends input
 orca-watchdog stop       # unregister the LaunchAgent (state is retained)
 ```
+
+These are two independent layers. **`start` / `stop`** load or unload the
+LaunchAgent — whether the service is registered with `launchd` at all.
+**`pause` / `resume`** toggle whether an already-loaded service *acts*, without
+unregistering or losing state. They don't substitute for each other: `resume`
+won't start a stopped service, and `start` won't un-pause a paused one.
 
 `pause` takes effect immediately — it also halts the remaining sends of a tick
 that is already running, not just future ticks.
