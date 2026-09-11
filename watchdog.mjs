@@ -37,7 +37,65 @@ export const SCHEDULE = Object.freeze({
     maxSends: 6, deadlineMs: 24 * 60 * MIN, resumeText: RESUME_TEXT }),
 });
 const KINDS = Object.keys(SCHEDULE);
-const PLATFORMS = ['claude', 'codex', 'unknown'];
+
+// --- provider registry (single source of truth; DOG-37) ---
+// One frozen, ORDERED entry per supported agent (claude BEFORE codex, to
+// preserve the prior OUTAGE_PATTERNS row order). Today's scattered per-platform
+// constants — PLATFORMS, OUTAGE_PATTERNS, the status URLs, the validateEvent
+// capability gates, the limit-rule selector, and the trailing-chrome seam — are
+// all DERIVED from this table. Scope is claude + codex ONLY this phase; later
+// phases add providers as new entries, never as new branches.
+//   agentIdentity   — terminal.agentIdentity values that resolve to this provider.
+//   kinds           — which detections apply (limit / outage / limitOpen).
+//   limit.rule      — 'generic' (LIMIT_RE/REACHED_RE/RESET_RE) or 'codex' (the
+//                     bespoke multi-line CODEX_* parser); kept deliberately distinct.
+//   outage[]        — TUI outage shapes; alsoUnknown also applies the row to the
+//                     'unknown' identity (only Claude's does, as before).
+//   fingerprint[]   — window regexes for future identity routing; EMPTY this phase,
+//                     so inferPlatform never consults them (behaviour unchanged).
+//   chrome.trailing — extra per-provider trailing-chrome lines; EMPTY this phase,
+//                     so isTrailingChromeFor ≡ isTrailingChrome for every platform.
+//   status          — Statuspage summary URL (env-overridable for the e2e stub).
+export const PROVIDERS = Object.freeze([
+  {
+    id: 'claude',
+    agentIdentity: ['claude'],
+    kinds: { limit: true, outage: true, limitOpen: false },
+    limit: { rule: 'generic' },
+    outage: [
+      { id: 'claude-api-error', alsoUnknown: true,
+        re: /^(⎿\s*)?API Error: (5\d\d\b|Connection error\b|.*\boverloaded_error\b)/i },
+    ],
+    fingerprint: [],
+    chrome: { trailing: [] },
+    status: { kind: 'statuspage', url: 'https://status.claude.com/api/v2/status.json' },
+  },
+  {
+    id: 'codex',
+    agentIdentity: ['codex'],
+    kinds: { limit: true, outage: true, limitOpen: true },
+    limit: { rule: 'codex' },
+    outage: [
+      // Codex TUI history marker "■" (a U+200A hair space may follow) + one of its
+      // fixed error texts (codex-rs/protocol/src/error.rs). 429 is the rate-limit
+      // path and deliberately not listed.
+      { id: 'codex-api-error', alsoUnknown: false,
+        re: /^■\s*(stream disconnected before completion\b|We're currently experiencing high demand\b|Selected model is at capacity\b|exceeded retry limit, last status: 5\d\d\b|Error while reading the server response\b|Connection failed:|unexpected status 5\d\d\b|request timed out\b)/ },
+    ],
+    fingerprint: [],
+    chrome: { trailing: [] },
+    status: { kind: 'statuspage', url: 'https://status.openai.com/api/v2/status.json' },
+  },
+]);
+
+// Registry lookups. providerFor returns null for a platform with no provider
+// (e.g. 'unknown'); platformSupports is the capability check validateEvent uses.
+const providerFor = (platform) => PROVIDERS.find((p) => p.id === platform) ?? null;
+const platformSupports = (platform, kind) => Boolean(providerFor(platform)?.kinds[kind]);
+
+// Derived from the registry (+ the 'unknown' sentinel); as a set this equals the
+// prior ['claude','codex','unknown'] (order is irrelevant to the .includes checks).
+export const PLATFORMS = ['unknown', ...PROVIDERS.map((p) => p.id)];
 const STATUSES = ['waiting', 'resumed', 'gave_up', 'awaiting-user', 'dismissed'];
 const GRACE_PAST_MS = 2 * 60 * MIN; // absolute time this recently past = already reset
 // A still-present limit banner whose parsed reset jumps at least this much LATER
@@ -93,17 +151,12 @@ export function sanitize(text, limit = 200) {
   return s.length > limit ? `${s.slice(0, limit)}…` : s;
 }
 
-// Outage banners are platform-owned TUI shapes; there is deliberately no
-// generic rule. `platforms` gates which terminal identities a row applies to.
-const OUTAGE_PATTERNS = [
-  { id: 'claude-api-error', platforms: ['claude', 'unknown'],
-    re: /^(⎿\s*)?API Error: (5\d\d\b|Connection error\b|.*\boverloaded_error\b)/i },
-  { id: 'codex-api-error', platforms: ['codex'],
-    // Codex TUI history marker "■" (a U+200A hair space may follow) + one of its
-    // fixed error texts (codex-rs/protocol/src/error.rs). 429 is the rate-limit
-    // path and deliberately not listed.
-    re: /^■\s*(stream disconnected before completion\b|We're currently experiencing high demand\b|Selected model is at capacity\b|exceeded retry limit, last status: 5\d\d\b|Error while reading the server response\b|Connection failed:|unexpected status 5\d\d\b|request timed out\b)/ },
-];
+// Outage banners are platform-owned TUI shapes; there is deliberately no generic
+// rule. Derived from PROVIDERS (DOG-37): one row per provider outage shape, with
+// alsoUnknown extending the row to the 'unknown' identity. `platforms` still gates
+// which terminal identities a row applies to. Deep-equals the prior literal table.
+export const OUTAGE_PATTERNS = PROVIDERS.flatMap((p) =>
+  p.outage.map((o) => ({ id: o.id, re: o.re, platforms: o.alsoUnknown ? [p.id, 'unknown'] : [p.id] })));
 const RETRY_RE = /retrying in \d|attempt \d+\s*(\/|of)\s*\d+|Reconnecting\.\.\. (\d+\/\d+|waiting for network)|esc to interrupt/i;
 // Lines allowed AFTER the error for it to count as the final, stalled banner.
 const CHROME_RES = [
@@ -123,6 +176,12 @@ const isChrome = (l) => CHROME_RES.some((re) => re.test(l));
 // the agent moving on, so the final-block checks that decide whether a banner is
 // still the stalled last thing on screen must tolerate it (DOG-24).
 const isTrailingChrome = (l) => isChrome(l) || FOOTER_RE.test(l);
+// Per-provider trailing-chrome seam (DOG-37): base trailing chrome OR a line a
+// provider declares as its own trailing chrome, consulted only for that platform.
+// Every chrome.trailing array is empty this phase, so this ≡ isTrailingChrome for
+// all platforms (including 'unknown', which has no provider).
+const isTrailingChromeFor = (platform, l) =>
+  isTrailingChrome(l) || (providerFor(platform)?.chrome.trailing.some((re) => re.test(l)) ?? false);
 const lastIndex = (arr, pred) => { let i = -1; arr.forEach((x, j) => { if (pred(x)) i = j; }); return i; };
 
 export function shouldLog(level, env = process.env) {
@@ -164,7 +223,11 @@ const CODEX_LIMIT_FORMS = [
 
 export function detectBanner(lines, platform = 'unknown', now = new Date()) {
   const window = toWindow(lines);
-  const codexCandidate = (l) => platform === 'codex' && /^■\s*/.test(l)
+  // The bespoke Codex multi-line limit parser is selected by the provider's
+  // limit.rule (DOG-37) — equivalent to the prior `platform === 'codex'` gate
+  // (non-codex platforms default to the 'generic' rule and never enter this block).
+  const limitRule = providerFor(platform)?.limit?.rule ?? 'generic';
+  const codexCandidate = (l) => limitRule === 'codex' && /^■\s*/.test(l)
     && (CODEX_429_RE.test(l) || (LIMIT_RE.test(l) && REACHED_RE.test(l)));
   const c = lastIndex(window, codexCandidate);
   let codexLimit = null;
@@ -197,7 +260,7 @@ export function detectBanner(lines, platform = 'unknown', now = new Date()) {
     // Same final-block guard the Codex limit and outage rules use: a banner the
     // agent already scrolled past (ordinary output between it and an idle empty
     // box) is stale and must not re-fire a resume send (DOG-24).
-    if (window.slice(l + 1).every(isTrailingChrome)) {
+    if (window.slice(l + 1).every((line) => isTrailingChromeFor(platform, line))) {
       limit = { kind: 'limit', bannerText: sanitize(window.filter(isRelevant).join(' | '), 600),
         matchedLine: window[l], patternId: 'limit', index: l };
     }
@@ -212,7 +275,7 @@ export function detectBanner(lines, platform = 'unknown', now = new Date()) {
     const e = lastIndex(window, (l) => p.re.test(l));
     if (e < 0) continue;
     if (lastIndex(window, (l) => RETRY_RE.test(l)) >= e) continue;   // still retrying
-    if (!window.slice(e + 1).every(isTrailingChrome)) continue;       // stale: agent moved on
+    if (!window.slice(e + 1).every((line) => isTrailingChromeFor(platform, line))) continue; // stale: agent moved on
     outage = { kind: 'outage', bannerText: sanitize(window[e], 200),
       matchedLine: window[e], patternId: p.id, index: e };
     break;
@@ -224,11 +287,21 @@ export function detectBanner(lines, platform = 'unknown', now = new Date()) {
   return banner;
 }
 
-export function inferPlatform(terminal, banner = null) {
-  const id = terminal?.agentIdentity;
-  if (id === 'claude' || id === 'codex') return id;
-  if (banner?.patternId === 'claude-api-error') return 'claude';
-  if (banner?.patternId === 'codex-api-error') return 'codex';
+// Identity resolution (DOG-37): terminal.agentIdentity → its provider; else a
+// future window fingerprint → its provider (every fingerprint array is empty this
+// phase, so `window` is never consulted); else the banner's outage patternId →
+// its provider; else 'unknown'. Output for claude/codex/unknown is unchanged.
+export function inferPlatform(terminal, banner = null, window = null) {
+  const byIdentity = PROVIDERS.find((p) => p.agentIdentity.includes(terminal?.agentIdentity));
+  if (byIdentity) return byIdentity.id;
+  if (window != null) {
+    const byFingerprint = PROVIDERS.find((p) => p.fingerprint.some((re) => re.test(window)));
+    if (byFingerprint) return byFingerprint.id;
+  }
+  if (banner?.patternId != null) {
+    const byPattern = PROVIDERS.find((p) => p.outage.some((o) => o.id === banner.patternId));
+    if (byPattern) return byPattern.id;
+  }
   return 'unknown';
 }
 
@@ -255,11 +328,11 @@ export function validateEvent(key, ev) {
   if (typeof ev.handle !== 'string' || ev.handle === '' || ev.handle !== key) return 'handle: must equal its key';
   if (!KINDS.includes(ev.kind)) return `kind: ${ev.kind}`;
   if (!PLATFORMS.includes(ev.platform)) return `platform: ${ev.platform}`;
-  if (ev.kind === 'outage' && ev.platform === 'unknown') return 'platform: outage requires a known platform';
+  if (ev.kind === 'outage' && !platformSupports(ev.platform, 'outage')) return 'platform: outage requires a known platform';
   if (!STATUSES.includes(ev.status)) return `status: ${ev.status}`;
   if (['awaiting-user', 'dismissed'].includes(ev.status) && ev.kind !== 'limit-open') return 'status: requires limit-open';
   if (ev.kind === 'limit-open') {
-    if (ev.platform !== 'codex') return 'platform: limit-open requires codex';
+    if (!platformSupports(ev.platform, 'limitOpen')) return 'platform: limit-open requires codex';
     if (typeof ev.episodeId !== 'string' || !ev.episodeId.trim()) return 'episodeId: required';
     if (ev.status === 'awaiting-user' && ev.attempts !== 0) return 'attempts: awaiting-user requires zero';
   } else if (ev.episodeId !== undefined) return 'episodeId: only legal for limit-open';
@@ -438,17 +511,20 @@ export function isInputOccupied(tail) {
   return last !== undefined && SHELL_CMD_RE.test(last);
 }
 
-const STATUS_URLS = Object.freeze({
-  claude: 'https://status.claude.com/api/v2/status.json',
-  codex: 'https://status.openai.com/api/v2/status.json',
-});
 export const CONNECTIVITY_URL = 'https://captive.apple.com/hotspot-detect.html';
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', '[::1]', 'localhost']);
+
+// The provider's Statuspage config (DOG-37), or null for a platform with no
+// provider (e.g. 'unknown'); replaces the separate STATUS_URLS table so a
+// provider's status URL lives with the rest of its behaviour in the registry.
+export function statusConfigFor(platform) {
+  return providerFor(platform)?.status ?? null;
+}
 
 // Resolve the status page for a platform. The env override exists for the E2E
 // stub only and is honoured solely for http(s) loopback URLs (spec safety §5).
 export function statusUrlFor(platform, env = process.env) {
-  const url = STATUS_URLS[platform];
+  const url = statusConfigFor(platform)?.url;
   const override = env[`WATCHDOG_STATUS_URL_${platform.toUpperCase()}`];
   if (!override) return { url, warn: null };
   try {
