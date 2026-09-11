@@ -538,17 +538,21 @@ test('doctor keeps the runtime-missing diagnosis (not a filesystem error) when t
   } finally { h.cleanup(); }
 });
 
-test('doctor does not hang on a FIFO state.json and reports it as unreadable (DOG-30)', async () => {
+test('doctor and status do not hang on a FIFO state.json and report it as unreadable (DOG-30)', () => {
   if (process.platform === 'win32') return;
-  const h = harness('wd fifo doctor ');
-  try {
-    const { doctorText, installPaths } = await loadManagement();
-    const paths = installPaths(h.home);
-    fs.mkdirSync(paths.stateDir, { recursive: true });
-    assert.equal(spawnSync('mkfifo', [paths.stateFile]).status, 0);
-    const start = Date.now();   // a blocking read would hang this in-process call
-    const result = doctorText({ env: h.env });
-    assert.ok(Date.now() - start < 2000, 'doctor blocked on a FIFO state.json');
-    assert.match(result.text, /event state: error/);
-  } finally { h.cleanup(); }
+  // Subprocess with a kill timeout, not an in-process call: a blocking open() on a
+  // reader-less FIFO stalls the event loop, so an in-process test hangs the whole
+  // run instead of failing this assertion. A hang shows as a kill signal (DOG-30 S2).
+  for (const cmd of ['doctor', 'status']) {
+    const h = harness(`wd fifo ${cmd} `);
+    try {
+      const stateDir = path.join(h.home, '.local', 'state', 'orca-watchdog');
+      fs.mkdirSync(stateDir, { recursive: true });
+      assert.equal(spawnSync('mkfifo', [path.join(stateDir, 'state.json')]).status, 0);
+      const r = spawnSync(process.execPath, [CLI, cmd], { env: h.env, encoding: 'utf8', timeout: 5000 });
+      assert.equal(r.signal, null, `${cmd} blocked on a FIFO state.json (killed by timeout)`);
+      const expected = cmd === 'doctor' ? /event state: error \(not a regular file/ : /events: unreadable \(run doctor\)/;
+      assert.match(r.stdout, expected, `${cmd} stdout: ${r.stdout}${r.stderr}`);
+    } finally { h.cleanup(); }
+  }
 });

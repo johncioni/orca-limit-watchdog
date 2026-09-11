@@ -20,11 +20,18 @@ test('readRegularSync reads a regular file, rejects a FIFO fast (no block), and 
   assert.equal(operations.readRegularSync(reg), 'hello\n');
   assert.throws(() => operations.readRegularSync(path.join(dir, 'nope')), e => e.code === 'ENOENT');
   if (process.platform !== 'win32') {
+    // Run the FIFO case in a child process with a kill timeout: a blocking open() on a
+    // reader-less FIFO stalls the event loop and hangs the whole run rather than failing
+    // this assertion. A hang shows as a kill signal (DOG-30 S2).
     const fifo = path.join(dir, 'fifo');
     assert.equal(spawnSync('mkfifo', [fifo]).status, 0);
-    const start = Date.now();   // a blocking bug would hang this in-process read
-    assert.throws(() => operations.readRegularSync(fifo), e => e.code === 'ENOTREG');
-    assert.ok(Date.now() - start < 2000, 'readRegularSync blocked on the FIFO');
+    const runner = path.join(dir, 'run.mjs');
+    fs.writeFileSync(runner, `import { readRegularSync } from ${JSON.stringify(path.resolve('lib/operations.mjs'))};\n`
+      + `try { readRegularSync(${JSON.stringify(fifo)}); process.stdout.write('READ'); }\n`
+      + `catch (e) { process.stdout.write(e.code === 'ENOTREG' ? 'ENOTREG' : 'ERR:' + e.code); }\n`);
+    const r = spawnSync(process.execPath, [runner], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(r.signal, null, 'readRegularSync blocked on the FIFO (killed by timeout)');
+    assert.equal(r.stdout, 'ENOTREG', `stdout=${r.stdout} stderr=${r.stderr}`);
   }
 });
 

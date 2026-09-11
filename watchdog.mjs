@@ -522,7 +522,12 @@ export function spawnAlert(ev, { spawnImpl = spawn, stateDir = STATE_DIR, env = 
 }
 
 export async function readChoice(handle, episodeId, stateDir = STATE_DIR, logImpl = log) {
-  try { return JSON.parse(fs.readFileSync(choicePath(handle, episodeId, stateDir), 'utf8')); }
+  // readRegularSync (not fs.readFileSync): a plain O_RDONLY open on a reader-less FIFO
+  // choice file blocks the tick forever, and reapChoices keeps the live name so a FIFO
+  // there is not swept. It fstat-rejects a FIFO/socket/device with ENOTREG, which lands
+  // in the non-ENOENT branch below (warn -> null): fail-closed, no status change, no
+  // send (DOG-30).
+  try { return JSON.parse(readRegularSync(choicePath(handle, episodeId, stateDir))); }
   catch (e) {
     if (e.code !== 'ENOENT') logImpl('warn', `choice read failed for ${handle}: ${sanitize(e.message)}`);
     return null;
