@@ -31,11 +31,13 @@ class OrcaWatchdog < Formula
 
   def caveats
     <<~EOS
-      orca-watchdog is installed but NOT running. Nothing is registered
-      with launchd and no terminal is touched until you start it:
+      orca-watchdog is installed but does nothing until you start it.
+      Nothing is registered with launchd and no terminal is touched yet.
 
-        orca-watchdog doctor
-        orca-watchdog start
+      To turn it on (two steps):
+
+        orca-watchdog doctor   # check macOS, Node, Orca, launchd
+        orca-watchdog start    # register the LaunchAgent; runs every 5 min
 
       It needs the Orca CLI (`orca`) on your PATH, or set ORCA_CLI to its path.
       Before `brew upgrade`, run `orca-watchdog stop`, then `start` again.
