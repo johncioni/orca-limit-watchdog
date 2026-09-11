@@ -2,6 +2,16 @@
 
 All notable changes to Orca Watchdog are documented here.
 
+## 1.1.1 - 2026-09-10
+
+- **Power/scheduling citizenship**: the LaunchAgent now declares
+  `ProcessType Background`, telling launchd the watchdog is a non-user-facing
+  utility that may be throttled under the system power policy. No user-observable
+  behavior change — the daemon was already power-appropriate because its
+  `StartInterval` poll never wakes a sleeping Mac (it fires once on wake, with no
+  queued catch-up). To pick up the key on an existing install, re-run `install.sh`
+  (or `brew upgrade`), which re-stages the plist. (DOG-31)
+
 ## 1.1.0 - 2026-09-10
 
 - **Richer `status`**: reports service registration (distinct from a running
