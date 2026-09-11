@@ -2,7 +2,7 @@
 
 All notable changes to Orca Watchdog are documented here.
 
-## Unreleased
+## 1.1.0 - 2026-09-10
 
 - **Richer `status`**: reports service registration (distinct from a running
   periodic process), the installed version, the last completed check, the last
@@ -21,6 +21,11 @@ All notable changes to Orca Watchdog are documented here.
   command and the `logs` options, plus `man orca-watchdog`. Homebrew installs both
   into the standard directories; the release archive ships `completions/` and
   `man/` for manual setup.
+- **Robustness hardening**: state and health files are now written atomically
+  (an exclusive temp file plus rename), so a crash mid-write can't leave a partial
+  file and a symlink/hardlink tamper of a valid state can't block a send. A
+  non-regular `state.json` or choice file (for example a FIFO) can no longer hang
+  a tick, `status`, or `doctor`: it reads as unreadable and resets, never a send.
 
 ## 1.0.0 - 2026-09-10
 
