@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/orca-watchdog-banner.png" alt="Orca Watchdog — monitor, recover, keep building" width="100%">
+</p>
+
 # Orca Watchdog
 
 **Orca Watchdog** is a local [launchd](https://www.launchd.info/) daemon for
