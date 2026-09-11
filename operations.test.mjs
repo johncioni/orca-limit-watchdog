@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import * as operations from './lib/operations.mjs';
 import { tick } from './watchdog.mjs';
 import { spawnSync } from 'node:child_process';
@@ -26,7 +27,7 @@ test('readRegularSync reads a regular file, rejects a FIFO fast (no block), and 
     const fifo = path.join(dir, 'fifo');
     assert.equal(spawnSync('mkfifo', [fifo]).status, 0);
     const runner = path.join(dir, 'run.mjs');
-    fs.writeFileSync(runner, `import { readRegularSync } from ${JSON.stringify(path.resolve('lib/operations.mjs'))};\n`
+    fs.writeFileSync(runner, `import { readRegularSync } from ${JSON.stringify(pathToFileURL(path.resolve('lib/operations.mjs')).href)};\n`
       + `try { readRegularSync(${JSON.stringify(fifo)}); process.stdout.write('READ'); }\n`
       + `catch (e) { process.stdout.write(e.code === 'ENOTREG' ? 'ENOTREG' : 'ERR:' + e.code); }\n`);
     const r = spawnSync(process.execPath, [runner], { encoding: 'utf8', timeout: 5000 });

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { spawnSync } from 'node:child_process';
 import * as watchdog from './watchdog.mjs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
 import { isShellPrompt, isInputOccupied } from './watchdog.mjs';
@@ -1329,12 +1329,16 @@ test('readChoice does not hang the tick on a FIFO choice file and fails closed (
     fs.mkdirSync(choices, { recursive: true });
     assert.equal(spawnSync('mkfifo', [path.join(choices, 'term_x.ep9.json')]).status, 0);
     const runner = path.join(dir, 'run.mjs');
-    fs.writeFileSync(runner, `import { readChoice } from ${JSON.stringify(path.resolve('watchdog.mjs'))};\n`
-      + `const r = await readChoice('term_x', 'ep9', ${JSON.stringify(dir)}, () => {});\n`
-      + `process.stdout.write(r === null ? 'NULL' : 'VALUE');\n`);
+    // Capture the warn so a filename-scheme drift can't make this pass vacuously via an
+    // ENOENT (which returns null without warning): the FIFO path must warn ENOTREG.
+    fs.writeFileSync(runner, `import { readChoice } from ${JSON.stringify(pathToFileURL(path.resolve('watchdog.mjs')).href)};\n`
+      + `const warns = [];\n`
+      + `const r = await readChoice('term_x', 'ep9', ${JSON.stringify(dir)}, (lvl, msg) => warns.push(lvl + ':' + msg));\n`
+      + `process.stdout.write((r === null ? 'NULL' : 'VALUE') + '|' + warns.join('||'));\n`);
     const r = spawnSync(process.execPath, [runner], { encoding: 'utf8', timeout: 5000 });
     assert.equal(r.signal, null, 'readChoice blocked on a FIFO choice file (killed by timeout)');
-    assert.equal(r.stdout, 'NULL', `stdout=${r.stdout} stderr=${r.stderr}`);
+    assert.match(r.stdout, /^NULL\|/, `stdout=${r.stdout} stderr=${r.stderr}`);
+    assert.match(r.stdout, /not a regular file/, `expected an ENOTREG warn, stdout=${r.stdout}`);
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 test('loadState: v2 rejection names the normalized violation when alertedAt is omitted (DOG-21)', async (t) => {
