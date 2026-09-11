@@ -5,7 +5,7 @@
 # Orca Watchdog
 
 **Orca Watchdog** is a local [launchd](https://www.launchd.info/) daemon for
-macOS that watches your connected [Orca](https://orca.dev) terminals for a
+macOS that watches your connected [Orca](https://onorca.dev) terminals for a
 stalled agent TUI and sends a one-line resume prompt when — and only when — it
 is safe to. Zero AI, zero tokens: it acts precisely when the agent subscriptions
 it watches are exhausted or a provider is down, and does nothing the rest of the
@@ -40,7 +40,7 @@ lightweight connectivity probe (before any resume) and the two status pages
 - **macOS** (uses `launchd` and `plutil`).
 - **Node.js 22 or newer.** Homebrew installs this for you; the archive install
   expects `node` on your `PATH` (or set `ORCA_WATCHDOG_NODE` to an absolute path).
-- **[Orca](https://orca.dev)** with its `orca` CLI available (or set `ORCA_CLI`
+- **[Orca](https://onorca.dev)** with its `orca` CLI available (or set `ORCA_CLI`
   to its absolute path). The watchdog needs `orca terminal list/read/wait/send`.
 
 ## Install
