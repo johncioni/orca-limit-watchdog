@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { spawnSync } from 'node:child_process';
 import * as watchdog from './watchdog.mjs';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { detectBanner, parseResetTime, reconcile, eventKey, stripAnsi, sanitize, hasOutageLine, inferPlatform,
   SCHEDULE, OUTAGE_RESUME_TEXT, newEvent, validateEvent, parseStateFile } from './watchdog.mjs';
 import { isShellPrompt, isInputOccupied } from './watchdog.mjs';
@@ -1013,6 +1013,29 @@ test('watchdog --status degrades gracefully when state.json is unreadable (not E
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
 
+test('watchdog --status, --dry-run and a tick do not hang on a FIFO state.json (DOG-30)', () => {
+  if (process.platform === 'win32') return;
+  for (const arg of ['--status', '--dry-run', '--once']) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-fifo-'));
+    try {
+      const stateDir = path.join(home, '.local', 'state', 'orca-watchdog');
+      fs.mkdirSync(stateDir, { recursive: true });
+      const mk = spawnSync('mkfifo', [path.join(stateDir, 'state.json')]);
+      assert.equal(mk.status, 0, `mkfifo failed: ${mk.stderr}`);
+      const env = { ...process.env, HOME: home };
+      if (arg !== '--status') {   // a fake orca so the real check (--dry-run/--once) runs to completion
+        const orca = path.join(home, 'fake-orca');
+        fs.writeFileSync(orca, '#!/bin/sh\nprintf \'%s\\n\' \'{"ok":true,"result":{"terminals":[]}}\'\n', { mode: 0o755 });
+        env.ORCA_CLI = orca;
+      }
+      // A plain readFileSync(O_RDONLY) blocks on a reader-less FIFO; a hang shows as a kill signal.
+      const r = spawnSync(process.execPath, ['watchdog.mjs', arg], { env, encoding: 'utf8', timeout: 5000 });
+      assert.equal(r.signal, null, `${arg} blocked on a FIFO state.json (killed by timeout)`);
+      assert.equal(r.status, 0, `${arg} stderr: ${r.stderr}`);
+    } finally { fs.rmSync(home, { recursive: true, force: true }); }
+  }
+});
+
 function alertHarness({ ev = LO(), choice = null, ...options } = {}) {
   const h = harness({ tail: OPEN_TAIL, terminals: [{ ...T, agentIdentity: 'codex' }], state: { [H]: ev }, now: NOW, ...options });
   const actions = [];
@@ -1294,6 +1317,29 @@ test('choice deps: real per-episode reads/deletes are bounded and isolated (DOG-
   fs.mkdirSync(env.WATCHDOG_ALERT_CHOICE_FILE);
   await watchdog.clearChoice('term_x', 'ep9', dir, logger);
   assert.ok(warnings.length >= 2);
+});
+test('readChoice does not hang the tick on a FIFO choice file and fails closed (DOG-30)', () => {
+  if (process.platform === 'win32') return;
+  // Subprocess with a kill timeout: a plain readFileSync(O_RDONLY) blocks forever on a
+  // reader-less FIFO, hanging the tick. reapChoices keeps the live name, so a FIFO there
+  // is not swept. A hang shows as a kill signal; fail-closed means readChoice returns null.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-choice-fifo-'));
+  try {
+    const choices = path.join(dir, 'choices');
+    fs.mkdirSync(choices, { recursive: true });
+    assert.equal(spawnSync('mkfifo', [path.join(choices, 'term_x.ep9.json')]).status, 0);
+    const runner = path.join(dir, 'run.mjs');
+    // Capture the warn so a filename-scheme drift can't make this pass vacuously via an
+    // ENOENT (which returns null without warning): the FIFO path must warn ENOTREG.
+    fs.writeFileSync(runner, `import { readChoice } from ${JSON.stringify(pathToFileURL(path.resolve('watchdog.mjs')).href)};\n`
+      + `const warns = [];\n`
+      + `const r = await readChoice('term_x', 'ep9', ${JSON.stringify(dir)}, (lvl, msg) => warns.push(lvl + ':' + msg));\n`
+      + `process.stdout.write((r === null ? 'NULL' : 'VALUE') + '|' + warns.join('||'));\n`);
+    const r = spawnSync(process.execPath, [runner], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(r.signal, null, 'readChoice blocked on a FIFO choice file (killed by timeout)');
+    assert.match(r.stdout, /^NULL\|/, `stdout=${r.stdout} stderr=${r.stderr}`);
+    assert.match(r.stdout, /not a regular file/, `expected an ENOTREG warn, stdout=${r.stdout}`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 test('loadState: v2 rejection names the normalized violation when alertedAt is omitted (DOG-21)', async (t) => {
   const { dir } = alertFiles(t);

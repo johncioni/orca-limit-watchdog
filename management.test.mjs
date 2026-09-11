@@ -537,3 +537,22 @@ test('doctor keeps the runtime-missing diagnosis (not a filesystem error) when t
     assert.doesNotMatch(r.stdout, /event state: error/, `${r.stdout}${r.stderr}`);
   } finally { h.cleanup(); }
 });
+
+test('doctor and status do not hang on a FIFO state.json and report it as unreadable (DOG-30)', () => {
+  if (process.platform === 'win32') return;
+  // Subprocess with a kill timeout, not an in-process call: a blocking open() on a
+  // reader-less FIFO stalls the event loop, so an in-process test hangs the whole
+  // run instead of failing this assertion. A hang shows as a kill signal (DOG-30 S2).
+  for (const cmd of ['doctor', 'status']) {
+    const h = harness(`wd fifo ${cmd} `);
+    try {
+      const stateDir = path.join(h.home, '.local', 'state', 'orca-watchdog');
+      fs.mkdirSync(stateDir, { recursive: true });
+      assert.equal(spawnSync('mkfifo', [path.join(stateDir, 'state.json')]).status, 0);
+      const r = spawnSync(process.execPath, [CLI, cmd], { env: h.env, encoding: 'utf8', timeout: 5000 });
+      assert.equal(r.signal, null, `${cmd} blocked on a FIFO state.json (killed by timeout)`);
+      const expected = cmd === 'doctor' ? /event state: error \(not a regular file/ : /events: unreadable \(run doctor\)/;
+      assert.match(r.stdout, expected, `${cmd} stdout: ${r.stdout}${r.stderr}`);
+    } finally { h.cleanup(); }
+  }
+});

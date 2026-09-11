@@ -3,14 +3,38 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import * as operations from './lib/operations.mjs';
 import { tick } from './watchdog.mjs';
+import { spawnSync } from 'node:child_process';
 
 function fixture(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'wd-operations-'));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
+
+test('readRegularSync reads a regular file, rejects a FIFO fast (no block), and propagates ENOENT (DOG-30)', t => {
+  const dir = fixture(t);
+  const reg = path.join(dir, 'reg');
+  fs.writeFileSync(reg, 'hello\n');
+  assert.equal(operations.readRegularSync(reg), 'hello\n');
+  assert.throws(() => operations.readRegularSync(path.join(dir, 'nope')), e => e.code === 'ENOENT');
+  if (process.platform !== 'win32') {
+    // Run the FIFO case in a child process with a kill timeout: a blocking open() on a
+    // reader-less FIFO stalls the event loop and hangs the whole run rather than failing
+    // this assertion. A hang shows as a kill signal (DOG-30 S2).
+    const fifo = path.join(dir, 'fifo');
+    assert.equal(spawnSync('mkfifo', [fifo]).status, 0);
+    const runner = path.join(dir, 'run.mjs');
+    fs.writeFileSync(runner, `import { readRegularSync } from ${JSON.stringify(pathToFileURL(path.resolve('lib/operations.mjs')).href)};\n`
+      + `try { readRegularSync(${JSON.stringify(fifo)}); process.stdout.write('READ'); }\n`
+      + `catch (e) { process.stdout.write(e.code === 'ENOTREG' ? 'ENOTREG' : 'ERR:' + e.code); }\n`);
+    const r = spawnSync(process.execPath, [runner], { encoding: 'utf8', timeout: 5000 });
+    assert.equal(r.signal, null, 'readRegularSync blocked on the FIFO (killed by timeout)');
+    assert.equal(r.stdout, 'ENOTREG', `stdout=${r.stdout} stderr=${r.stderr}`);
+  }
+});
 
 test('health is versioned, atomic, private and independent of event state', t => {
   const dir = fixture(t);
