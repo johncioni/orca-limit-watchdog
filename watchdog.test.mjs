@@ -2021,3 +2021,65 @@ test('CLI entry runs when invoked through a symlinked path (DOG-6)', async () =>
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+// --- DOG-37: PROVIDERS registry parity (characterization) ---
+// These lock the registry-DERIVED structures to the known-good literals the
+// scattered per-platform code produced before the refactor. If one fails, the
+// registry refactor changed behaviour for claude/codex/unknown and is wrong.
+
+test('DOG-37 registry: OUTAGE_PATTERNS deep-equals the prior two-row table', () => {
+  const expected = [
+    { id: 'claude-api-error', platforms: ['claude', 'unknown'],
+      re: /^(⎿\s*)?API Error: (5\d\d\b|Connection error\b|.*\boverloaded_error\b)/i },
+    { id: 'codex-api-error', platforms: ['codex'],
+      re: /^■\s*(stream disconnected before completion\b|We're currently experiencing high demand\b|Selected model is at capacity\b|exceeded retry limit, last status: 5\d\d\b|Error while reading the server response\b|Connection failed:|unexpected status 5\d\d\b|request timed out\b)/ },
+  ];
+  const actual = watchdog.OUTAGE_PATTERNS;
+  assert.equal(actual.length, expected.length);
+  expected.forEach((row, i) => {
+    assert.equal(actual[i].id, row.id, `row ${i} id`);
+    assert.deepEqual(actual[i].platforms, row.platforms, `row ${i} platforms`);
+    assert.equal(actual[i].re.source, row.re.source, `row ${i} re.source`);
+    assert.equal(actual[i].re.flags, row.re.flags, `row ${i} re.flags`);
+  });
+  // hasOutageLine (which consumes OUTAGE_PATTERNS) still matches both shapes.
+  assert.ok(hasOutageLine(['API Error: 529 overloaded_error']));
+  assert.ok(hasOutageLine(['■ stream disconnected before completion']));
+});
+
+test('DOG-37 registry: PLATFORMS is exactly {claude, codex, unknown}', () => {
+  assert.deepEqual([...watchdog.PLATFORMS].sort(), ['claude', 'codex', 'unknown']);
+});
+
+test('DOG-37 registry: statusConfigFor maps claude/codex to the current status URLs', () => {
+  assert.equal(watchdog.statusConfigFor('claude').url, 'https://status.claude.com/api/v2/status.json');
+  assert.equal(watchdog.statusConfigFor('codex').url, 'https://status.openai.com/api/v2/status.json');
+  assert.equal(watchdog.statusConfigFor('unknown'), null);
+  // statusUrlFor still sources its default from the registry, unchanged.
+  assert.deepEqual(statusUrlFor('claude', {}), { url: 'https://status.claude.com/api/v2/status.json', warn: null });
+  assert.deepEqual(statusUrlFor('codex', {}), { url: 'https://status.openai.com/api/v2/status.json', warn: null });
+});
+
+test('DOG-37 registry: inferPlatform parity via the registry (identity + outage patternId)', () => {
+  assert.equal(inferPlatform({ agentIdentity: 'claude' }), 'claude');
+  assert.equal(inferPlatform({ agentIdentity: 'codex' }), 'codex');
+  assert.equal(inferPlatform({ agentIdentity: 'gpt' }), 'unknown');
+  assert.equal(inferPlatform(undefined, { patternId: 'claude-api-error' }), 'claude');
+  assert.equal(inferPlatform(undefined, { patternId: 'codex-api-error' }), 'codex');
+  assert.equal(inferPlatform(undefined, { patternId: 'limit' }), 'unknown');
+  assert.equal(inferPlatform(undefined, null), 'unknown');
+  // The future fingerprint param is inert this phase (all arrays empty): clearly
+  // Claude/Codex window text still resolves to unknown without agentIdentity/banner.
+  assert.equal(inferPlatform(undefined, null, 'API Error: 529 overloaded_error'), 'unknown');
+});
+
+test('DOG-37 registry: validateEvent capability gates match the prior hardcoded rules', () => {
+  // outage requires a provider with kinds.outage (claude/codex yes, unknown no).
+  assert.equal(validateEvent(H, { ...V2, kind: 'outage', platform: 'claude' }), null);
+  assert.equal(validateEvent(H, { ...V2, kind: 'outage', platform: 'codex' }), null);
+  assert.match(validateEvent(H, { ...V2, kind: 'outage', platform: 'unknown' }), /platform/);
+  // limit-open requires kinds.limitOpen (codex yes; claude/unknown no).
+  assert.equal(validateEvent(H, LO({})), null);
+  assert.match(validateEvent(H, LO({ platform: 'claude' })), /platform/);
+  assert.match(validateEvent(H, LO({ platform: 'unknown' })), /platform/);
+});
