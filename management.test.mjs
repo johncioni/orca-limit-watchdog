@@ -186,10 +186,10 @@ test('pause, resume, stop, and status keep service, pause, and events separate',
     await runCli(['pause'], h.env);
     const paused = await runCli(['status'], h.env);
     assert.match(paused.stdout, /service:\s+registered/);
-    assert.match(paused.stdout, /pause:\s+paused/);
+    assert.match(paused.stdout, /pause:\s+on\b/);
     assert.match(paused.stdout, /events:\s+none/);
     await runCli(['resume'], h.env);
-    assert.match((await runCli(['status'], h.env)).stdout, /pause:\s+active/);
+    assert.match((await runCli(['status'], h.env)).stdout, /pause:\s+off\b/);
     await runCli(['stop'], h.env);
     assert.match((await runCli(['status'], h.env)).stdout, /service:\s+stopped/);
   } finally { h.cleanup(); }
